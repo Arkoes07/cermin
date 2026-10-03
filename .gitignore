@@ -1,0 +1,5 @@
+.env
+# Real Thoughts (WhatsApp export, eval set) live here and are never committed.
+data/
+*.db
+*.sqlite*
