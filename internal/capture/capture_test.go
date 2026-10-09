@@ -15,7 +15,8 @@ import (
 	"time"
 
 	"github.com/arkoes07/cermin/internal/capture"
-	"github.com/arkoes07/cermin/internal/store"
+	"github.com/arkoes07/cermin/internal/cermin"
+	"github.com/arkoes07/cermin/internal/sqlite"
 	"github.com/arkoes07/cermin/internal/telegram"
 )
 
@@ -31,7 +32,7 @@ var thoughtTime = time.Date(2026, 10, 12, 1, 30, 0, 0, time.UTC)
 func TestBot_ProcessInbox_CapturesOwnerText(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
-	classifier := &fakeClassifier{candidates: []store.TopicCandidate{
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{
 		{Name: "transport", Confidence: 0.95},
 		{Name: "cities", Confidence: 0.8},
 	}}
@@ -62,7 +63,7 @@ func TestBot_ProcessInbox_CapturesOwnerText(t *testing.T) {
 		t.Errorf("ReceivedAt = %v, want between %v and %v", got.ReceivedAt, before, after)
 	}
 	got.ThoughtAt, got.ReceivedAt = time.Time{}, time.Time{}
-	want := store.Thought{
+	want := cermin.Thought{
 		ID:                 got.ID,
 		Text:               "What if bus stops showed how full the next bus is?",
 		Source:             "telegram",
@@ -92,12 +93,12 @@ func TestBot_ProcessInbox_CapturesOwnerText(t *testing.T) {
 		t.Errorf("CreatedAt = %v, want between %v and %v", gotClassification.CreatedAt, before, after)
 	}
 	gotClassification.ID, gotClassification.CreatedAt = 0, time.Time{}
-	wantClassification := store.Classification{
+	wantClassification := cermin.Classification{
 		ThoughtID:      got.ID,
 		Source:         "cermin",
 		Kind:           "idea",
 		KindConfidence: 0.9,
-		Topics: []store.TopicCandidate{
+		Topics: []cermin.TopicCandidate{
 			{Name: "transport", Confidence: 0.95, Kept: true},
 			{Name: "cities", Confidence: 0.8, Kept: true},
 		},
@@ -115,20 +116,20 @@ func TestBot_ProcessInbox_KeepsStrongTopics(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name       string
-		candidates []store.TopicCandidate
+		candidates []cermin.TopicCandidate
 		wantAck    string
-		wantStored []store.TopicCandidate // every candidate, best first
-		wantTopics []string               // the Topics that exist afterwards
+		wantStored []cermin.TopicCandidate // every candidate, best first
+		wantTopics []string                // the Topics that exist afterwards
 	}{
 		{
 			name: "those at 0.7 or above, best first",
-			candidates: []store.TopicCandidate{
+			candidates: []cermin.TopicCandidate{
 				{Name: "cities", Confidence: 0.7},
 				{Name: "transport", Confidence: 0.95},
 				{Name: "design", Confidence: 0.4},
 			},
 			wantAck: "💡 idea · transport, cities",
-			wantStored: []store.TopicCandidate{
+			wantStored: []cermin.TopicCandidate{
 				{Name: "transport", Confidence: 0.95, Kept: true},
 				{Name: "cities", Confidence: 0.7, Kept: true},
 				{Name: "design", Confidence: 0.4},
@@ -137,14 +138,14 @@ func TestBot_ProcessInbox_KeepsStrongTopics(t *testing.T) {
 		},
 		{
 			name: "at most 3",
-			candidates: []store.TopicCandidate{
+			candidates: []cermin.TopicCandidate{
 				{Name: "data", Confidence: 0.72},
 				{Name: "transport", Confidence: 0.95},
 				{Name: "cities", Confidence: 0.8},
 				{Name: "design", Confidence: 0.75},
 			},
 			wantAck: "💡 idea · transport, cities, design",
-			wantStored: []store.TopicCandidate{
+			wantStored: []cermin.TopicCandidate{
 				{Name: "transport", Confidence: 0.95, Kept: true},
 				{Name: "cities", Confidence: 0.8, Kept: true},
 				{Name: "design", Confidence: 0.75, Kept: true},
@@ -154,13 +155,13 @@ func TestBot_ProcessInbox_KeepsStrongTopics(t *testing.T) {
 		},
 		{
 			name: "the single best when none reaches 0.7",
-			candidates: []store.TopicCandidate{
+			candidates: []cermin.TopicCandidate{
 				{Name: "design", Confidence: 0.5},
 				{Name: "cities", Confidence: 0.6},
 				{Name: "data", Confidence: 0.3},
 			},
 			wantAck: "💡 idea · cities",
-			wantStored: []store.TopicCandidate{
+			wantStored: []cermin.TopicCandidate{
 				{Name: "cities", Confidence: 0.6, Kept: true},
 				{Name: "design", Confidence: 0.5},
 				{Name: "data", Confidence: 0.3},
@@ -169,14 +170,14 @@ func TestBot_ProcessInbox_KeepsStrongTopics(t *testing.T) {
 		},
 		{
 			name: "names lowercased, blank and repeated ones dropped",
-			candidates: []store.TopicCandidate{
+			candidates: []cermin.TopicCandidate{
 				{Name: " Transport ", Confidence: 0.9},
 				{Name: "", Confidence: 0.99},
 				{Name: "transport", Confidence: 0.8},
 				{Name: "Cities", Confidence: 0.75},
 			},
 			wantAck: "💡 idea · transport, cities",
-			wantStored: []store.TopicCandidate{
+			wantStored: []cermin.TopicCandidate{
 				{Name: "transport", Confidence: 0.9, Kept: true},
 				{Name: "cities", Confidence: 0.75, Kept: true},
 			},
@@ -214,12 +215,12 @@ func TestBot_ProcessInbox_KeepsStrongTopics(t *testing.T) {
 func TestBot_ProcessInbox_ReusesTopicIgnoringCase(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
-	classifier := &fakeClassifier{candidates: []store.TopicCandidate{{Name: "business", Confidence: 0.9}}}
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "business", Confidence: 0.9}}}
 	bot, db, api := newBot(t, classifier.classify)
 	api.queue(textUpdate(t, ownerID, "What if small shops could restock by chat?", 0))
 	captureQueued(t, bot, db)
 
-	classifier.candidates = []store.TopicCandidate{
+	classifier.candidates = []cermin.TopicCandidate{
 		{Name: "Business", Confidence: 0.85},
 		{Name: "retail", Confidence: 0.8},
 	}
@@ -242,7 +243,7 @@ func TestBot_ProcessInbox_ReusesTopicIgnoringCase(t *testing.T) {
 	if err != nil || len(classifications) != 1 {
 		t.Fatalf("Classifications = %+v, %v; want 1", classifications, err)
 	}
-	wantStored := []store.TopicCandidate{
+	wantStored := []cermin.TopicCandidate{
 		{Name: "business", Confidence: 0.85, Kept: true},
 		{Name: "retail", Confidence: 0.8, Kept: true},
 	}
@@ -257,12 +258,12 @@ func TestBot_ProcessInbox_ReusesTopicIgnoringCase(t *testing.T) {
 func TestBot_ProcessInbox_SavesWhenClassificationTimesOut(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
-	timesOut := func(ctx context.Context, _ string, _ []store.Kind, _ []string) (store.Classification, string, error) {
+	timesOut := func(ctx context.Context, _ string, _ []cermin.Kind, _ []string) (cermin.Classification, string, error) {
 		deadline, ok := ctx.Deadline()
 		if !ok || time.Until(deadline) > 8*time.Second {
 			t.Errorf("classifying with deadline %v (set: %t), want one at most 8s away", deadline, ok)
 		}
-		return store.Classification{}, "", context.DeadlineExceeded
+		return cermin.Classification{}, "", context.DeadlineExceeded
 	}
 	bot, db, api := newBot(t, timesOut)
 	api.queue(textUpdate(t, ownerID, "Why does Go still not have sum types?", 0))
@@ -287,7 +288,7 @@ func TestBot_ProcessInbox_SavesWhenClassificationTimesOut(t *testing.T) {
 func TestBot_ProcessInbox_RetryKeepsClassification(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
-	classifier := &fakeClassifier{candidates: []store.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
 	bot, db, api := newBot(t, classifier.classify)
 	api.failNextSend()
 	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
@@ -389,7 +390,7 @@ func TestBot_ProcessInbox_CapturesOnlyOwnerText(t *testing.T) {
 func TestBot_Process_SafeToRepeat(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
-	classifier := &fakeClassifier{candidates: []store.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
 	bot, db, api := newBot(t, classifier.classify)
 	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
 	if err := bot.Poll(ctx); err != nil {
@@ -416,15 +417,15 @@ func TestBot_Process_SafeToRepeat(t *testing.T) {
 	}
 }
 
-func newBot(t *testing.T, classify capture.ClassifyFunc) (*capture.Bot, *store.DB, *fakeBotAPI) {
+func newBot(t *testing.T, classify capture.ClassifyFunc) (*capture.Bot, *sqlite.DB, *fakeBotAPI) {
 	t.Helper()
 	api := &fakeBotAPI{}
 	srv := httptest.NewServer(api.handler(t))
 	t.Cleanup(srv.Close)
 
-	db, err := store.Open(t.Context(), filepath.Join(t.TempDir(), "cermin.db"))
+	db, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "cermin.db"))
 	if err != nil {
-		t.Fatalf("store.Open: %v", err)
+		t.Fatalf("sqlite.Open: %v", err)
 	}
 	t.Cleanup(func() {
 		if err := db.Close(); err != nil {
@@ -443,7 +444,7 @@ func newBot(t *testing.T, classify capture.ClassifyFunc) (*capture.Bot, *store.D
 
 // captureQueued polls the queued updates, processes the inbox and returns the
 // latest Thought.
-func captureQueued(t *testing.T, bot *capture.Bot, db *store.DB) store.Thought {
+func captureQueued(t *testing.T, bot *capture.Bot, db *sqlite.DB) cermin.Thought {
 	t.Helper()
 	ctx := t.Context()
 	if err := bot.Poll(ctx); err != nil {
@@ -466,18 +467,18 @@ const fakeRawOutput = `{"language":"en","kind":{"value":"idea","confidence":0.9}
 // fakeClassifier classifies every Thought as an English idea with its
 // candidate Topics, and records the existing Topics it was given.
 type fakeClassifier struct {
-	candidates []store.TopicCandidate
+	candidates []cermin.TopicCandidate
 	gotTopics  [][]string // the existing Topics given to each call
 }
 
 func (f *fakeClassifier) classify(
 	_ context.Context,
 	_ string,
-	_ []store.Kind,
+	_ []cermin.Kind,
 	topics []string,
-) (store.Classification, string, error) {
+) (cermin.Classification, string, error) {
 	f.gotTopics = append(f.gotTopics, topics)
-	c := store.Classification{
+	c := cermin.Classification{
 		Kind:             "idea",
 		KindConfidence:   0.9,
 		Topics:           slices.Clone(f.candidates),

@@ -22,6 +22,8 @@ Scope, non-goals, success checks and milestones: `docs/product/PRD.md`. Check it
 
 Before any Go coding, review, debugging, troubleshooting, or setup task, load the `samber/cc-skills-golang@golang-how-to` skill first — it routes to whichever other Go skills the task needs.
 
+Code layout: which package each kind of code goes in, and what it may import, is in §5.2 of `docs/design/high-level-design.md`. Read it before adding a package or a type, or moving code between packages.
+
 ## Required Go skills
 
 The following Go skills from `samber/cc-skills-golang` MUST always be applied when working on this project. Load them at the start of every Go-related task, regardless of whether the user explicitly mentions them.

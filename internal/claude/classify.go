@@ -1,20 +1,18 @@
-// Package classify gives a Thought its Classification: one Claude call that
-// names its Kind and candidate Topics, each with Claude's stated confidence,
-// and the keep rule that picks the candidates the Thought keeps.
-package classify
+// Package claude calls the Claude API for Cermin. A Classifier gives a Thought
+// its Classification: one call that names its Kind and candidate Topics, each
+// with Claude's stated confidence.
+package claude
 
 import (
-	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
-	"slices"
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
 
-	"github.com/arkoes07/cermin/internal/store"
+	"github.com/arkoes07/cermin/internal/cermin"
 )
 
 // DefaultModel is the Claude model that classifies unless configured
@@ -29,12 +27,6 @@ const (
 	confidenceMethod = "verbalized-v1"
 	// maxTokens leaves room for the output and any thinking at low effort.
 	maxTokens = 4096
-
-	// keepThreshold is the confidence a candidate Topic needs to be kept, a
-	// placeholder until week 3 measures calibration.
-	keepThreshold = 0.7
-	// maxKept is the most Topics a Thought keeps.
-	maxKept = 3
 )
 
 // Classifier classifies Thoughts with a Claude model.
@@ -51,13 +43,13 @@ func New(apiKey, model string) *Classifier {
 // Classify asks Claude for the Classification of a Thought's text: one of
 // kinds, and up to 5 candidate Topics that reuse topics where one fits. It
 // also returns the Thought's language: en, id or mixed. The candidates come
-// back as Claude gave them, none of them kept; Keep picks those.
+// back as Claude gave them, none of them kept; cermin.KeepTopics picks those.
 func (c *Classifier) Classify(
 	ctx context.Context,
 	text string,
-	kinds []store.Kind,
+	kinds []cermin.Kind,
 	topics []string,
-) (store.Classification, string, error) {
+) (cermin.Classification, string, error) {
 	resp, err := c.client.Messages.New(ctx, anthropic.MessageNewParams{
 		Model:     c.model,
 		MaxTokens: maxTokens,
@@ -69,11 +61,11 @@ func (c *Classifier) Classify(
 		},
 	})
 	if err != nil {
-		return store.Classification{}, "", fmt.Errorf("classify: %w", err)
+		return cermin.Classification{}, "", fmt.Errorf("classify: %w", err)
 	}
 	// A refused or cut-off output may not match the schema.
 	if resp.StopReason != anthropic.StopReasonEndTurn {
-		return store.Classification{}, "", fmt.Errorf("classify: model stopped with %s", resp.StopReason)
+		return cermin.Classification{}, "", fmt.Errorf("classify: model stopped with %s", resp.StopReason)
 	}
 	var raw string
 	for _, block := range resp.Content {
@@ -84,14 +76,14 @@ func (c *Classifier) Classify(
 	}
 	var out output
 	if err := json.Unmarshal([]byte(raw), &out); err != nil {
-		return store.Classification{}, "", fmt.Errorf("classify: decoding output: %w", err)
+		return cermin.Classification{}, "", fmt.Errorf("classify: decoding output: %w", err)
 	}
 
-	candidates := make([]store.TopicCandidate, 0, len(out.Topics))
+	candidates := make([]cermin.TopicCandidate, 0, len(out.Topics))
 	for _, t := range out.Topics {
-		candidates = append(candidates, store.TopicCandidate{Name: t.Name, Confidence: t.Confidence})
+		candidates = append(candidates, cermin.TopicCandidate{Name: t.Name, Confidence: t.Confidence})
 	}
-	classification := store.Classification{
+	classification := cermin.Classification{
 		Kind:             out.Kind.Value,
 		KindConfidence:   out.Kind.Confidence,
 		Topics:           candidates,
@@ -101,37 +93,6 @@ func (c *Classifier) Classify(
 		RawOutput:        raw,
 	}
 	return classification, out.Language, nil
-}
-
-// Keep returns candidates best first, with the ones the Thought keeps marked
-// Kept: those at keepThreshold or above, at most maxKept of them, or else the
-// single best. Names are trimmed and lowercased first, and a blank or
-// repeated name is dropped, so no candidate names a Topic twice.
-func Keep(candidates []store.TopicCandidate) []store.TopicCandidate {
-	sorted := make([]store.TopicCandidate, 0, len(candidates))
-	for _, c := range candidates {
-		c.Name = strings.ToLower(strings.TrimSpace(c.Name))
-		if c.Name != "" {
-			sorted = append(sorted, c)
-		}
-	}
-	slices.SortStableFunc(sorted, func(a, b store.TopicCandidate) int {
-		return cmp.Compare(b.Confidence, a.Confidence)
-	})
-
-	unique := make([]store.TopicCandidate, 0, len(sorted))
-	for _, c := range sorted {
-		isRepeat := slices.ContainsFunc(unique, func(u store.TopicCandidate) bool { return u.Name == c.Name })
-		if isRepeat {
-			continue
-		}
-		c.Kept = len(unique) < maxKept && c.Confidence >= keepThreshold
-		unique = append(unique, c)
-	}
-	if len(unique) > 0 {
-		unique[0].Kept = true // the best is kept even below the threshold
-	}
-	return unique
 }
 
 // output is the model's output, as outputSchema shapes it. Its
@@ -150,7 +111,7 @@ type output struct {
 
 // outputSchema is the JSON schema Claude's output must follow, with the Kind
 // limited to kinds.
-func outputSchema(kinds []store.Kind) map[string]any {
+func outputSchema(kinds []cermin.Kind) map[string]any {
 	names := make([]string, 0, len(kinds))
 	for _, k := range kinds {
 		names = append(names, k.Name)
@@ -190,7 +151,7 @@ func outputSchema(kinds []store.Kind) map[string]any {
 
 // systemPrompt tells Claude how to classify a Thought, giving it the
 // definitions of kinds and the names of the existing topics.
-func systemPrompt(kinds []store.Kind, topics []string) string {
+func systemPrompt(kinds []cermin.Kind, topics []string) string {
 	var b strings.Builder
 	b.WriteString(`You classify a Thought: a short message someone sent to themselves, in English, Bahasa Indonesia or a mix of the two. The user message is the Thought. In the definitions below, "I" is the person who wrote it.
 

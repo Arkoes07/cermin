@@ -18,7 +18,7 @@ set -a; . ./.env; set +a   # TELEGRAM_BOT_TOKEN, TELEGRAM_OWNER_ID, ANTHROPIC_AP
 go run ./cmd/cermin serve  # database at data/cermin.db unless CERMIN_DB_PATH is set
 ```
 
-Thoughts are classified by `claude-sonnet-5-5` unless `CERMIN_CLASSIFY_MODEL` names another model. `go test -tags integration ./internal/classify/` checks the classifier against the real API.
+Thoughts are classified by `claude-sonnet-5-5` unless `CERMIN_CLASSIFY_MODEL` names another model. `go test -tags integration ./internal/claude/` checks the classifier against the real API.
 
 Built for one user, me. Outside pull requests are not accepted yet ([ADR-0001](docs/adr/0001-agpl-license.md)).
 

@@ -20,8 +20,8 @@ import (
 	"syscall"
 
 	"github.com/arkoes07/cermin/internal/capture"
-	"github.com/arkoes07/cermin/internal/classify"
-	"github.com/arkoes07/cermin/internal/store"
+	"github.com/arkoes07/cermin/internal/claude"
+	"github.com/arkoes07/cermin/internal/sqlite"
 	"github.com/arkoes07/cermin/internal/telegram"
 )
 
@@ -49,17 +49,17 @@ func run(args []string) error {
 		return errors.New("missing ANTHROPIC_API_KEY")
 	}
 	dbPath := cmp.Or(os.Getenv("CERMIN_DB_PATH"), "data/cermin.db")
-	model := cmp.Or(os.Getenv("CERMIN_CLASSIFY_MODEL"), classify.DefaultModel)
+	model := cmp.Or(os.Getenv("CERMIN_CLASSIFY_MODEL"), claude.DefaultModel)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	db, err := store.Open(ctx, dbPath)
+	db, err := sqlite.Open(ctx, dbPath)
 	if err != nil {
 		return err
 	}
 	slog.InfoContext(ctx, "capturing Thoughts", "db", dbPath, "classify_model", model)
-	classifier := classify.New(apiKey, model)
+	classifier := claude.New(apiKey, model)
 	bot := capture.New(
 		db,
 		telegram.New(telegram.APIURL, token),

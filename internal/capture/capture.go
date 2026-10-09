@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/arkoes07/cermin/internal/classify"
-	"github.com/arkoes07/cermin/internal/store"
+	"github.com/arkoes07/cermin/internal/cermin"
+	"github.com/arkoes07/cermin/internal/sqlite"
 	"github.com/arkoes07/cermin/internal/telegram"
 )
 
@@ -33,18 +33,18 @@ const (
 
 // ClassifyFunc gives a Thought's text a Classification, with one of kinds
 // and candidate Topics that reuse the existing topics where one fits, and
-// returns the Thought's language. (*classify.Classifier).Classify is one.
+// returns the Thought's language. (*claude.Classifier).Classify is one.
 type ClassifyFunc func(
 	ctx context.Context,
 	text string,
-	kinds []store.Kind,
+	kinds []cermin.Kind,
 	topics []string,
-) (c store.Classification, language string, err error)
+) (c cermin.Classification, language string, err error)
 
 // Bot moves Telegram updates into the inbox and captures the owner's Thoughts
 // from it. Its methods must not be called concurrently.
 type Bot struct {
-	db       *store.DB
+	db       *sqlite.DB
 	tg       *telegram.Client
 	ownerID  int64
 	classify ClassifyFunc
@@ -53,7 +53,7 @@ type Bot struct {
 
 // New returns a Bot that captures the Thoughts of the Telegram user ownerID,
 // ignoring everyone else, and classifies them with classify.
-func New(db *store.DB, tg *telegram.Client, ownerID int64, classify ClassifyFunc) *Bot {
+func New(db *sqlite.DB, tg *telegram.Client, ownerID int64, classify ClassifyFunc) *Bot {
 	return &Bot{db: db, tg: tg, ownerID: ownerID, classify: classify}
 }
 
@@ -84,7 +84,7 @@ func (b *Bot) Poll(ctx context.Context) error {
 		return err
 	}
 	for _, u := range updates {
-		row := store.InboxUpdate{ID: u.ID, Payload: u.Raw}
+		row := sqlite.InboxUpdate{ID: u.ID, Payload: u.Raw}
 		if m := u.Message; m != nil {
 			row.MessageID = m.ID
 			if m.ReplyToMessage != nil {
@@ -123,7 +123,7 @@ func (b *Bot) ProcessInbox(ctx context.Context) error {
 // Process handles one inbox update: the owner's text message becomes a
 // Thought, which is classified and gets an Acknowledgement. Anything else is
 // only marked processed.
-func (b *Bot) Process(ctx context.Context, in store.InboxUpdate) error {
+func (b *Bot) Process(ctx context.Context, in sqlite.InboxUpdate) error {
 	var update telegram.Update
 	if err := json.Unmarshal(in.Payload, &update); err != nil {
 		return fmt.Errorf("decoding: %w", err)
@@ -141,7 +141,7 @@ func (b *Bot) Process(ctx context.Context, in store.InboxUpdate) error {
 		return b.db.MarkProcessed(ctx, in.ID)
 	}
 
-	thought, err := b.db.SaveThought(ctx, store.Thought{
+	thought, err := b.db.SaveThought(ctx, cermin.Thought{
 		Text:               m.Text,
 		Source:             "telegram",
 		TGMessageID:        in.MessageID,
@@ -189,7 +189,7 @@ func (b *Bot) Process(ctx context.Context, in store.InboxUpdate) error {
 
 // classifyThought gives a Thought its Classification and returns the
 // Acknowledgement that shows it. It gives up after classifyTimeout.
-func (b *Bot) classifyThought(ctx context.Context, t store.Thought) (string, error) {
+func (b *Bot) classifyThought(ctx context.Context, t cermin.Thought) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, classifyTimeout)
 	defer cancel()
 
@@ -221,7 +221,7 @@ func (b *Bot) classifyThought(ctx context.Context, t store.Thought) (string, err
 	}
 	c.ThoughtID = t.ID
 	c.Source = "cermin"
-	c.Topics = classify.Keep(c.Topics)
+	c.Topics = cermin.KeepTopics(c.Topics)
 	if len(c.Topics) == 0 {
 		return "", errors.New("classified with no topic")
 	}
@@ -234,8 +234,8 @@ func (b *Bot) classifyThought(ctx context.Context, t store.Thought) (string, err
 
 // ackText is the Acknowledgement of a Thought classified as c, such as
 // "💡 idea · business, retail": the Kind and the kept Topics, best first.
-func ackText(kinds []store.Kind, c store.Classification) (string, error) {
-	i := slices.IndexFunc(kinds, func(k store.Kind) bool { return k.Name == c.Kind })
+func ackText(kinds []cermin.Kind, c cermin.Classification) (string, error) {
+	i := slices.IndexFunc(kinds, func(k cermin.Kind) bool { return k.Name == c.Kind })
 	if i < 0 {
 		return "", fmt.Errorf("classified with unknown kind %q", c.Kind)
 	}

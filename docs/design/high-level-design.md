@@ -118,6 +118,7 @@ flowchart TB
 | AI provider | [ADR-0006](../adr/0006-claude-classification-gemini-embeddings.md) | Claude Sonnet 5.5 classifies from day 1; gemini-embedding-2 from week 2; paid tiers only. |
 | Capture pipeline | [ADR-0007](../adr/0007-capture-durable-inbox-long-polling.md) | Long polling into a database inbox; the Thought is saved before any AI call. |
 | Data model | [ADR-0008](../adr/0008-append-only-classifications.md) | Append-only Classifications; every candidate Topic stored; Kinds in a table changed only by migrations. |
+| Code layout | [ADR-0009](../adr/0009-domain-package-and-inward-imports.md) | Clean architecture's dependency rule without its layer directories: the domain in `internal/cermin`, use cases and adapters as sibling packages, wiring in `cmd/cermin`. See [5.2](#52-code-layout). |
 | Deploy | | GitHub Actions runs `go vet` and `go test` on every push, then `fly deploy` on `main` once they pass. The inbox makes this safe: a handler bug leaves updates unprocessed, not lost. |
 
 ### 5.1 Environments
@@ -133,17 +134,27 @@ The laptop also hosts the MCP client (Claude Code or Desktop). In week 3, evalua
 
 ### 5.2 Code layout
 
-Module `github.com/arkoes07/cermin`:
+Module `github.com/arkoes07/cermin`. Imports point inward, toward `internal/cermin`, which imports only the standard library ([ADR-0009](../adr/0009-domain-package-and-inward-imports.md)):
 
-| Path | Holds |
-|---|---|
-| `cmd/cermin/` | `main` with subcommands: `serve` (wk 1), `import` (wk 2), `eval` (wk 3) |
-| `internal/telegram/` | Bot API client over `net/http`: `getUpdates`, `sendMessage`, `editMessageText`, `sendChatAction` |
-| `internal/store/` | SQLite access; migrations embedded and tracked with `PRAGMA user_version`; `PRAGMA foreign_keys = ON` |
-| `internal/classify/` | the Claude call, the prompt, the keep rule |
-| `internal/capture/` | the inbox handler, commands, the catch-up loop |
+| Path | Role | Holds |
+|---|---|---|
+| `internal/cermin/` | domain | the glossary types (Thought, Kind, Classification, candidate Topics) and the rules about them that need no I/O, such as the keep rule (`KeepTopics`) |
+| `internal/capture/` | use case | the inbox handler, commands, the catch-up loop |
+| `internal/sqlite/` | adapter | SQLite access; migrations embedded and tracked with `PRAGMA user_version`; `PRAGMA foreign_keys = ON` |
+| `internal/claude/` | adapter | Claude API calls; today the classification call, with its prompt and output schema |
+| `internal/telegram/` | adapter | Bot API client over `net/http`: `getUpdates`, `sendMessage`, `editMessageText`, `sendChatAction` |
+| `cmd/cermin/` | wiring | `main` with subcommands: `serve` (wk 1), `import` (wk 2), `eval` (wk 3); reads the environment and builds every part with its constructor, without a dependency-injection library |
 
-Later weeks add packages when they need them. Libraries:
+Later weeks add packages when they need them. New code goes in the first place that fits:
+
+1. **A glossary term, or a rule about one that needs no I/O**: `internal/cermin`.
+2. **Code that calls out of the process** (an API, the database, a file format): an adapter, named after what it talks to (`telegram`, `claude`, `sqlite`, `gemini`, `whatsapp`), so the glossary's words stay free for the domain and the use cases. `embed` is taken by the standard library and `import` is a Go keyword, hence `gemini` and `whatsapp`. An adapter may import `internal/cermin` and nothing else in this module.
+3. **Code that drives the adapters**: something you do or receive (Capture, Correction, Resurfacing, Ask, Digest), an endpoint that receives requests (MCP), or logic several of them share (Retrieval). It goes in a use-case package named after its job, such as `resurface`, `ask`, `digest`, `mcp` or `retrieval`. A use case may import `internal/cermin`, adapters and other use cases, and calls adapters directly. It declares a function type or interface for an adapter only when a second implementation arrives or a test needs a fake that a real instance can't provide, as `capture.ClassifyFunc` does for the Claude call.
+4. **Reading the environment, choosing implementations, building each part and starting it**: `cmd/cermin`. A part may still run goroutines of its own.
+
+Once week 3 adds a second classifier ([#10](https://github.com/Arkoes07/cermin/issues/10)), a `classify` use case takes the classifier adapters, such as `claude` and `jev`, and combines them behind one `Classify` method; `cmd/cermin` passes it to `capture` as its `ClassifyFunc`, and `capture` doesn't change. Until then `cmd/cermin` passes `claude`'s `Classify` directly, since a `classify` package would only forward the call.
+
+Libraries:
 - `modernc.org/sqlite`;
 - the official Anthropic Go SDK (`github.com/anthropics/anthropic-sdk-go`);
 - the official MCP Go SDK (`github.com/modelcontextprotocol/go-sdk`), from week 3;
@@ -450,7 +461,7 @@ Confidence is never shown.
   - Structured output, at low effort.
   - Confidence is the model's own stated value from 0 to 1 (method `verbalized-v1`).
   - `topics` lists up to 5 candidates, reusing existing names where one fits.
-  - The kept set is the candidates at or above 0.7, at most 3. If none pass, the single best is kept. Week 3 replaces the 0.7 placeholder (⏳).
+  - Every candidate comes back unkept. Cermin then keeps those at or above 0.7, at most 3, or the single best if none pass (`cermin.KeepTopics`). Week 3 replaces the 0.7 placeholder (⏳).
   - `kind_suggestion` is empty unless no Kind fits well.
 - **`embed(texts) → vectors`** (week 2).
 - **`answer(question, thoughts) → {text, cited_ids}`** (week 3).
@@ -467,6 +478,7 @@ Confidence is never shown.
 | AI provider | Claude Sonnet 5.5 for classification, gemini-embedding-2 for embeddings, paid tiers only. | [ADR-0006](../adr/0006-claude-classification-gemini-embeddings.md) |
 | Capture pipeline | Long polling into a durable inbox; save before classifying; reply after classification or 8 s. | [ADR-0007](../adr/0007-capture-durable-inbox-long-polling.md), PRD |
 | Data model | Append-only Classifications, every candidate Topic stored, Kinds table changed only by migration, hard delete with inbox scrubbing. | [ADR-0008](../adr/0008-append-only-classifications.md) |
+| Code layout | Domain types and rules in `internal/cermin`; imports point inward; no layer directories, and no interface until a second implementation or a test needs one. | [ADR-0009](../adr/0009-domain-package-and-inward-imports.md) |
 | Day-1 confidence | The model's stated confidence per Assignment (`verbalized-v1`); Topics kept at ≥ 0.7 as a placeholder. | ADR-0006 |
 | Kind and Topic names | English, except Declared Topics; prose follows the Thought's language. | CONTEXT.md |
 | Corrections | Reply commands; `/topics` replaces the set; Cermin's Classifications are kept. | CONTEXT.md |

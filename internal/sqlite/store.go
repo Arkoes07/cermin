@@ -1,6 +1,6 @@
-// Package store keeps Cermin's data in one SQLite file: the Telegram inbox,
+// Package sqlite keeps Cermin's data in one SQLite file: the Telegram inbox,
 // the Thoughts captured from it and their Classifications.
-package store
+package sqlite
 
 import (
 	"context"
@@ -14,6 +14,8 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite" // registers the "sqlite" driver; this package is its only user
+
+	"github.com/arkoes07/cermin/internal/cermin"
 )
 
 //go:embed migrations/*.sql
@@ -162,23 +164,10 @@ func (db *DB) MarkProcessed(ctx context.Context, updateID int64) error {
 	return nil
 }
 
-// Thought is a captured Thought.
-type Thought struct {
-	ID                 int64
-	Text               string
-	Source             string    // "telegram" or "whatsapp"
-	TGMessageID        int64     // the Telegram message that carried it
-	TGReplyToMessageID int64     // the message it replied to; 0 if none
-	AckMessageID       int64     // the Acknowledgement's message; 0 until sent
-	ThoughtAt          time.Time // Thought time
-	ReceivedAt         time.Time // when Cermin stored it
-	Language           string    // en, id or mixed; "" until classified
-}
-
 // SaveThought stores a Thought taken from a Telegram message and returns it
 // as stored. If that message's Thought is already stored, it is returned
 // unchanged, so saving the same message twice keeps one Thought.
-func (db *DB) SaveThought(ctx context.Context, t Thought) (Thought, error) {
+func (db *DB) SaveThought(ctx context.Context, t cermin.Thought) (cermin.Thought, error) {
 	_, err := db.pool.ExecContext(ctx, `
 		INSERT INTO thoughts (text, source, tg_message_id, tg_reply_to_message_id, thought_at, received_at)
 		VALUES (?, ?, ?, NULLIF(?, 0), ?, ?)
@@ -191,7 +180,7 @@ func (db *DB) SaveThought(ctx context.Context, t Thought) (Thought, error) {
 		formatTime(t.ReceivedAt),
 	)
 	if err != nil {
-		return Thought{}, fmt.Errorf("saving thought from message %d: %w", t.TGMessageID, err)
+		return cermin.Thought{}, fmt.Errorf("saving thought from message %d: %w", t.TGMessageID, err)
 	}
 	row := db.pool.QueryRowContext(ctx,
 		`SELECT `+thoughtColumns+` FROM thoughts WHERE tg_message_id = ?`,
@@ -199,7 +188,7 @@ func (db *DB) SaveThought(ctx context.Context, t Thought) (Thought, error) {
 	)
 	stored, err := scanThought(row)
 	if err != nil {
-		return Thought{}, fmt.Errorf("reading thought from message %d: %w", t.TGMessageID, err)
+		return cermin.Thought{}, fmt.Errorf("reading thought from message %d: %w", t.TGMessageID, err)
 	}
 	return stored, nil
 }
@@ -218,14 +207,14 @@ func (db *DB) SetAckMessageID(ctx context.Context, thoughtID, ackMessageID int64
 }
 
 // Thoughts returns every Thought, oldest first.
-func (db *DB) Thoughts(ctx context.Context) ([]Thought, error) {
+func (db *DB) Thoughts(ctx context.Context) ([]cermin.Thought, error) {
 	rows, err := db.pool.QueryContext(ctx, `SELECT `+thoughtColumns+` FROM thoughts ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("listing thoughts: %w", err)
 	}
 	defer rows.Close()
 
-	thoughts := []Thought{}
+	thoughts := []cermin.Thought{}
 	for rows.Next() {
 		t, err := scanThought(rows)
 		if err != nil {
@@ -243,8 +232,8 @@ func (db *DB) Thoughts(ctx context.Context) ([]Thought, error) {
 const thoughtColumns = `id, text, source, COALESCE(tg_message_id, 0), COALESCE(tg_reply_to_message_id, 0),
 	COALESCE(ack_message_id, 0), thought_at, received_at, COALESCE(language, '')`
 
-func scanThought(row interface{ Scan(dest ...any) error }) (Thought, error) {
-	var t Thought
+func scanThought(row interface{ Scan(dest ...any) error }) (cermin.Thought, error) {
+	var t cermin.Thought
 	var thoughtAt, receivedAt string
 	err := row.Scan(
 		&t.ID,
@@ -258,26 +247,19 @@ func scanThought(row interface{ Scan(dest ...any) error }) (Thought, error) {
 		&t.Language,
 	)
 	if err != nil {
-		return Thought{}, err
+		return cermin.Thought{}, err
 	}
 	if t.ThoughtAt, err = time.Parse(timeLayout, thoughtAt); err != nil {
-		return Thought{}, fmt.Errorf("thought %d: %w", t.ID, err)
+		return cermin.Thought{}, fmt.Errorf("thought %d: %w", t.ID, err)
 	}
 	if t.ReceivedAt, err = time.Parse(timeLayout, receivedAt); err != nil {
-		return Thought{}, fmt.Errorf("thought %d: %w", t.ID, err)
+		return cermin.Thought{}, fmt.Errorf("thought %d: %w", t.ID, err)
 	}
 	return t, nil
 }
 
-// Kind is a shape a Thought can have.
-type Kind struct {
-	Name       string
-	Emoji      string
-	Definition string // what it means, as the classifier's prompt gives it
-}
-
 // Kinds returns the Kinds in use, in the order they were added.
-func (db *DB) Kinds(ctx context.Context) ([]Kind, error) {
+func (db *DB) Kinds(ctx context.Context) ([]cermin.Kind, error) {
 	rows, err := db.pool.QueryContext(ctx,
 		`SELECT name, emoji, definition FROM kinds WHERE retired_at IS NULL ORDER BY rowid`)
 	if err != nil {
@@ -285,9 +267,9 @@ func (db *DB) Kinds(ctx context.Context) ([]Kind, error) {
 	}
 	defer rows.Close()
 
-	kinds := []Kind{}
+	kinds := []cermin.Kind{}
 	for rows.Next() {
-		var k Kind
+		var k cermin.Kind
 		if err := rows.Scan(&k.Name, &k.Emoji, &k.Definition); err != nil {
 			return nil, fmt.Errorf("reading kind: %w", err)
 		}
@@ -323,47 +305,22 @@ func (db *DB) TopicNames(ctx context.Context) ([]string, error) {
 	return names, nil
 }
 
-// Classification is the Kind and Topics a Thought was given at one moment, by
-// Cermin or in a Correction.
-type Classification struct {
-	ID               int64
-	ThoughtID        int64
-	Source           string // "cermin", "correction" or "declared"
-	Kind             string
-	KindConfidence   float64
-	Topics           []TopicCandidate // every candidate Topic, best first
-	Model            string           // the model that classified; "" for a Correction
-	PromptVersion    string
-	ConfidenceMethod string // how the confidences were measured
-	RawOutput        string // the model's output, verbatim
-	TGMessageID      int64  // the Correction's Telegram message; 0 if none
-	CreatedAt        time.Time
-}
-
-// TopicCandidate is a Topic considered for a Classification. A kept one is
-// assigned to the Thought; the others were considered and dropped.
-type TopicCandidate struct {
-	Name       string
-	Confidence float64
-	Kept       bool
-}
-
 // SaveClassification stores c and returns it as stored. A kept candidate whose
 // Topic doesn't exist yet creates it, with origin cermin. A candidate naming
 // an existing Topic, in any case, takes that Topic's spelling. A language
 // other than "" becomes the Thought's.
-func (db *DB) SaveClassification(ctx context.Context, c Classification, language string) (Classification, error) {
+func (db *DB) SaveClassification(ctx context.Context, c cermin.Classification, language string) (cermin.Classification, error) {
 	stored, err := db.saveClassification(ctx, c, language)
 	if err != nil {
-		return Classification{}, fmt.Errorf("saving classification of thought %d: %w", c.ThoughtID, err)
+		return cermin.Classification{}, fmt.Errorf("saving classification of thought %d: %w", c.ThoughtID, err)
 	}
 	return stored, nil
 }
 
-func (db *DB) saveClassification(ctx context.Context, c Classification, language string) (Classification, error) {
+func (db *DB) saveClassification(ctx context.Context, c cermin.Classification, language string) (cermin.Classification, error) {
 	tx, err := db.pool.BeginTx(ctx, nil)
 	if err != nil {
-		return Classification{}, err
+		return cermin.Classification{}, err
 	}
 	defer tx.Rollback() //nolint:errcheck // after Commit it only returns sql.ErrTxDone
 
@@ -385,10 +342,10 @@ func (db *DB) saveClassification(ctx context.Context, c Classification, language
 		formatTime(c.CreatedAt),
 	).Scan(&c.ID)
 	if err != nil {
-		return Classification{}, err
+		return cermin.Classification{}, err
 	}
 
-	topics := make([]TopicCandidate, 0, len(c.Topics))
+	topics := make([]cermin.TopicCandidate, 0, len(c.Topics))
 	for _, t := range c.Topics {
 		// ponytail: a kept name matching an archived Topic is assigned to it;
 		// skip archived Topics here once /topic archive exists.
@@ -400,7 +357,7 @@ func (db *DB) saveClassification(ctx context.Context, c Classification, language
 				formatTime(c.CreatedAt),
 			)
 			if err != nil {
-				return Classification{}, err
+				return cermin.Classification{}, err
 			}
 		}
 		err := tx.QueryRowContext(ctx, `
@@ -414,7 +371,7 @@ func (db *DB) saveClassification(ctx context.Context, c Classification, language
 			t.Kept,
 		).Scan(&t.Name)
 		if err != nil {
-			return Classification{}, err
+			return cermin.Classification{}, err
 		}
 		topics = append(topics, t)
 	}
@@ -427,18 +384,18 @@ func (db *DB) saveClassification(ctx context.Context, c Classification, language
 			c.ThoughtID,
 		)
 		if err != nil {
-			return Classification{}, err
+			return cermin.Classification{}, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return Classification{}, err
+		return cermin.Classification{}, err
 	}
 	return c, nil
 }
 
 // Classifications returns every Classification of the Thought thoughtID,
 // oldest first, so the last one is current.
-func (db *DB) Classifications(ctx context.Context, thoughtID int64) ([]Classification, error) {
+func (db *DB) Classifications(ctx context.Context, thoughtID int64) ([]cermin.Classification, error) {
 	rows, err := db.pool.QueryContext(ctx, `
 		SELECT id, thought_id, source, kind, COALESCE(kind_confidence, 0), COALESCE(model, ''),
 			COALESCE(prompt_version, ''), COALESCE(confidence_method, ''), COALESCE(raw_output, ''),
@@ -453,9 +410,9 @@ func (db *DB) Classifications(ctx context.Context, thoughtID int64) ([]Classific
 	}
 	defer rows.Close()
 
-	classifications := []Classification{}
+	classifications := []cermin.Classification{}
 	for rows.Next() {
-		var c Classification
+		var c cermin.Classification
 		var createdAt string
 		err := rows.Scan(
 			&c.ID,
@@ -494,7 +451,7 @@ func (db *DB) Classifications(ctx context.Context, thoughtID int64) ([]Classific
 
 // topicCandidates returns the candidate Topics of a Classification, in the
 // order they were stored.
-func (db *DB) topicCandidates(ctx context.Context, classificationID int64) ([]TopicCandidate, error) {
+func (db *DB) topicCandidates(ctx context.Context, classificationID int64) ([]cermin.TopicCandidate, error) {
 	rows, err := db.pool.QueryContext(ctx, `
 		SELECT topic_name, COALESCE(confidence, 0), kept
 		FROM classification_topics
@@ -507,9 +464,9 @@ func (db *DB) topicCandidates(ctx context.Context, classificationID int64) ([]To
 	}
 	defer rows.Close()
 
-	topics := []TopicCandidate{}
+	topics := []cermin.TopicCandidate{}
 	for rows.Next() {
-		var t TopicCandidate
+		var t cermin.TopicCandidate
 		if err := rows.Scan(&t.Name, &t.Confidence, &t.Kept); err != nil {
 			return nil, fmt.Errorf("reading topic of classification %d: %w", classificationID, err)
 		}

@@ -1,6 +1,6 @@
 //go:build integration
 
-package classify_test
+package claude_test
 
 import (
 	"cmp"
@@ -10,21 +10,22 @@ import (
 	"testing"
 	"time"
 
-	"github.com/arkoes07/cermin/internal/classify"
-	"github.com/arkoes07/cermin/internal/store"
+	"github.com/arkoes07/cermin/internal/cermin"
+	"github.com/arkoes07/cermin/internal/claude"
+	"github.com/arkoes07/cermin/internal/sqlite"
 )
 
 // TestClassifier_Classify calls Claude, so it needs ANTHROPIC_API_KEY:
 //
-//	go test -tags integration -v ./internal/classify/
+//	go test -tags integration -v ./internal/claude/
 func TestClassifier_Classify(t *testing.T) {
 	apiKey := os.Getenv("ANTHROPIC_API_KEY")
 	if apiKey == "" {
 		t.Skip("ANTHROPIC_API_KEY is not set")
 	}
-	db, err := store.Open(t.Context(), filepath.Join(t.TempDir(), "cermin.db"))
+	db, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "cermin.db"))
 	if err != nil {
-		t.Fatalf("store.Open: %v", err)
+		t.Fatalf("sqlite.Open: %v", err)
 	}
 	t.Cleanup(func() {
 		if err := db.Close(); err != nil {
@@ -35,7 +36,7 @@ func TestClassifier_Classify(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Kinds: %v", err)
 	}
-	classifier := classify.New(apiKey, cmp.Or(os.Getenv("CERMIN_CLASSIFY_MODEL"), classify.DefaultModel))
+	classifier := claude.New(apiKey, cmp.Or(os.Getenv("CERMIN_CLASSIFY_MODEL"), claude.DefaultModel))
 
 	tests := []struct {
 		name         string
@@ -64,7 +65,7 @@ func TestClassifier_Classify(t *testing.T) {
 			if language != tt.wantLanguage {
 				t.Errorf("language = %q, want %q", language, tt.wantLanguage)
 			}
-			if !slices.ContainsFunc(kinds, func(k store.Kind) bool { return k.Name == c.Kind }) {
+			if !slices.ContainsFunc(kinds, func(k cermin.Kind) bool { return k.Name == c.Kind }) {
 				t.Errorf("Kind = %q, want one of the Kinds", c.Kind)
 			}
 			if len(c.Topics) == 0 {
