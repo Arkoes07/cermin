@@ -1,16 +1,20 @@
-// Package capture turns the owner's Telegram messages into Thoughts. Every
-// update is stored in the inbox before anything else happens and processed
-// from there, so a crash or a failed reply never loses one.
+// Package capture turns the owner's Telegram messages into Thoughts and
+// classifies them. Every update is stored in the inbox before anything else
+// happens and processed from there, so a crash or a failed reply never loses
+// one.
 package capture
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/arkoes07/cermin/internal/classify"
 	"github.com/arkoes07/cermin/internal/store"
 	"github.com/arkoes07/cermin/internal/telegram"
 )
@@ -20,21 +24,37 @@ const (
 	pollTimeout = 50 * time.Second
 	// retryDelay is the pause after a failed poll.
 	retryDelay = 5 * time.Second
+	// classifyTimeout is how long an Acknowledgement waits for the Thought's
+	// Classification before it goes out without one.
+	classifyTimeout = 8 * time.Second
+	// savedAck is the Acknowledgement of a Thought not yet classified.
+	savedAck = "✓ saved"
 )
+
+// ClassifyFunc gives a Thought's text a Classification, with one of kinds
+// and candidate Topics that reuse the existing topics where one fits, and
+// returns the Thought's language. (*classify.Classifier).Classify is one.
+type ClassifyFunc func(
+	ctx context.Context,
+	text string,
+	kinds []store.Kind,
+	topics []string,
+) (c store.Classification, language string, err error)
 
 // Bot moves Telegram updates into the inbox and captures the owner's Thoughts
 // from it. Its methods must not be called concurrently.
 type Bot struct {
-	db      *store.DB
-	tg      *telegram.Client
-	ownerID int64
-	offset  int64 // the next update_id to ask Telegram for
+	db       *store.DB
+	tg       *telegram.Client
+	ownerID  int64
+	classify ClassifyFunc
+	offset   int64 // the next update_id to ask Telegram for
 }
 
-// New returns a Bot that captures the Thoughts of the Telegram user ownerID
-// and ignores everyone else.
-func New(db *store.DB, tg *telegram.Client, ownerID int64) *Bot {
-	return &Bot{db: db, tg: tg, ownerID: ownerID}
+// New returns a Bot that captures the Thoughts of the Telegram user ownerID,
+// ignoring everyone else, and classifies them with classify.
+func New(db *store.DB, tg *telegram.Client, ownerID int64, classify ClassifyFunc) *Bot {
+	return &Bot{db: db, tg: tg, ownerID: ownerID, classify: classify}
 }
 
 // Run processes the inbox and polls Telegram for more, until ctx is
@@ -101,8 +121,8 @@ func (b *Bot) ProcessInbox(ctx context.Context) error {
 }
 
 // Process handles one inbox update: the owner's text message becomes a
-// Thought and gets an Acknowledgement. Anything else is only marked
-// processed.
+// Thought, which is classified and gets an Acknowledgement. Anything else is
+// only marked processed.
 func (b *Bot) Process(ctx context.Context, in store.InboxUpdate) error {
 	var update telegram.Update
 	if err := json.Unmarshal(in.Payload, &update); err != nil {
@@ -136,7 +156,22 @@ func (b *Bot) Process(ctx context.Context, in store.InboxUpdate) error {
 	// processed before a crash. A crash between sending and storing it still
 	// sends a second one.
 	if thought.AckMessageID == 0 {
-		ack, err := b.tg.SendMessage(ctx, m.Chat.ID, "✓ saved", m.ID)
+		if err := b.tg.SendChatAction(ctx, m.Chat.ID, "typing"); err != nil {
+			slog.WarnContext(ctx, "showing typing", "thought_id", thought.ID, "err", err)
+		}
+		text, err := b.classifyThought(ctx, thought)
+		if err != nil {
+			// A slow or failing classifier never fails a Capture: the
+			// Thought is saved and stays unclassified for now.
+			slog.WarnContext(ctx, "classifying thought", "thought_id", thought.ID, "err", err)
+			text = savedAck
+		}
+		ack, err := b.tg.SendMessage(
+			ctx,
+			m.Chat.ID,
+			text,
+			m.ID,
+		)
 		if err != nil {
 			return err
 		}
@@ -150,4 +185,65 @@ func (b *Bot) Process(ctx context.Context, in store.InboxUpdate) error {
 		)
 	}
 	return b.db.MarkProcessed(ctx, in.ID)
+}
+
+// classifyThought gives a Thought its Classification and returns the
+// Acknowledgement that shows it. It gives up after classifyTimeout.
+func (b *Bot) classifyThought(ctx context.Context, t store.Thought) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, classifyTimeout)
+	defer cancel()
+
+	kinds, err := b.db.Kinds(ctx)
+	if err != nil {
+		return "", err
+	}
+	// A Thought processed again, because its Acknowledgement failed to send,
+	// keeps the Classification it already has.
+	classifications, err := b.db.Classifications(ctx, t.ID)
+	if err != nil {
+		return "", err
+	}
+	if n := len(classifications); n > 0 {
+		return ackText(kinds, classifications[n-1])
+	}
+	topics, err := b.db.TopicNames(ctx)
+	if err != nil {
+		return "", err
+	}
+	c, language, err := b.classify(
+		ctx,
+		t.Text,
+		kinds,
+		topics,
+	)
+	if err != nil {
+		return "", err
+	}
+	c.ThoughtID = t.ID
+	c.Source = "cermin"
+	c.Topics = classify.Keep(c.Topics)
+	if len(c.Topics) == 0 {
+		return "", errors.New("classified with no topic")
+	}
+	stored, err := b.db.SaveClassification(ctx, c, language)
+	if err != nil {
+		return "", err
+	}
+	return ackText(kinds, stored)
+}
+
+// ackText is the Acknowledgement of a Thought classified as c, such as
+// "💡 idea · business, retail": the Kind and the kept Topics, best first.
+func ackText(kinds []store.Kind, c store.Classification) (string, error) {
+	i := slices.IndexFunc(kinds, func(k store.Kind) bool { return k.Name == c.Kind })
+	if i < 0 {
+		return "", fmt.Errorf("classified with unknown kind %q", c.Kind)
+	}
+	topics := []string{}
+	for _, t := range c.Topics {
+		if t.Kept {
+			topics = append(topics, t.Name)
+		}
+	}
+	return kinds[i].Emoji + " " + c.Kind + " · " + strings.Join(topics, ", "), nil
 }

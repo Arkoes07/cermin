@@ -1,5 +1,5 @@
-// Package store keeps Cermin's data in one SQLite file: the Telegram inbox
-// and the Thoughts captured from it.
+// Package store keeps Cermin's data in one SQLite file: the Telegram inbox,
+// the Thoughts captured from it and their Classifications.
 package store
 
 import (
@@ -267,6 +267,258 @@ func scanThought(row interface{ Scan(dest ...any) error }) (Thought, error) {
 		return Thought{}, fmt.Errorf("thought %d: %w", t.ID, err)
 	}
 	return t, nil
+}
+
+// Kind is a shape a Thought can have.
+type Kind struct {
+	Name       string
+	Emoji      string
+	Definition string // what it means, as the classifier's prompt gives it
+}
+
+// Kinds returns the Kinds in use, in the order they were added.
+func (db *DB) Kinds(ctx context.Context) ([]Kind, error) {
+	rows, err := db.pool.QueryContext(ctx,
+		`SELECT name, emoji, definition FROM kinds WHERE retired_at IS NULL ORDER BY rowid`)
+	if err != nil {
+		return nil, fmt.Errorf("listing kinds: %w", err)
+	}
+	defer rows.Close()
+
+	kinds := []Kind{}
+	for rows.Next() {
+		var k Kind
+		if err := rows.Scan(&k.Name, &k.Emoji, &k.Definition); err != nil {
+			return nil, fmt.Errorf("reading kind: %w", err)
+		}
+		kinds = append(kinds, k)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("listing kinds: %w", err)
+	}
+	return kinds, nil
+}
+
+// TopicNames returns the names of the Topics that aren't archived, in name
+// order.
+func (db *DB) TopicNames(ctx context.Context) ([]string, error) {
+	rows, err := db.pool.QueryContext(ctx,
+		`SELECT name FROM topics WHERE archived_at IS NULL ORDER BY name`)
+	if err != nil {
+		return nil, fmt.Errorf("listing topics: %w", err)
+	}
+	defer rows.Close()
+
+	names := []string{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("reading topic: %w", err)
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("listing topics: %w", err)
+	}
+	return names, nil
+}
+
+// Classification is the Kind and Topics a Thought was given at one moment, by
+// Cermin or in a Correction.
+type Classification struct {
+	ID               int64
+	ThoughtID        int64
+	Source           string // "cermin", "correction" or "declared"
+	Kind             string
+	KindConfidence   float64
+	Topics           []TopicCandidate // every candidate Topic, best first
+	Model            string           // the model that classified; "" for a Correction
+	PromptVersion    string
+	ConfidenceMethod string // how the confidences were measured
+	RawOutput        string // the model's output, verbatim
+	TGMessageID      int64  // the Correction's Telegram message; 0 if none
+	CreatedAt        time.Time
+}
+
+// TopicCandidate is a Topic considered for a Classification. A kept one is
+// assigned to the Thought; the others were considered and dropped.
+type TopicCandidate struct {
+	Name       string
+	Confidence float64
+	Kept       bool
+}
+
+// SaveClassification stores c and returns it as stored. A kept candidate whose
+// Topic doesn't exist yet creates it, with origin cermin. A candidate naming
+// an existing Topic, in any case, takes that Topic's spelling. A language
+// other than "" becomes the Thought's.
+func (db *DB) SaveClassification(ctx context.Context, c Classification, language string) (Classification, error) {
+	stored, err := db.saveClassification(ctx, c, language)
+	if err != nil {
+		return Classification{}, fmt.Errorf("saving classification of thought %d: %w", c.ThoughtID, err)
+	}
+	return stored, nil
+}
+
+func (db *DB) saveClassification(ctx context.Context, c Classification, language string) (Classification, error) {
+	tx, err := db.pool.BeginTx(ctx, nil)
+	if err != nil {
+		return Classification{}, err
+	}
+	defer tx.Rollback() //nolint:errcheck // after Commit it only returns sql.ErrTxDone
+
+	c.CreatedAt = time.Now().UTC().Truncate(time.Millisecond) // as stored
+	err = tx.QueryRowContext(ctx, `
+		INSERT INTO classifications (thought_id, source, kind, kind_confidence, model, prompt_version,
+			confidence_method, raw_output, tg_message_id, created_at)
+		VALUES (?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, 0), ?)
+		RETURNING id`,
+		c.ThoughtID,
+		c.Source,
+		c.Kind,
+		c.KindConfidence,
+		c.Model,
+		c.PromptVersion,
+		c.ConfidenceMethod,
+		c.RawOutput,
+		c.TGMessageID,
+		formatTime(c.CreatedAt),
+	).Scan(&c.ID)
+	if err != nil {
+		return Classification{}, err
+	}
+
+	topics := make([]TopicCandidate, 0, len(c.Topics))
+	for _, t := range c.Topics {
+		// ponytail: a kept name matching an archived Topic is assigned to it;
+		// skip archived Topics here once /topic archive exists.
+		if t.Kept {
+			_, err := tx.ExecContext(ctx, `
+				INSERT INTO topics (name, origin, created_at) VALUES (?, 'cermin', ?)
+				ON CONFLICT (name) DO NOTHING`,
+				t.Name,
+				formatTime(c.CreatedAt),
+			)
+			if err != nil {
+				return Classification{}, err
+			}
+		}
+		err := tx.QueryRowContext(ctx, `
+			INSERT INTO classification_topics (classification_id, topic_name, confidence, kept)
+			VALUES (?, COALESCE((SELECT name FROM topics WHERE name = ?), ?), ?, ?)
+			RETURNING topic_name`,
+			c.ID,
+			t.Name,
+			t.Name,
+			t.Confidence,
+			t.Kept,
+		).Scan(&t.Name)
+		if err != nil {
+			return Classification{}, err
+		}
+		topics = append(topics, t)
+	}
+	c.Topics = topics
+
+	if language != "" {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE thoughts SET language = ? WHERE id = ?`,
+			language,
+			c.ThoughtID,
+		)
+		if err != nil {
+			return Classification{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return Classification{}, err
+	}
+	return c, nil
+}
+
+// Classifications returns every Classification of the Thought thoughtID,
+// oldest first, so the last one is current.
+func (db *DB) Classifications(ctx context.Context, thoughtID int64) ([]Classification, error) {
+	rows, err := db.pool.QueryContext(ctx, `
+		SELECT id, thought_id, source, kind, COALESCE(kind_confidence, 0), COALESCE(model, ''),
+			COALESCE(prompt_version, ''), COALESCE(confidence_method, ''), COALESCE(raw_output, ''),
+			COALESCE(tg_message_id, 0), created_at
+		FROM classifications
+		WHERE thought_id = ?
+		ORDER BY id`,
+		thoughtID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing classifications of thought %d: %w", thoughtID, err)
+	}
+	defer rows.Close()
+
+	classifications := []Classification{}
+	for rows.Next() {
+		var c Classification
+		var createdAt string
+		err := rows.Scan(
+			&c.ID,
+			&c.ThoughtID,
+			&c.Source,
+			&c.Kind,
+			&c.KindConfidence,
+			&c.Model,
+			&c.PromptVersion,
+			&c.ConfidenceMethod,
+			&c.RawOutput,
+			&c.TGMessageID,
+			&createdAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("reading classification of thought %d: %w", thoughtID, err)
+		}
+		if c.CreatedAt, err = time.Parse(timeLayout, createdAt); err != nil {
+			return nil, fmt.Errorf("classification %d: %w", c.ID, err)
+		}
+		classifications = append(classifications, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("listing classifications of thought %d: %w", thoughtID, err)
+	}
+
+	// ponytail: one query per Classification, fine for the few a Thought has;
+	// join them if a caller ever lists many Thoughts' Classifications.
+	for i := range classifications {
+		if classifications[i].Topics, err = db.topicCandidates(ctx, classifications[i].ID); err != nil {
+			return nil, err
+		}
+	}
+	return classifications, nil
+}
+
+// topicCandidates returns the candidate Topics of a Classification, in the
+// order they were stored.
+func (db *DB) topicCandidates(ctx context.Context, classificationID int64) ([]TopicCandidate, error) {
+	rows, err := db.pool.QueryContext(ctx, `
+		SELECT topic_name, COALESCE(confidence, 0), kept
+		FROM classification_topics
+		WHERE classification_id = ?
+		ORDER BY rowid`,
+		classificationID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing topics of classification %d: %w", classificationID, err)
+	}
+	defer rows.Close()
+
+	topics := []TopicCandidate{}
+	for rows.Next() {
+		var t TopicCandidate
+		if err := rows.Scan(&t.Name, &t.Confidence, &t.Kept); err != nil {
+			return nil, fmt.Errorf("reading topic of classification %d: %w", classificationID, err)
+		}
+		topics = append(topics, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("listing topics of classification %d: %w", classificationID, err)
+	}
+	return topics, nil
 }
 
 func formatTime(t time.Time) string {

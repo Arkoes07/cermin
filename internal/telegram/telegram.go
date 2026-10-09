@@ -104,6 +104,16 @@ func (c *Client) SendMessage(ctx context.Context, chatID int64, text string, rep
 	return sent, nil
 }
 
+// SendChatAction shows action, such as "typing", in the chat until the bot
+// sends a message there or a few seconds pass.
+func (c *Client) SendChatAction(ctx context.Context, chatID int64, action string) error {
+	ctx, cancel := context.WithTimeout(ctx, sendTimeout)
+	defer cancel()
+
+	var ok bool
+	return c.call(ctx, "sendChatAction", map[string]any{"chat_id": chatID, "action": action}, &ok)
+}
+
 // call invokes a Bot API method and decodes its result into result.
 func (c *Client) call(ctx context.Context, method string, params, result any) error {
 	body, err := json.Marshal(params)
