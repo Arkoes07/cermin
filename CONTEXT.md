@@ -4,6 +4,8 @@ Indonesian for "mirror". A personal tool that turns a stream of short, random th
 
 ## Language
 
+An _Avoid_ list governs words: prose, chat replies and test names. A code or schema identifier may use a short form of a term, such as "ack" for Acknowledgement, as long as it uses the same form everywhere.
+
 **Thought**:
 A single free-text message captured into Cermin, in English or Bahasa Indonesia. Permanent once captured: it can be deleted, which erases it completely, but never edited.
 _Avoid_: Note, post, entry, tweet
