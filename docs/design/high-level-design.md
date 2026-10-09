@@ -479,5 +479,5 @@ Confidence is never shown.
 | Week | Open question |
 |---|---|
 | 2 | Strong-match definition and threshold for Resurfacing; Embedding dimensions; Reaction mechanism: inline buttons vs native reactions; How the WhatsApp export reaches the server. |
-| 3 | Classifier comparison: Claude Haiku 5.5, Sonnet 5.5, Opus 5.5 and Jev on the labelled set, for accuracy and calibration. The outcome is the cheapest model that holds accuracy, or a cascade. Confidence method beyond the day-1 one; The strong-Topic threshold; Whether `kind_suggestion` evidence justifies a new Kind; How the evaluation set is built, since Corrections alone contain only errors; Declared Topic matching; Ask retrieval size and model; The final MCP tool list. |
+| 3 | Classifier comparison: Claude Haiku 5.5, Sonnet 5.5, Opus 5.5 and Jev on the labelled set, for accuracy and calibration. The outcome is the cheapest model that holds accuracy, or a cascade ([#10](https://github.com/Arkoes07/cermin/issues/10)). Confidence method beyond the day-1 one; The strong-Topic threshold; Whether `kind_suggestion` evidence justifies a new Kind; How the evaluation set is built, since Corrections alone contain only errors; Declared Topic matching; Ask retrieval size and model; The final MCP tool list. |
 | 4 | Loop detection; Digest content and model; Portrait method, trigger and model. |

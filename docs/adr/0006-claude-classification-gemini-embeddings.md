@@ -18,5 +18,5 @@ Each provider sits behind one function, `classify` or `embed`, and the model nam
 
 - Claude exposes no token probabilities. Day-1 confidence is therefore the model's own stated confidence (method `verbalized-v1`), stored with each Assignment. It is expected to be poorly calibrated, and measuring how poorly is part of week 3.
 - Two API accounts, two keys, two spend caps.
-- In week 3, Claude Haiku 5.5, Sonnet 5.5, Opus 5.5 and Jev are compared on the hand-labelled set for accuracy and calibration. The reruns go through the Batch API at half price. The outcome is either the cheapest model that holds accuracy, or a cascade: a cheap classifier first, escalating to a stronger model when it is unsure or a new Topic is needed.
+- In week 3, Claude Haiku 5.5, Sonnet 5.5, Opus 5.5 and Jev are compared on the hand-labelled set for accuracy and calibration. The reruns go through the Batch API at half price. The outcome is either the cheapest model that holds accuracy, or a cascade: a cheap classifier first, escalating to a stronger model when it is unsure or a new Topic is needed. Tracked in [#10](https://github.com/Arkoes07/cermin/issues/10).
 - Changing the embedding model means re-embedding the Corpus, which costs cents. Embeddings are stored per model, so old and new can coexist during a comparison.
