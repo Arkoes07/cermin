@@ -5,12 +5,20 @@ Indonesian for "mirror". A personal tool that turns a stream of short, random th
 ## Language
 
 **Thought**:
-A single free-text message captured into Cermin, in English or Bahasa Indonesia. Permanent once captured: it can be deleted, never edited.
+A single free-text message captured into Cermin, in English or Bahasa Indonesia. Permanent once captured: it can be deleted, which erases it completely, but never edited.
 _Avoid_: Note, post, entry, tweet
+
+**Thought time**:
+When you had the Thought, taken as the moment you sent it and read in your home timezone (WIB). Not when Cermin received or processed it.
+_Avoid_: Created at, timestamp, received time
 
 **Capture**:
 The act of sending a Thought into Cermin.
 _Avoid_: Log, post, tweet, submit
+
+**Acknowledgement**:
+Cermin's reply to a Capture, showing the Thought's Kind and Topics. It describes a single Thought, so it is not an Insight and takes no Reaction.
+_Avoid_: Receipt, confirmation, ack
 
 **Ask**:
 A question you put to Cermin about your Corpus, marked with an explicit command. Anything sent without the command is a Thought, even if it is phrased as a question.
@@ -23,7 +31,7 @@ _Avoid_: Thought corpus, journal, database
 ### Classification
 
 **Kind**:
-The shape of a Thought, from a small fixed set: idea, question, observation, reflection, plan. A "business idea" is Kind idea with Topic business.
+The shape of a Thought, from a small set that changes only when you decide to. It starts as idea, question, observation, reflection and plan. A "business idea" is Kind idea with Topic business.
 _Avoid_: Type, category
 
 **Topic**:
@@ -33,6 +41,18 @@ _Avoid_: Category, tag, label, activity category, area
 **Declared Topic**:
 A Topic you create yourself with a name and a description, such as a project, a book or the job hunt. Cermin uses your exact name, applies it to past Thoughts too, and stops using it once you archive it.
 _Avoid_: Project, custom topic, pinned topic
+
+**Assignment**:
+One Kind or Topic given to a Thought, either by Cermin with a confidence, or by you through a Correction. Kind and Topic names are English, except a Declared Topic's.
+_Avoid_: Label, tag, prediction
+
+**Classification**:
+The Kind and Topics a Thought was given at one moment, by Cermin or by you in a Correction. A Thought keeps every Classification: the latest is current, and Cermin's first is what accuracy is measured against.
+_Avoid_: Label, tagging, classification run
+
+**Correction**:
+Your reply that gives a Thought a new Classification, replacing its Kind or its whole set of Topics.
+_Avoid_: Edit, fix, override
 
 ### Insights
 

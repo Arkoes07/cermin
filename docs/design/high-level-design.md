@@ -1,0 +1,483 @@
+# Cermin: high-level design
+
+Status: **accepted**, 2026-10-09. Each week updates its own open questions ([section 10](#10-designed-in-their-week)). Product: [PRD](../product/PRD.md). Vocabulary: [CONTEXT.md](../../CONTEXT.md). Decisions: [docs/adr/](../adr/).
+
+This document describes the whole v1 solution, weeks 1 to 4. The choices that are hard to undo are settled here: runtime, storage, hosting, AI provider, capture pipeline, MCP transport and data model. Thresholds and algorithms are designed in their own week; [section 10](#10-designed-in-their-week) lists them. That covers strong Topic, strong Resurfacing match, Loops, Digest, Portrait and Declared Topic matching.
+
+## 1. Capacity plan
+
+| Quantity | Estimate | Basis |
+|---|---|---|
+| Thoughts | 5/day on average; plan for 30/day peaks | PRD |
+| Corpus size | ~75 imported from WhatsApp, then ~150/month: ~400 by 8 Nov, ~2,000 after a year | 3 Oct to go-live at 5/day |
+| Thought length | ~200 characters (~60 tokens) on average; 4,096 max | Telegram message limit |
+| Telegram updates | 10 to 40/day: Thoughts, commands, Reactions | |
+| LLM calls | 10 to 30/day: one Classification per Thought, plus Ask, weekly Digest and occasional Portrait | |
+| Tokens | under 1M/month in total | |
+| MCP calls | tens/day at most | |
+| Storage per Thought | ~20 KB: text 0.5 KB, raw update 2 KB, Classifications 3 KB, embedding ~12 KB (3,072 float32) | |
+| Database size | ~10 MB by 8 Nov, ~40 MB after a year | |
+| Similarity search | brute force: 2,000 × 3,072 ≈ 6M multiply-adds per query, about a millisecond; all vectors in RAM ≈ 25 MB | no vector index needed below ~100k Thoughts |
+| Concurrency | one writer; a few concurrent readers (MCP) | |
+
+### Monthly cost
+
+| Item | Cost |
+|---|---|
+| Fly.io machine, shared-cpu-1x 256 MB, `iad` | $2.19 |
+| Fly volume, 1 GB | $0.15 |
+| Backups on Cloudflare R2 (free tier: 10 GB, free egress) | $0 |
+| Classification on Claude Sonnet 5.5 ($2 / $10 per MTok), low effort: 150 × ~1.5k in, ~350 out | ~$1 to $1.50 |
+| Ask on Claude Sonnet 5.5: ~60 × 5k in, 500 out | ~$0.90 |
+| Digest on Sonnet 5.5: 4 runs | ~$0.20 |
+| Portrait on Claude Opus 5.5 ($4 / $20): ~4 runs × 30k in, ~15k out incl. thinking | ~$1.70 |
+| Embeddings, gemini-embedding-2 ($0.20 per MTok) | < $0.01 |
+| Week-3 evaluation reruns (Haiku, Sonnet, Opus on the labelled set, via the Batch API at half price) | ~$2, once |
+| **Total** | **≈ $8 in the month with evaluation, ≈ $6 otherwise; under the $10 cap** |
+
+The models for Ask, Digest and Portrait are upper bounds; each picks its own in its week. Both AI provider accounts have spend caps.
+
+## 2. Non-functional requirements
+
+| Area | Requirement | How it is met |
+|---|---|---|
+| Capture durability | A Thought that Telegram accepted is never lost. | The raw update is committed to SQLite before any AI call. Telegram keeps undelivered updates for 24 h. Litestream streams the database to R2, so at most ~1 s of data is at risk. |
+| Capture independent of AI | A slow or failing AI never blocks saving. | The Acknowledgement goes out once classification finishes or after 8 s, whichever comes first. A catch-up loop classifies the Thought later and edits the Acknowledgement. |
+| Latency | Acknowledgement ≤ 8 s (typically a few seconds). Resurfacing ≤ 10 s after Capture. `/ask` ≤ 30 s. MCP search ≤ 2 s. | One process, local SQLite, brute-force search in memory. |
+| Availability | Best effort on one machine. An outage of up to 24 h loses nothing. A deploy means a few seconds of downtime. | Telegram buffers updates; MCP clients retry; Fly restarts the machine when `/healthz` fails. |
+| Recovery | Under 1 h to rebuild from backup. | `litestream restore` onto a fresh volume; restore drill in week 1. |
+| Privacy | The Corpus is never public. | Owner-only bot, by Telegram user ID. MCP behind a bearer token over TLS. Paid AI tiers only, which don't train on inputs. Thought text is never written to logs. `/delete` scrubs the database; backups age out after 7 days. |
+| Security | No secrets or real Thoughts in the repo or its issues. | Fly and GitHub secrets; test fixtures use made-up Thoughts. |
+| Cost | ≤ $10/month for everything. | [Section 1](#monthly-cost). |
+| Portability | Someone else can run their own Cermin on other hosting or models. | Nothing in the code is host-specific: one binary, a SQLite file and environment variables, needing only a disk and outbound internet. Long polling needs no inbound URL. Each AI provider sits behind one function (`classify`, `embed`) with the model name in config, so another provider is one new implementation ([ADR-0006](../adr/0006-claude-classification-gemini-embeddings.md)). |
+| Evaluability | Everything week 3 needs to measure accuracy and calibration exists from day 1. | [Section 6.4](#64-recorded-from-day-1). |
+| Language | English, Bahasa Indonesia and mixed Thoughts are accepted. | Kind and Topic names are English, except a Declared Topic's; prose follows the Thought's language. |
+| Operability | One person can run it. | One binary; deploy on push to `main`; structured logs; schema migrations embedded in the binary. |
+
+## 3. High-level diagram
+
+```mermaid
+flowchart LR
+    you(["You, on the phone"]) -->|Thoughts, commands, replies| tg["Telegram Bot API"]
+    tg <-->|long polling, replies| cermin["Cermin service<br/>one Go process on Fly.io"]
+    cermin <--> db[("SQLite<br/>on a Fly volume")]
+    db -.->|Litestream, continuous| r2[("Cloudflare R2<br/>backups")]
+    cermin -->|classify, answer, summarise| claude["Claude API"]
+    cermin -->|embed, from week 2| gemini["Gemini embeddings API"]
+    client(["Claude Code / Claude Desktop<br/>on the laptop"]) -->|MCP over HTTPS, bearer token, from week 3| cermin
+```
+
+## 4. Architecture
+
+```mermaid
+flowchart TB
+    subgraph fly["Fly.io machine: shared-cpu-1x, 256 MB, 1 GB volume"]
+        ls["litestream replicate -exec 'cermin serve'"]
+        subgraph app["cermin serve"]
+            poller["Telegram poller"] --> inbox[("telegram_updates<br/>inbox")]
+            inbox --> handler["Update handler:<br/>Capture, commands, Reactions"]
+            handler --> classifier["Classifier"]
+            catchup["Catch-up loop, every minute"] --> classifier
+            catchup --> embedder["Embedder (wk 2)"]
+            handler --> resurfacer["Resurfacer (wk 2)"]
+            handler --> asker["Ask (wk 3)"]
+            http["HTTP server: /healthz, /mcp (wk 3)"] --> retrieval["Retrieval"]
+            asker --> retrieval
+            resurfacer --> retrieval
+            scheduler["Scheduler: Digest (wk 4)"]
+        end
+        vol[("cermin.db")]
+        ls -.-> vol
+        app <--> vol
+    end
+```
+
+| Component | Week | Responsibility |
+|---|---|---|
+| Telegram poller | 1 | Long-polls `getUpdates`, writes each raw update into the `telegram_updates` inbox, then confirms the offset. |
+| Update handler | 1 | Works through inbox rows in order: owner check, Capture, `/delete`, `/kind`, `/topics`, edge cases; later `/ask`, `/topic` and Reactions. |
+| Classifier | 1 | One Claude call per Thought with structured output: Kind, candidate Topics, stated confidences, language, `kind_suggestion`. |
+| Catch-up loop | 1 | Every minute: classifies Thoughts that have no Classification, sends missing Acknowledgements, edits `✓ saved` ones. From week 2 it also embeds. |
+| HTTP server | 1 | `/healthz` for Fly; `/mcp` from week 3. |
+| Embedder | 2 | Embeds Thoughts and queries; backfills when the embedding model changes. |
+| Resurfacer | 2 | Finds strong matches for a new Thought and sends at most 2 as an Insight with 👍/👎. |
+| Retrieval | 2 to 3 | Brute-force cosine over in-memory vectors, filtered by Topic, Kind or time. Shared by Resurfacing, Ask and MCP. |
+| Ask | 3 | `/ask`: retrieval, then Claude answers with citations. |
+| MCP handler | 3 | Read-only tools over Streamable HTTP. |
+| Scheduler | 4 | Sunday-morning Digest (WIB); runs a missed Digest on startup. |
+| Litestream | 1 | Wraps the process, replicates the database to R2, restores on boot when the volume is empty. |
+
+## 5. Runtime decisions
+
+| Decision | Record | Summary |
+|---|---|---|
+| Language | | Go for all of v1. |
+| Process shape and storage | [ADR-0003](../adr/0003-one-process-embedded-sqlite.md) | One binary, one process: bot, workers, MCP endpoint and scheduler. SQLite in WAL mode with a pure-Go driver, replicated by Litestream. Subcommands handle one-off jobs: `serve`, `import` (wk 2), `eval` (wk 3). |
+| MCP transport | [ADR-0004](../adr/0004-remote-mcp-bearer-token.md) | Streamable HTTP inside the same process, bearer token, no OAuth in v1. |
+| Hosting | [ADR-0005](../adr/0005-fly-single-machine-r2-backups.md) | Fly.io, one always-on machine in `iad`; Litestream backups on Cloudflare R2. |
+| AI provider | [ADR-0006](../adr/0006-claude-classification-gemini-embeddings.md) | Claude Sonnet 5.5 classifies from day 1; gemini-embedding-2 from week 2; paid tiers only. |
+| Capture pipeline | [ADR-0007](../adr/0007-capture-durable-inbox-long-polling.md) | Long polling into a database inbox; the Thought is saved before any AI call. |
+| Data model | [ADR-0008](../adr/0008-append-only-classifications.md) | Append-only Classifications; every candidate Topic stored; Kinds in a table changed only by migrations. |
+| Deploy | | GitHub Actions runs `go vet` and `go test` on every push, then `fly deploy` on `main` once they pass. The inbox makes this safe: a handler bug leaves updates unprocessed, not lost. |
+
+### 5.1 Environments
+
+| | Production | Development |
+|---|---|---|
+| Where | the Fly machine | whoever is coding: your laptop or an agent's sandbox |
+| Telegram bot | the production bot you use daily | a separate dev bot, since two pollers can't share a token |
+| Database | `/data/cermin.db` on the Fly volume, replicated to R2 | `data/cermin.db` (gitignored) |
+| Purpose | serves you | tries changes before they deploy; never serves you |
+
+The laptop also hosts the MCP client (Claude Code or Desktop). In week 3, evaluation runs there on a copy restored from R2. Neither of these serves the product.
+
+### 5.2 Code layout
+
+Module `github.com/arkoes07/cermin`:
+
+| Path | Holds |
+|---|---|
+| `cmd/cermin/` | `main` with subcommands: `serve` (wk 1), `import` (wk 2), `eval` (wk 3) |
+| `internal/telegram/` | Bot API client over `net/http`: `getUpdates`, `sendMessage`, `editMessageText`, `sendChatAction` |
+| `internal/store/` | SQLite access; migrations embedded and tracked with `PRAGMA user_version`; `PRAGMA foreign_keys = ON` |
+| `internal/classify/` | the Claude call, the prompt, the keep rule |
+| `internal/capture/` | the inbox handler, commands, the catch-up loop |
+
+Later weeks add packages when they need them. Libraries:
+- `modernc.org/sqlite`;
+- the official Anthropic Go SDK (`github.com/anthropics/anthropic-sdk-go`);
+- the official MCP Go SDK (`github.com/modelcontextprotocol/go-sdk`), from week 3;
+- the standard library for everything else.
+
+### 5.3 Configuration and secrets
+
+| Variable | Week | Where it is set | Purpose |
+|---|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | 1 | Fly secret; `.env` locally | Production or dev bot token |
+| `TELEGRAM_OWNER_ID` | 1 | Fly secret; `.env` | Your numeric Telegram user ID; every other sender is ignored |
+| `ANTHROPIC_API_KEY` | 1 | Fly secret; `.env` | Claude |
+| `CERMIN_DB_PATH` | 1 | `fly.toml` (`/data/cermin.db`); default `data/cermin.db` | Database file |
+| `CERMIN_CLASSIFY_MODEL` | 1 | optional; default `claude-sonnet-5-5` | Classification model |
+| `R2_ENDPOINT`, `R2_BUCKET`, `LITESTREAM_ACCESS_KEY_ID`, `LITESTREAM_SECRET_ACCESS_KEY` | 1 | Fly secrets | Litestream replica on R2 |
+| `FLY_API_TOKEN` | 1 | GitHub Actions secret | Deploy on push to `main` |
+| `GEMINI_API_KEY` | 2 | Fly secret; `.env` | Embeddings |
+| `CERMIN_MCP_TOKEN` | 3 | Fly secret; MCP client config | MCP bearer token |
+
+Values that only change with a deploy are constants in code: the WIB timezone (`Asia/Jakarta`), the 8 s Acknowledgement wait, and the 0.7 placeholder keep threshold.
+
+## 6. Data model
+
+```mermaid
+erDiagram
+    TELEGRAM_UPDATES {
+        int update_id PK
+        text payload "raw Telegram JSON"
+        int message_id
+        int reply_to_message_id
+        datetime received_at
+        datetime processed_at
+    }
+    THOUGHTS {
+        int id PK
+        text text
+        text source "telegram or whatsapp"
+        int tg_message_id UK
+        int tg_reply_to_message_id
+        int ack_message_id UK
+        datetime thought_at "UTC"
+        datetime received_at "UTC"
+        text language "en, id or mixed"
+    }
+    KINDS {
+        text name PK
+        text emoji
+        text definition "used in the prompt"
+        datetime created_at
+        datetime retired_at
+    }
+    CLASSIFICATIONS {
+        int id PK
+        int thought_id FK
+        text source "cermin, correction or declared"
+        text kind FK
+        real kind_confidence
+        text model
+        text prompt_version
+        text confidence_method
+        text raw_output "includes kind_suggestion"
+        int tg_message_id "the Correction's message"
+        datetime created_at
+    }
+    CLASSIFICATION_TOPICS {
+        int classification_id FK
+        text topic_name "matches TOPICS.name ignoring case"
+        real confidence
+        bool kept
+    }
+    TOPICS {
+        int id PK
+        text name UK "case-insensitive"
+        text origin "cermin, you or declared"
+        text description
+        datetime created_at
+        datetime declared_at
+        datetime archived_at
+    }
+    EMBEDDINGS {
+        int thought_id FK
+        text model
+        blob vector "float32"
+        datetime created_at
+    }
+    INSIGHTS {
+        int id PK
+        text type "resurfacing, ask, digest or portrait"
+        int thought_id FK "trigger, nullable"
+        text question
+        text body
+        text meta "model, threshold, version"
+        int tg_message_id UK
+        datetime created_at
+    }
+    INSIGHT_CITATIONS {
+        int insight_id FK
+        int thought_id FK
+        real score
+    }
+    REACTIONS {
+        int id PK
+        int insight_id FK
+        int value "+1 or -1"
+        datetime created_at
+    }
+    THOUGHTS ||--o{ CLASSIFICATIONS : "classified by"
+    KINDS ||--o{ CLASSIFICATIONS : "assigned in"
+    CLASSIFICATIONS ||--o{ CLASSIFICATION_TOPICS : proposes
+    TOPICS |o--o{ CLASSIFICATION_TOPICS : "kept as"
+    THOUGHTS ||--o{ EMBEDDINGS : has
+    THOUGHTS |o--o{ INSIGHTS : triggers
+    INSIGHTS ||--o{ INSIGHT_CITATIONS : cites
+    THOUGHTS ||--o{ INSIGHT_CITATIONS : "cited by"
+    INSIGHTS ||--o{ REACTIONS : receives
+```
+
+Each table is created in the week that first needs it:
+- **Week 1:** `telegram_updates`, `thoughts`, `kinds`, `topics`, `classifications`, `classification_topics`.
+- **Week 2:** `embeddings`, `insights`, `insight_citations`, `reactions`.
+
+### 6.1 Where each glossary term lives
+
+| [CONTEXT.md](../../CONTEXT.md) term | Stored as |
+|---|---|
+| Thought | a `thoughts` row |
+| Thought time | `thoughts.thought_at` |
+| Capture | turning a `telegram_updates` row into a `thoughts` row |
+| Acknowledgement | the Telegram message whose ID is `thoughts.ack_message_id`; not stored as a row |
+| Kind | a `kinds` row |
+| Classification | a `classifications` row |
+| Assignment of a Kind | `classifications.kind` and `kind_confidence` |
+| Assignment of a Topic | a `classification_topics` row with `kept = true`; rows with `kept = false` are candidates Cermin considered and dropped |
+| Correction | a `classifications` row with `source = correction` |
+| Topic, Declared Topic | a `topics` row; declared when `declared_at` is set |
+| Insight: Resurfacing, answer to an Ask, Digest, Portrait | an `insights` row, by `type` |
+| Reaction | a `reactions` row |
+| Loop | not stored; computed for the Digest and the Portrait (wk 4) |
+| Corpus | all `thoughts` rows |
+
+`telegram_updates` is the one table with no glossary term, because it is plumbing:
+- **The inbox.** Every update Telegram sends (a new message, an edit, a button press) is written there as raw JSON before anything else happens. The handler works through the rows in order. If Cermin crashes mid-way, the row stays unprocessed and is retried on restart.
+- **The raw log.** If parsing gets something wrong, the original is still there to replay.
+- **Delete support.** The `message_id` and `reply_to_message_id` columns exist so `/delete` can find and scrub every row that carries the deleted text.
+
+### 6.2 Rules
+
+- **Classifications are append-only.** A Thought's current Kind and Topics are those of its latest Classification. A Correction or a Declared Topic backfill adds a Classification, and nothing is updated in place. Cermin's first Classification is therefore always there to measure accuracy against.
+- **Every candidate Topic is stored**, with its confidence and a `kept` flag marking the ones shown. Week 3 tunes the "strong" threshold on this history without re-running the model.
+- **Topics are created only when used.** A `topics` row is created the first time a Topic is kept, or given in a Correction. Dropped candidates are stored by name only, so a name Cermin considered and dropped never enters the Topic list the classifier sees.
+- **Kinds and Topics are both tables, but grow differently.**
+  - Topics grow as Cermin and you use new names. A Classification has 1 to 3 of them, hence the link table.
+  - A Classification has exactly one Kind, so `classifications.kind` references `kinds`. Kinds change only by migration, together with a prompt-version bump, never at runtime and never by a Correction.
+  - When no Kind fits well, the model's `kind_suggestion` (inside `raw_output`) records the shape it would have named. That is the evidence for a future Kind.
+- **Thought time vs arrival time.** `thought_at` is Telegram's message `date`, or the export timestamp for WhatsApp imports. `received_at` is when Cermin stored it. Both are UTC and read in WIB.
+- **Topic names** are unique ignoring case.
+  - Names created by Cermin, or given in a Correction, are English lowercase.
+  - Declared Topics keep your spelling.
+  - Declaring a name that already exists turns that same row into a Declared Topic, so its Thoughts come with it.
+- **Embeddings are keyed by (Thought, model).** Two models can sit side by side for comparison, and switching models is a backfill that costs cents.
+- **Routing replies.** `thoughts.ack_message_id` maps a reply to an Acknowledgement back to its Thought, and `insights.tg_message_id` maps a 👍/👎 back to its Insight.
+- **Delete is a hard delete.** Deleting a Thought cascades to its Classifications, embeddings and citations. The `telegram_updates` rows whose `message_id` or `reply_to_message_id` point at the Thought or its Acknowledgement are deleted too, because a reply carries the text of the message it replies to. Insights keep their body as sent, and backups age out within 7 days.
+
+### 6.3 Topic lifecycle
+
+| Timestamp | Set when |
+|---|---|
+| `created_at` | Cermin or you first use the name |
+| `declared_at` | `/topic add` declares the Topic or takes it over |
+| `archived_at` | `/topic archive` stops new tagging |
+
+### 6.4 Recorded from day 1
+
+These can't be reconstructed later, so week 1 records them:
+
+1. **Raw inbound updates.** Every Telegram update as raw JSON in `telegram_updates`. Parsing bugs can be replayed, and edits are logged.
+2. **The Thought.** Its verbatim text, Thought time, arrival time and Telegram message ID, the message it replied to, the Acknowledgement's message ID, and its detected language.
+3. **Every Classification Cermin makes.**
+   - the model, prompt version and confidence method;
+   - the raw model output, including `kind_suggestion`;
+   - the Kind and its confidence;
+   - every candidate Topic and its confidence, including the dropped ones.
+4. **Corrections** as new Classifications. Cermin's are never changed.
+5. **Bot message IDs** for every Acknowledgement and Insight, so replies and Reactions find their target.
+6. **Topic lifecycle timestamps** ([6.3](#63-topic-lifecycle)).
+7. **From week 2, every Insight sent**, with the cited Thoughts, their scores, and the threshold and version used.
+
+## 7. Data flows
+
+### 7.1 Capture (week 1)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor You
+    participant TG as Telegram
+    participant P as Poller
+    participant DB as SQLite
+    participant H as Handler
+    participant AI as Claude
+    You->>TG: Thought
+    P->>TG: getUpdates (long poll)
+    TG-->>P: update
+    P->>DB: insert raw update into inbox
+    H->>DB: insert Thought (thought_at, received_at)
+    H->>TG: sendChatAction "typing"
+    H->>AI: classify(text, Kinds, Topics), timeout 8 s
+    alt classified in time
+        AI-->>H: language, Kind, candidate Topics, confidences
+        H->>DB: insert Classification and candidate Topics
+        H->>TG: reply "💡 idea · business, retail"
+    else AI slow or down
+        H->>TG: reply "✓ saved"
+    end
+    H->>DB: store Acknowledgement message ID, mark update processed
+    Note over H,DB: The catch-up loop later classifies any unclassified Thought and edits its Acknowledgement.
+```
+
+Every step is idempotent. The Thought is unique on its Telegram message ID, and an update is processed again after a crash until it is marked processed. A Thought with no Acknowledgement ID gets one from the catch-up loop.
+
+### 7.2 Correction (week 1)
+
+1. You reply to a Thought or its Acknowledgement with `/kind plan` or `/topics rust, cermin`.
+2. The handler finds the Thought from the replied-to message ID, whether it is the Thought's own or its Acknowledgement's.
+3. It adds a Classification with source `correction`.
+   - `/kind` copies the current Topics. An unknown Kind gets the list of Kinds as a reply.
+   - `/topics` copies the current Kind and replaces the whole Topic set (1 to 3). An unknown Topic name is created with origin `you`.
+4. It edits the Acknowledgement to show the corrected Kind and Topics, marked ✏️.
+
+### 7.3 Delete (week 1)
+
+1. You reply `/delete` to a Thought or its Acknowledgement.
+2. In one transaction, the handler deletes the Thought and scrubs its `telegram_updates` rows ([6.2](#62-rules)), including the `/delete` update itself.
+3. It edits the Acknowledgement to `🗑 deleted`.
+
+### 7.4 Later weeks (outline)
+
+- **Resurfacing (wk 2).** After classification, Cermin embeds the Thought and scores it against every other Thought. If the best matches pass the threshold (⏳), it sends at most 2 as an Insight with 👍/👎 buttons. It stores the Insight, citations, scores and threshold.
+- **WhatsApp import (wk 2).** Cermin parses the chat export and creates Thoughts with `source = whatsapp` and the export's timestamps, deduped on time and text. The catch-up loop then classifies and embeds them. How the file reaches the server is decided in week 2 (⏳).
+- **Ask (wk 3).** `/ask <question>` embeds the question, retrieves the top Thoughts, and has Claude answer citing them. The answer is stored as an Insight.
+- **MCP (wk 3).** Claude Code or Desktop calls read-only retrieval tools, and the client's model writes the answer.
+- **Declared Topics (wk 3).** `/topic add` creates the Topic or takes it over. Cermin then backfills past Thoughts that match (⏳ matching), adding Classifications with source `declared`.
+- **Accuracy (wk 3).** Compares Cermin's first Classification against Corrections and hand-labelled Thoughts. Calibration compares stored confidence against the same.
+- **Digest, Loops, Portrait (wk 4).** The scheduler sends the Digest every Sunday morning (WIB). Loops and the Portrait are computed from the Corpus, with every claim citing Thought IDs.
+
+## 8. API design
+
+### 8.1 Telegram commands
+
+| Input | Where | Week | Effect |
+|---|---|---|---|
+| plain text | anywhere | 1 | Captures a Thought. A plain-text reply to an old Thought is a new Thought that records which message it replied to. |
+| `/delete` | reply to a Thought or its Acknowledgement | 1 | Hard-deletes the Thought. |
+| `/kind <kind>` | reply | 1 | Correction of the Kind; only existing Kinds. |
+| `/topics <a>, <b>, <c>` | reply | 1 | Correction that replaces the whole Topic set (1 to 3). |
+| `/start`, `/help` | anywhere | 1 | Lists the commands. |
+| 👍 / 👎 | buttons on an Insight | 2 | Reaction. |
+| `/ask <question>` | anywhere | 3 | Ask. |
+| `/topic add <name> <description>` | anywhere | 3 | Declares a Topic, or updates its description. |
+| `/topic archive <name>` | anywhere | 3 | Archives a Declared Topic. |
+
+Edge cases:
+
+| Message | What happens |
+|---|---|
+| From anyone but the owner | Ignored silently. |
+| Not text (photo, voice, sticker, file) | Gets "Text only for now." and is not captured. |
+| An edited message | The original stays. The edit gets "Edits aren't saved. Send it as a new Thought." |
+| Forwarded text | Captured, with Thought time = when you forwarded it. |
+| An unknown command | Gets the command list. |
+| Anything starting with `/` | Treated as a command, never as a Thought. |
+
+All messages are sent as plain text, with no Markdown parse mode.
+
+### 8.2 Acknowledgement format
+
+The format is `<Kind emoji> <kind> · <topic>, <topic>`, for example `💡 idea · business, retail`.
+- **Kind emoji:** 💡 idea, ❓ question, 👀 observation, 🪞 reflection, 📋 plan.
+- **Pending:** `✓ saved`, edited once the Classification arrives.
+- **Corrected:** prefixed with ✏️.
+- **Deleted:** `🗑 deleted`.
+
+Confidence is never shown.
+
+### 8.3 MCP (week 3)
+
+- Endpoint: `https://<app>.fly.dev/mcp`, Streamable HTTP, `Authorization: Bearer <token>`.
+- Claude Code: `claude mcp add --transport http cermin https://<app>.fly.dev/mcp --header "Authorization: Bearer <token>"`.
+- Claude Desktop: the `mcp-remote` stdio bridge (via `npx`) with the same header.
+- Tools (read-only; the final list is set in week 3):
+  - `search_thoughts(query, topic?, kind?, since?, until?, limit?)` → Thoughts with ID, Thought time, Kind, Topics and score.
+  - `list_topics()` → name, declared or not, description, Thought count, last seen.
+
+### 8.4 HTTP
+
+| Path | Week | Purpose |
+|---|---|---|
+| `/healthz` | 1 | 200 while the last successful `getUpdates` finished under 2 minutes ago, else 503; Fly restarts the machine on failure. |
+| `/mcp` | 3 | MCP Streamable HTTP endpoint. |
+
+### 8.5 AI contracts
+
+- **`classify(text, kinds, topics)`** returns `{language, kind: {value, confidence}, topics: [{name, confidence}], kind_suggestion}`.
+  - Structured output, at low effort.
+  - Confidence is the model's own stated value from 0 to 1 (method `verbalized-v1`).
+  - `topics` lists up to 5 candidates, reusing existing names where one fits.
+  - The kept set is the candidates at or above 0.7, at most 3. If none pass, the single best is kept. Week 3 replaces the 0.7 placeholder (⏳).
+  - `kind_suggestion` is empty unless no Kind fits well.
+- **`embed(texts) → vectors`** (week 2).
+- **`answer(question, thoughts) → {text, cited_ids}`** (week 3).
+
+## 9. Decisions log
+
+| Area | Decision | Record |
+|---|---|---|
+| Schedule | Milestones moved one week: week 1 is 12–18 Oct, the gate is 8 Nov. | PRD |
+| Language | Go. | |
+| Process and storage | One Go process, embedded SQLite, Litestream backups. | [ADR-0003](../adr/0003-one-process-embedded-sqlite.md) |
+| MCP clients and transport | Claude Code and Claude Desktop over Streamable HTTP with a bearer token; no OAuth in v1. | [ADR-0004](../adr/0004-remote-mcp-bearer-token.md) |
+| Hosting | Fly.io, one machine in `iad`, backups on R2. | [ADR-0005](../adr/0005-fly-single-machine-r2-backups.md) |
+| AI provider | Claude Sonnet 5.5 for classification, gemini-embedding-2 for embeddings, paid tiers only. | [ADR-0006](../adr/0006-claude-classification-gemini-embeddings.md) |
+| Capture pipeline | Long polling into a durable inbox; save before classifying; reply after classification or 8 s. | [ADR-0007](../adr/0007-capture-durable-inbox-long-polling.md), PRD |
+| Data model | Append-only Classifications, every candidate Topic stored, Kinds table changed only by migration, hard delete with inbox scrubbing. | [ADR-0008](../adr/0008-append-only-classifications.md) |
+| Day-1 confidence | The model's stated confidence per Assignment (`verbalized-v1`); Topics kept at ≥ 0.7 as a placeholder. | ADR-0006 |
+| Kind and Topic names | English, except Declared Topics; prose follows the Thought's language. | CONTEXT.md |
+| Corrections | Reply commands; `/topics` replaces the set; Cermin's Classifications are kept. | CONTEXT.md |
+| Kinds | Starting five, defined in the PRD; changed only by your decision. | PRD, ADR-0008 |
+| Time | UTC stored, read in WIB; no per-Thought timezone in v1. | |
+| Deploy | Tests on every push; deploy on `main` once they pass. | [5](#5-runtime-decisions) |
+
+## 10. Designed in their week
+
+| Week | Open question |
+|---|---|
+| 2 | Strong-match definition and threshold for Resurfacing; Embedding dimensions; Reaction mechanism: inline buttons vs native reactions; How the WhatsApp export reaches the server. |
+| 3 | Classifier comparison: Claude Haiku 5.5, Sonnet 5.5, Opus 5.5 and Jev on the labelled set, for accuracy and calibration. The outcome is the cheapest model that holds accuracy, or a cascade. Confidence method beyond the day-1 one; The strong-Topic threshold; Whether `kind_suggestion` evidence justifies a new Kind; How the evaluation set is built, since Corrections alone contain only errors; Declared Topic matching; Ask retrieval size and model; The final MCP tool list. |
+| 4 | Loop detection; Digest content and model; Portrait method, trigger and model. |

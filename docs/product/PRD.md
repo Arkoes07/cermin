@@ -1,6 +1,6 @@
 # Cermin: Product Requirements (v1)
 
-Status: accepted, 2026-10-03. Vocabulary: [CONTEXT.md](../../CONTEXT.md).
+Status: accepted, 2026-10-03. Milestones moved one week later on 2026-10-09. Vocabulary: [CONTEXT.md](../../CONTEXT.md).
 
 ## Problem
 
@@ -42,7 +42,7 @@ One user: me. Mostly English or Bahasa Indonesia, occasionally mixed. Capture ha
 ### Capture
 
 - I send a Thought as a text message to a **Telegram bot**.
-- Cermin acknowledges **instantly**. Capture **never fails** because the AI is slow or down; classification and Insights can catch up later.
+- Cermin replies **within a few seconds** with the Thought's Kind and Topics. Capture **never fails** because the AI is slow or down: the Thought is saved first, and classification and Insights catch up later.
 - Thoughts are permanent. I can remove one by replying to it with `/delete`; there is no edit.
 - **One-time import**: Thoughts captured in WhatsApp's "Message yourself" chat from 2026-10-03 until the bot is live are imported from a chat export, so the Corpus doesn't start empty.
 
@@ -53,6 +53,19 @@ One user: me. Mostly English or Bahasa Indonesia, occasionally mixed. Capture ha
 - Both are shown compactly in the acknowledgement, e.g. `💡 idea · business, retail`.
 - Cermin **stores** how confident it was in each assignment but **never shows** it in chat. Comparing stored confidence against my corrections shows whether "90% sure" really means right 90% of the time.
 - I can correct Kind or Topics by replying. Corrections feed the evaluation set used to measure accuracy.
+- **Kinds change only when I decide to.** Cermin never invents a Kind. When a Thought fits none of them well, it picks the closest one and notes the shape it would have named; those notes are the evidence for adding a Kind later. Corrections can only use existing Kinds.
+
+The starting Kinds:
+
+| Kind | Means | Example |
+|---|---|---|
+| 💡 idea | a possibility I could act on or build, not yet committed | "What if small shops could restock by chat?" |
+| ❓ question | something I'm asking, of myself or the world, with no answer yet | "Why does Go still not have sum types?" |
+| 👀 observation | something I noticed or learned about the world or other people | "Cafés near the office are full at 3pm." |
+| 🪞 reflection | looking inward: feelings, values, lessons about myself | "I procrastinate more when a task is vague." |
+| 📋 plan | something I intend or decided to do | "Start running on Saturdays." |
+
+A mood is a reflection, a quote or a "TIL" is an observation, and a decision is a plan.
 
 ### Declared Topics
 
@@ -109,7 +122,7 @@ One user: me. Mostly English or Bahasa Indonesia, occasionally mixed. Capture ha
 - **AI:** a hosted AI API for v1, chosen for quality on Bahasa Indonesia and for speed of shipping. Comparing it with a self-hosted model on my own evaluation set is a planned experiment, not a v1 requirement.
 - **Privacy:** my Thoughts may go to the AI provider's API. The Corpus is **never public**.
 
-## Success checks (end of week 4, 2026-11-01)
+## Success checks (end of week 4, 2026-11-08)
 
 1. **The habit holds:** at least 3 Thoughts a day, on average, in week 4.
 2. **Resurfacing works:** at least 5 Resurfacings rated 👍.
@@ -124,11 +137,11 @@ Weeks run Monday to Sunday.
 
 | Week | Dates | Ships |
 |---|---|---|
-| 0 | Sat 3 Oct | Product docs; start capturing in WhatsApp "Message yourself" |
-| 1 | 5–11 Oct | Capture and classification live in Telegram; using Cermin daily begins |
-| 2 | 12–18 Oct | Resurfacing, Reactions, WhatsApp import |
-| 3 | 19–25 Oct | Accuracy measured, `/ask`, Declared Topics, MCP server |
-| 4 | 26 Oct – 1 Nov | Digest, Loops, Portrait; gate review |
+| 0 | 3–11 Oct | Product docs and technical design; start capturing in WhatsApp "Message yourself" |
+| 1 | 12–18 Oct | Capture and classification live in Telegram; using Cermin daily begins |
+| 2 | 19–25 Oct | Resurfacing, Reactions, WhatsApp import |
+| 3 | 26 Oct – 1 Nov | Accuracy measured, `/ask`, Declared Topics, MCP server |
+| 4 | 2–8 Nov | Digest, Loops, Portrait; gate review |
 
 ## Product decisions not worth an ADR
 
