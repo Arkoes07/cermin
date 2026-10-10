@@ -22,12 +22,22 @@ type Kind struct {
 	Definition string // what it means, as the classifier's prompt gives it
 }
 
+// Source is where a Classification came from.
+type Source string
+
+const (
+	// SourceCermin is a Classification Cermin gave.
+	SourceCermin Source = "cermin"
+	// SourceCorrection is your Correction.
+	SourceCorrection Source = "correction"
+)
+
 // Classification is the Kind and Topics a Thought was given at one moment, by
 // Cermin or in a Correction.
 type Classification struct {
 	ID               int64
 	ThoughtID        int64
-	Source           string // "cermin", "correction" or "declared"
+	Source           Source
 	Kind             string
 	KindConfidence   float64          // 0 for a Correction, which states none
 	Topics           []TopicCandidate // every candidate Topic, best first; a Correction's are all kept, in your order
@@ -103,7 +113,7 @@ func (c Classification) CorrectKind(kind string, kinds []Kind) (Classification, 
 	for _, name := range c.KeptTopics() {
 		topics = append(topics, TopicCandidate{Name: name, Kept: true})
 	}
-	return Classification{ThoughtID: c.ThoughtID, Source: "correction", Kind: kind, Topics: topics}, true
+	return Classification{ThoughtID: c.ThoughtID, Source: SourceCorrection, Kind: kind, Topics: topics}, true
 }
 
 // CorrectTopics returns your Correction of a Thought classified as c, which
@@ -124,7 +134,7 @@ func (c Classification) CorrectTopics(names []string) (Classification, bool) {
 	if len(topics) == 0 || len(topics) > maxKept {
 		return Classification{}, false
 	}
-	return Classification{ThoughtID: c.ThoughtID, Source: "correction", Kind: c.Kind, Topics: topics}, true
+	return Classification{ThoughtID: c.ThoughtID, Source: SourceCorrection, Kind: c.Kind, Topics: topics}, true
 }
 
 // lowerName is name trimmed and lowercased, as Kind and Topic names are

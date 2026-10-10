@@ -103,7 +103,7 @@ func TestBot_ProcessInbox_CapturesOwnerText(t *testing.T) {
 	gotClassification.ID, gotClassification.CreatedAt = 0, time.Time{}
 	wantClassification := cermin.Classification{
 		ThoughtID:      got.ID,
-		Source:         "cermin",
+		Source:         cermin.SourceCermin,
 		Kind:           "idea",
 		KindConfidence: 0.9,
 		Topics: []cermin.TopicCandidate{
@@ -147,103 +147,44 @@ func TestBot_ProcessInbox_CapturesForwardedTextAtForwardTime(t *testing.T) {
 	}
 }
 
+// The keep rule itself is specified by the domain's tests. This one checks
+// only that Capture stores and shows what the rule returns, so it holds
+// however the rule is tuned.
 func TestBot_ProcessInbox_KeepsStrongTopics(t *testing.T) {
 	t.Parallel()
-	tests := []struct {
-		name       string
-		candidates []cermin.TopicCandidate
-		wantAck    string
-		wantStored []cermin.TopicCandidate // every candidate, best first
-		wantTopics []string                // the Topics that exist afterwards
-	}{
-		{
-			name: "those at 0.7 or above, best first",
-			candidates: []cermin.TopicCandidate{
-				{Name: "cities", Confidence: 0.7},
-				{Name: "transport", Confidence: 0.95},
-				{Name: "design", Confidence: 0.4},
-			},
-			wantAck: "💡 idea · transport, cities",
-			wantStored: []cermin.TopicCandidate{
-				{Name: "transport", Confidence: 0.95, Kept: true},
-				{Name: "cities", Confidence: 0.7, Kept: true},
-				{Name: "design", Confidence: 0.4},
-			},
-			wantTopics: []string{"cities", "transport"},
-		},
-		{
-			name: "at most 3",
-			candidates: []cermin.TopicCandidate{
-				{Name: "data", Confidence: 0.72},
-				{Name: "transport", Confidence: 0.95},
-				{Name: "cities", Confidence: 0.8},
-				{Name: "design", Confidence: 0.75},
-			},
-			wantAck: "💡 idea · transport, cities, design",
-			wantStored: []cermin.TopicCandidate{
-				{Name: "transport", Confidence: 0.95, Kept: true},
-				{Name: "cities", Confidence: 0.8, Kept: true},
-				{Name: "design", Confidence: 0.75, Kept: true},
-				{Name: "data", Confidence: 0.72},
-			},
-			wantTopics: []string{"cities", "design", "transport"},
-		},
-		{
-			name: "the single best when none reaches 0.7",
-			candidates: []cermin.TopicCandidate{
-				{Name: "design", Confidence: 0.5},
-				{Name: "cities", Confidence: 0.6},
-				{Name: "data", Confidence: 0.3},
-			},
-			wantAck: "💡 idea · cities",
-			wantStored: []cermin.TopicCandidate{
-				{Name: "cities", Confidence: 0.6, Kept: true},
-				{Name: "design", Confidence: 0.5},
-				{Name: "data", Confidence: 0.3},
-			},
-			wantTopics: []string{"cities"},
-		},
-		{
-			name: "names lowercased, blank and repeated ones dropped",
-			candidates: []cermin.TopicCandidate{
-				{Name: " Transport ", Confidence: 0.9},
-				{Name: "", Confidence: 0.99},
-				{Name: "transport", Confidence: 0.8},
-				{Name: "Cities", Confidence: 0.75},
-			},
-			wantAck: "💡 idea · transport, cities",
-			wantStored: []cermin.TopicCandidate{
-				{Name: "transport", Confidence: 0.9, Kept: true},
-				{Name: "cities", Confidence: 0.75, Kept: true},
-			},
-			wantTopics: []string{"cities", "transport"},
-		},
+	ctx := t.Context()
+	// Out of order, with more clearly strong candidates than a Thought keeps
+	// and a clearly weak one.
+	candidates := []cermin.TopicCandidate{
+		{Name: "design", Confidence: 0.1},
+		{Name: "cities", Confidence: 0.85},
+		{Name: "transport", Confidence: 0.95},
+		{Name: "data", Confidence: 0.8},
+		{Name: "buses", Confidence: 0.9},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			ctx := t.Context()
-			classifier := &fakeClassifier{candidates: tt.candidates}
-			bot, db, api := newBot(t, classifier.classify)
-			api.queue(textUpdate(t, ownerID, "What if bus stops showed how full the next bus is?", 0))
+	wantStored := cermin.KeepTopics(candidates)
+	kept := cermin.Classification{Topics: wantStored}.KeptTopics()
+	classifier := &fakeClassifier{candidates: candidates}
+	bot, db, api := newBot(t, classifier.classify)
+	api.queue(textUpdate(t, ownerID, "What if bus stops showed how full the next bus is?", 0))
 
-			thought := captureQueued(t, bot, db)
+	thought := captureQueued(t, bot, db)
 
-			wantSent := []sentMessage{{ChatID: ownerID, Text: tt.wantAck, ReplyToID: messageID}}
-			if sent := api.sentMessages(); !slices.Equal(sent, wantSent) {
-				t.Errorf("sent %+v, want %+v", sent, wantSent)
-			}
-			classifications, err := db.Classifications(ctx, thought.ID)
-			if err != nil || len(classifications) != 1 {
-				t.Fatalf("Classifications = %+v, %v; want 1", classifications, err)
-			}
-			if got := classifications[0].Topics; !slices.Equal(got, tt.wantStored) {
-				t.Errorf("stored candidates %+v, want %+v", got, tt.wantStored)
-			}
-			if got, err := db.TopicNames(ctx); err != nil || !slices.Equal(got, tt.wantTopics) {
-				t.Errorf("TopicNames = %q, %v; want %q", got, err, tt.wantTopics)
-			}
-		})
+	wantAck := "💡 idea · " + strings.Join(kept, ", ")
+	wantSent := []sentMessage{{ChatID: ownerID, Text: wantAck, ReplyToID: messageID}}
+	if sent := api.sentMessages(); !slices.Equal(sent, wantSent) {
+		t.Errorf("sent %+v, want %+v", sent, wantSent)
+	}
+	classifications, err := db.Classifications(ctx, thought.ID)
+	if err != nil || len(classifications) != 1 {
+		t.Fatalf("Classifications = %+v, %v; want 1", classifications, err)
+	}
+	if got := classifications[0].Topics; !slices.Equal(got, wantStored) {
+		t.Errorf("stored candidates %+v, want %+v", got, wantStored)
+	}
+	wantTopics := slices.Sorted(slices.Values(kept))
+	if got, err := db.TopicNames(ctx); err != nil || !slices.Equal(got, wantTopics) {
+		t.Errorf("TopicNames = %q, %v; want %q", got, err, wantTopics)
 	}
 }
 
@@ -585,7 +526,7 @@ func TestBot_ProcessInbox_CorrectsKindKeepingTopics(t *testing.T) {
 			got.ID, got.CreatedAt = 0, time.Time{}
 			want := cermin.Classification{
 				ThoughtID: thought.ID,
-				Source:    "correction",
+				Source:    cermin.SourceCorrection,
 				Kind:      "plan",
 				Topics: []cermin.TopicCandidate{
 					{Name: "transport", Kept: true},
@@ -642,14 +583,14 @@ func TestBot_ProcessInbox_CorrectsTopicsKeepingKind(t *testing.T) {
 	want := []cermin.Classification{
 		{
 			ThoughtID:   thought.ID,
-			Source:      "correction",
+			Source:      cermin.SourceCorrection,
 			Kind:        "idea",
 			Topics:      correctedTopics,
 			TGMessageID: commandID,
 		},
 		{
 			ThoughtID:   thought.ID,
-			Source:      "correction",
+			Source:      cermin.SourceCorrection,
 			Kind:        "plan",
 			Topics:      correctedTopics,
 			TGMessageID: commandID + 1,

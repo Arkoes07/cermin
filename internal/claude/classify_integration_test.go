@@ -32,10 +32,7 @@ func TestClassifier_Classify(t *testing.T) {
 			t.Errorf("closing store: %v", err)
 		}
 	})
-	kinds, err := db.Kinds(t.Context())
-	if err != nil {
-		t.Fatalf("Kinds: %v", err)
-	}
+	kinds := db.Kinds()
 	classifier := claude.New(apiKey, cmp.Or(os.Getenv("CERMIN_CLASSIFY_MODEL"), claude.DefaultModel))
 
 	tests := []struct {

@@ -3,6 +3,7 @@ package sqlite
 import (
 	"database/sql"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"testing"
 	"time"
@@ -16,28 +17,11 @@ import (
 func TestDB_SaveClassification_StoresCorrection(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
-	db, err := Open(ctx, filepath.Join(t.TempDir(), "cermin.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Errorf("Close: %v", err)
-		}
-	})
-	thought, err := db.SaveThought(ctx, cermin.Thought{
-		Text:        "Start running on Saturdays.",
-		Source:      "telegram",
-		TGMessageID: 7,
-		ThoughtAt:   time.Now(),
-		ReceivedAt:  time.Now(),
-	})
-	if err != nil {
-		t.Fatalf("SaveThought: %v", err)
-	}
-	_, err = db.SaveClassification(ctx, cermin.Classification{
+	db := openDB(t)
+	thought := saveThought(t, db)
+	_, err := db.SaveClassification(ctx, cermin.Classification{
 		ThoughtID:        thought.ID,
-		Source:           "cermin",
+		Source:           cermin.SourceCermin,
 		Kind:             "idea",
 		KindConfidence:   0.9,
 		Topics:           []cermin.TopicCandidate{{Name: "running", Confidence: 0.9, Kept: true}},
@@ -63,7 +47,7 @@ func TestDB_SaveClassification_StoresCorrection(t *testing.T) {
 
 	correction, err := db.SaveClassification(ctx, cermin.Classification{
 		ThoughtID: thought.ID,
-		Source:    "correction",
+		Source:    cermin.SourceCorrection,
 		Kind:      "plan",
 		Topics: []cermin.TopicCandidate{
 			{Name: "running", Kept: true},
@@ -114,4 +98,89 @@ func TestDB_SaveClassification_StoresCorrection(t *testing.T) {
 	if want := []string{"Cermin declared", "health you", "running cermin"}; !slices.Equal(topicOrigins, want) {
 		t.Errorf("topics = %q, want %q", topicOrigins, want)
 	}
+}
+
+func TestDB_CurrentClassification(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	db := openDB(t)
+	thought := saveThought(t, db)
+
+	_, isClassified, err := db.CurrentClassification(ctx, thought.ID)
+	if err != nil || isClassified {
+		t.Fatalf("CurrentClassification of an unclassified Thought: %t, %v; want false", isClassified, err)
+	}
+
+	// Each one saved is current, with its own candidate Topics.
+	classifications := []cermin.Classification{
+		{
+			ThoughtID:      thought.ID,
+			Source:         cermin.SourceCermin,
+			Kind:           "idea",
+			KindConfidence: 0.9,
+			Topics: []cermin.TopicCandidate{
+				{Name: "running", Confidence: 0.9, Kept: true},
+				{Name: "weekend", Confidence: 0.4},
+			},
+			Model:            "claude-test",
+			PromptVersion:    "classify-v1",
+			ConfidenceMethod: "verbalized-v1",
+			RawOutput:        "{}",
+		},
+		{
+			ThoughtID:   thought.ID,
+			Source:      cermin.SourceCorrection,
+			Kind:        "plan",
+			Topics:      []cermin.TopicCandidate{{Name: "running", Kept: true}},
+			TGMessageID: 20,
+		},
+		{
+			ThoughtID:   thought.ID,
+			Source:      cermin.SourceCorrection,
+			Kind:        "plan",
+			Topics:      []cermin.TopicCandidate{{Name: "health", Kept: true}, {Name: "habits", Kept: true}},
+			TGMessageID: 21,
+		},
+	}
+	for i, c := range classifications {
+		want, err := db.SaveClassification(ctx, c, "")
+		if err != nil {
+			t.Fatalf("SaveClassification %d: %v", i, err)
+		}
+		got, isClassified, err := db.CurrentClassification(ctx, thought.ID)
+		if err != nil || !isClassified || !reflect.DeepEqual(got, want) {
+			t.Errorf("after saving %d, CurrentClassification = %+v, %t, %v; want %+v", i, got, isClassified, err, want)
+		}
+	}
+}
+
+// openDB opens a new database in a temporary directory.
+func openDB(t *testing.T) *DB {
+	t.Helper()
+	db, err := Open(t.Context(), filepath.Join(t.TempDir(), "cermin.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	return db
+}
+
+// saveThought saves a Thought from Telegram message 7 in db and returns it.
+func saveThought(t *testing.T, db *DB) cermin.Thought {
+	t.Helper()
+	thought, err := db.SaveThought(t.Context(), cermin.Thought{
+		Text:        "Start running on Saturdays.",
+		Source:      "telegram",
+		TGMessageID: 7,
+		ThoughtAt:   time.Now(),
+		ReceivedAt:  time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("SaveThought: %v", err)
+	}
+	return thought
 }

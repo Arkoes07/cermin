@@ -50,6 +50,15 @@ type Message struct {
 	ReplyToMessage *Message `json:"reply_to_message"`
 }
 
+// ReplyToID returns the ID of the message m replies to, or 0 if m is nil or
+// isn't a reply.
+func (m *Message) ReplyToID() int64 {
+	if m == nil || m.ReplyToMessage == nil {
+		return 0
+	}
+	return m.ReplyToMessage.ID
+}
+
 // User is a Telegram user or bot.
 type User struct {
 	ID int64 `json:"id"`

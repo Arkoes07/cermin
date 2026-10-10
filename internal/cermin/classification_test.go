@@ -89,7 +89,7 @@ func TestClassification_CorrectKind(t *testing.T) {
 	current := cermin.Classification{
 		ID:             1,
 		ThoughtID:      9,
-		Source:         "cermin",
+		Source:         cermin.SourceCermin,
 		Kind:           "idea",
 		KindConfidence: 0.9,
 		Topics: []cermin.TopicCandidate{
@@ -110,7 +110,7 @@ func TestClassification_CorrectKind(t *testing.T) {
 			kind: " Plan ",
 			want: cermin.Classification{
 				ThoughtID: 9,
-				Source:    "correction",
+				Source:    cermin.SourceCorrection,
 				Kind:      "plan",
 				Topics:    []cermin.TopicCandidate{{Name: "running", Kept: true}, {Name: "habits", Kept: true}},
 			},
@@ -135,7 +135,7 @@ func TestClassification_CorrectTopics(t *testing.T) {
 	current := cermin.Classification{
 		ID:             1,
 		ThoughtID:      9,
-		Source:         "cermin",
+		Source:         cermin.SourceCermin,
 		Kind:           "plan",
 		KindConfidence: 0.9,
 		Topics:         []cermin.TopicCandidate{{Name: "running", Confidence: 0.9, Kept: true}},
@@ -176,7 +176,7 @@ func TestClassification_CorrectTopics(t *testing.T) {
 			}
 			want := cermin.Classification{
 				ThoughtID: 9,
-				Source:    "correction",
+				Source:    cermin.SourceCorrection,
 				Kind:      "plan",
 				Topics:    []cermin.TopicCandidate{},
 			}
