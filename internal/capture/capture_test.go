@@ -120,6 +120,33 @@ func TestBot_ProcessInbox_CapturesOwnerText(t *testing.T) {
 	}
 }
 
+func TestBot_ProcessInbox_CapturesForwardedTextAtForwardTime(t *testing.T) {
+	t.Parallel()
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	bot, db, api := newBot(t, classifier.classify)
+	api.queue(update(t, "message", ownerID, map[string]any{
+		"text": "Parkrun starts at 7am every Saturday.",
+		"forward_origin": map[string]any{
+			"type":             "hidden_user",
+			"sender_user_name": "A Friend",
+			"date":             thoughtTime.Add(-24 * time.Hour).Unix(),
+		},
+	}))
+
+	thought := captureQueued(t, bot, db)
+
+	if thought.Text != "Parkrun starts at 7am every Saturday." {
+		t.Errorf("Text = %q, want the forwarded text", thought.Text)
+	}
+	if !thought.ThoughtAt.Equal(thoughtTime) {
+		t.Errorf("ThoughtAt = %v, want %v, when it was forwarded", thought.ThoughtAt, thoughtTime)
+	}
+	wantSent := []sentMessage{{ChatID: ownerID, Text: "💡 idea · running", ReplyToID: messageID}}
+	if sent := api.sentMessages(); !slices.Equal(sent, wantSent) {
+		t.Errorf("sent %+v, want %+v", sent, wantSent)
+	}
+}
+
 func TestBot_ProcessInbox_KeepsStrongTopics(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -327,30 +354,30 @@ func TestBot_ProcessInbox_RetryKeepsClassification(t *testing.T) {
 	}
 }
 
-func TestBot_ProcessInbox_CapturesOnlyOwnerText(t *testing.T) {
+func TestBot_ProcessInbox_IgnoresOtherChats(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name   string
 		update string
 	}{
 		{
-			name:   "message from someone else",
+			name:   "text from someone else",
 			update: textUpdate(t, ownerID+1, "Hi, is this bot public?", 0),
 		},
 		{
-			name:   "owner's command",
-			update: textUpdate(t, ownerID, "/start", 0),
+			name:   "command from someone else",
+			update: textUpdate(t, ownerID+1, "/start", 0),
 		},
 		{
-			name: "owner's edit",
-			update: update(t, "edited_message", ownerID, map[string]any{
-				"text":      "Start running on Saturdays.",
+			name: "edit from someone else",
+			update: update(t, "edited_message", ownerID+1, map[string]any{
+				"text":      "Hi, is this bot private?",
 				"edit_date": thoughtTime.Unix() + 60,
 			}),
 		},
 		{
-			name: "owner's photo",
-			update: update(t, "message", ownerID, map[string]any{
+			name: "photo from someone else",
+			update: update(t, "message", ownerID+1, map[string]any{
 				"photo": []map[string]any{{"file_id": "a", "file_unique_id": "b", "width": 90, "height": 90}},
 			}),
 		},
@@ -387,6 +414,99 @@ func TestBot_ProcessInbox_CapturesOnlyOwnerText(t *testing.T) {
 			}
 			if calls := len(classifier.gotTopics); calls != 0 {
 				t.Errorf("classified %d times, want never", calls)
+			}
+			if updates, err := db.UnprocessedUpdates(ctx); err != nil || len(updates) != 0 {
+				t.Errorf("unprocessed updates = %+v, %v; want none", updates, err)
+			}
+		})
+	}
+}
+
+func TestBot_ProcessInbox_RepliesWithoutCapturing(t *testing.T) {
+	t.Parallel()
+	const helpReply = "Send any text to save it as a Thought, unless it starts with /.\n\n" +
+		"Reply to a Thought or its Acknowledgement with:\n" +
+		"/kind <kind> to correct its Kind\n" +
+		"/topics <a>, <b>, <c> to replace its 1 to 3 Topics\n" +
+		"/delete to delete it"
+	tests := []struct {
+		name        string
+		update      string
+		wantReply   string
+		wantReplyTo int64
+	}{
+		{
+			name: "photo with a caption",
+			update: update(t, "message", ownerID, map[string]any{
+				"message_id": commandID,
+				"photo":      []map[string]any{{"file_id": "a", "file_unique_id": "b", "width": 90, "height": 90}},
+				"caption":    "The bus stop queue this morning.",
+			}),
+			wantReply:   "Text only for now.",
+			wantReplyTo: commandID,
+		},
+		{
+			name: "edit of the thought",
+			update: withUpdateID(t, update(t, "edited_message", ownerID, map[string]any{
+				"text":      "Start running on Sundays.",
+				"edit_date": thoughtTime.Unix() + 60,
+			}), commandID),
+			wantReply:   "Edits aren't saved. Send it as a new Thought.",
+			wantReplyTo: messageID,
+		},
+		{
+			name:        "start",
+			update:      commandUpdate(t, commandID, "/start", 0),
+			wantReply:   helpReply,
+			wantReplyTo: commandID,
+		},
+		{
+			name:        "help",
+			update:      commandUpdate(t, commandID, "/help", 0),
+			wantReply:   helpReply,
+			wantReplyTo: commandID,
+		},
+		{
+			name:        "unknown command",
+			update:      commandUpdate(t, commandID, "/remind tomorrow", 0),
+			wantReply:   "Unknown command.\n\n" + helpReply,
+			wantReplyTo: commandID,
+		},
+		{
+			name:        "text starting with a slash",
+			update:      commandUpdate(t, commandID, "/r/running says to start slow.", 0),
+			wantReply:   "Unknown command.\n\n" + helpReply,
+			wantReplyTo: commandID,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+			path := filepath.Join(t.TempDir(), "cermin.db")
+			bot, db, api := newBotAt(t, classifier.classify, path)
+			file := openFile(t, path)
+			api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
+			thoughts := []cermin.Thought{captureQueued(t, bot, db)}
+
+			api.queue(tt.update)
+			processQueued(t, bot)
+
+			sent := api.sentMessages()
+			wantReply := sentMessage{ChatID: ownerID, Text: tt.wantReply, ReplyToID: tt.wantReplyTo}
+			if len(sent) != 2 || sent[1] != wantReply {
+				t.Errorf("sent %+v, want the Acknowledgement and then %+v", sent, wantReply)
+			}
+			if got, err := db.Thoughts(ctx); err != nil || !reflect.DeepEqual(got, thoughts) {
+				t.Errorf("Thoughts = %+v, %v; want them unchanged: %+v", got, err, thoughts)
+			}
+			if calls := len(classifier.gotTopics); calls != 1 {
+				t.Errorf("classified %d times, want once, for the Thought", calls)
+			}
+			// The raw update stays in the inbox, processed.
+			if got := updateIDs(t, file); !slices.Equal(got, []int64{messageID, commandID}) {
+				t.Errorf("inbox updates = %v, want %v", got, []int64{messageID, commandID})
 			}
 			if updates, err := db.UnprocessedUpdates(ctx); err != nil || len(updates) != 0 {
 				t.Errorf("unprocessed updates = %+v, %v; want none", updates, err)
@@ -770,8 +890,8 @@ func TestBot_ProcessInbox_DeletesThought(t *testing.T) {
 			if edits := api.editedMessages(); !slices.Equal(edits, wantEdits) {
 				t.Errorf("edited %+v, want %+v", edits, wantEdits)
 			}
-			if sent := api.sentMessages(); len(sent) != 3 {
-				t.Errorf("sent %+v, want only the 3 Acknowledgements", sent)
+			if sent := api.sentMessages(); len(sent) != 4 {
+				t.Errorf("sent %+v, want only the 3 Acknowledgements and the reply to the edit", sent)
 			}
 		})
 	}

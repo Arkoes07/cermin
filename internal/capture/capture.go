@@ -49,6 +49,18 @@ const (
 	deleteUsage = "Reply to a Thought or its Acknowledgement with /delete."
 	// deletedAck is the Acknowledgement of a deleted Thought.
 	deletedAck = "🗑 deleted"
+	// textOnlyReply is the reply to a message with no text, such as a photo.
+	textOnlyReply = "Text only for now."
+	// editReply is the reply to an edited message.
+	editReply = "Edits aren't saved. Send it as a new Thought."
+	// helpReply is the reply to /start and /help: the command list.
+	helpReply = "Send any text to save it as a Thought, unless it starts with /.\n\n" +
+		"Reply to a Thought or its Acknowledgement with:\n" +
+		"/kind <kind> to correct its Kind\n" +
+		"/topics <a>, <b>, <c> to replace its 1 to 3 Topics\n" +
+		"/delete to delete it"
+	// unknownCommandReply is the reply to an unknown command.
+	unknownCommandReply = "Unknown command.\n\n" + helpReply
 )
 
 // ClassifyFunc gives a Thought's text a Classification, with one of kinds
@@ -176,27 +188,34 @@ func (b *Bot) ProcessInbox(ctx context.Context) error {
 
 // Process handles one inbox update: the owner's text message becomes a
 // Thought, which is classified and gets an Acknowledgement, the owner's /kind
-// or /topics corrects one, and their /delete deletes one. Anything else is only
-// marked processed.
+// or /topics corrects one, and their /delete deletes one. The owner's edits,
+// messages with no text and other commands get a reply saying what Cermin
+// takes. Everyone else's updates are only marked processed.
 func (b *Bot) Process(ctx context.Context, in sqlite.InboxUpdate) error {
 	var update telegram.Update
 	if err := json.Unmarshal(in.Payload, &update); err != nil {
 		return fmt.Errorf("decoding: %w", err)
 	}
-	// Only the owner's plain text in their private chat with the bot is a
-	// Thought or a command. Edits and non-text messages carry none, text
-	// starting with / is a command, and a message ID from another chat could
-	// clash with a captured Thought's.
-	m := update.Message
+	// Only the owner's messages in their private chat with the bot count: a
+	// message ID from another chat could clash with a captured Thought's.
+	// Their text is a Thought, unless it starts with /, which makes it a
+	// command. An edit changes nothing, not even a command.
+	m := cmp.Or(update.Message, update.EditedMessage)
 	isOwner := m != nil && m.From != nil && m.From.ID == b.ownerID
 	isPrivate := isOwner && m.Chat.ID == b.ownerID // a private chat's ID is the user's
-	if isPrivate && strings.HasPrefix(m.Text, "/") {
-		return b.runCommand(ctx, in, m.Text)
-	}
-	isThought := isPrivate && m.Text != ""
-	if !isThought {
+	switch {
+	case !isPrivate:
 		slog.InfoContext(ctx, "update not captured", "update_id", in.ID)
 		return b.db.MarkProcessed(ctx, in.ID)
+	case update.EditedMessage != nil:
+		return b.replyAndMarkProcessed(ctx, in, editReply)
+	case strings.HasPrefix(m.Text, "/"):
+		return b.runCommand(ctx, in, m.Text)
+	case m.Text == "":
+		// ponytail: each photo of an album gets this reply, and so does a
+		// service message such as your pin of a message; reply once per
+		// media_group_id and skip service messages if it ever matters.
+		return b.replyAndMarkProcessed(ctx, in, textOnlyReply)
 	}
 
 	b.mu.Lock()
@@ -240,8 +259,8 @@ func (b *Bot) Process(ctx context.Context, in sqlite.InboxUpdate) error {
 }
 
 // runCommand runs the owner's command text, sent as message in, and marks in
-// processed, or removes it for /delete. Only /kind, /topics and /delete do
-// anything yet.
+// processed, or removes it for /delete. /start, /help and an unknown command
+// get the command list.
 func (b *Bot) runCommand(ctx context.Context, in sqlite.InboxUpdate, text string) error {
 	command, args, _ := strings.Cut(text, " ")
 	switch command {
@@ -251,10 +270,12 @@ func (b *Bot) runCommand(ctx context.Context, in sqlite.InboxUpdate, text string
 		if err := b.correct(ctx, in, command, args); err != nil {
 			return err
 		}
+		return b.db.MarkProcessed(ctx, in.ID)
+	case "/start", "/help":
+		return b.replyAndMarkProcessed(ctx, in, helpReply)
 	default:
-		slog.InfoContext(ctx, "update not captured", "update_id", in.ID)
+		return b.replyAndMarkProcessed(ctx, in, unknownCommandReply)
 	}
-	return b.db.MarkProcessed(ctx, in.ID)
 }
 
 // correct runs /kind or /topics, sent as message in with args after the
@@ -401,6 +422,15 @@ func (b *Bot) reply(ctx context.Context, in sqlite.InboxUpdate, text string) err
 		in.MessageID,
 	)
 	return err
+}
+
+// replyAndMarkProcessed sends text in reply to the owner's message in, and
+// marks in processed.
+func (b *Bot) replyAndMarkProcessed(ctx context.Context, in sqlite.InboxUpdate, text string) error {
+	if err := b.reply(ctx, in, text); err != nil {
+		return err
+	}
+	return b.db.MarkProcessed(ctx, in.ID)
 }
 
 // kindUsage is the reply to a /kind that can't be run, listing kinds.
