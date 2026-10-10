@@ -2,7 +2,7 @@
 // classifies them, and applies the owner's Corrections and deletes. Every
 // update is stored in the inbox before anything else happens and processed
 // from there, so a crash or a failed reply never loses one. A catch-up loop
-// later finishes the Captures that a crash or the classifier left undone.
+// later finishes what a crash, the classifier or Telegram left undone.
 package capture
 
 import (
@@ -240,30 +240,23 @@ func (b *Bot) Process(ctx context.Context, in sqlite.InboxUpdate) error {
 		return err
 	}
 	// The Thought may already have its Acknowledgement if this update was
-	// processed before a crash, or the catch-up sent it since. A crash between
-	// sending and storing it still sends a second one.
+	// processed before a crash, or the catch-up sent it since; the catch-up
+	// then classifies it if it isn't yet.
 	if thought.AckMessageID == 0 {
 		if err := b.tg.SendChatAction(ctx, m.Chat.ID, "typing"); err != nil {
 			slog.WarnContext(ctx, "showing typing", "thought_id", thought.ID, "err", err)
 		}
-		text, err := b.classifyThought(ctx, thought)
-		if err != nil {
+		if err := b.classifyThought(ctx, thought); err != nil {
 			// A slow or failing classifier never fails a Capture: the
 			// Thought is saved and stays unclassified until the catch-up.
 			slog.WarnContext(ctx, "classifying thought", "thought_id", thought.ID, "err", err)
-			text = savedAck
-		}
-		ackID, err := b.acknowledge(ctx, thought, text)
-		if err != nil {
-			return err
 		}
 		slog.InfoContext(ctx, "thought captured",
 			"thought_id", thought.ID,
 			"update_id", in.ID,
-			"ack_message_id", ackID,
 		)
 	}
-	return b.db.MarkProcessed(ctx, in.ID)
+	return b.syncAckAndMarkProcessed(ctx, thought.ID, in.ID)
 }
 
 // runCommand runs the owner's command, sent as message m in update updateID,
@@ -319,7 +312,7 @@ func (b *Bot) runCommand(ctx context.Context, updateID int64, m *telegram.Messag
 // apply returns the Correction of the Thought's current Classification that
 // the command asks for, which replaces its Kind or its whole set of Topics and
 // keeps the rest, or false if the command's arguments ask for none. correct
-// adds it and edits the Acknowledgement to show it. A command it can't run
+// adds it and brings the Acknowledgement up to date. A command it can't run
 // gets a reply saying why, which is usage unless the Thought isn't classified
 // yet.
 func (b *Bot) correct(
@@ -359,8 +352,7 @@ func (b *Bot) correct(
 	}
 	if current.TGMessageID == m.ID {
 		// Processed again after a crash, the Correction is current already.
-		b.showCorrection(ctx, thought, current)
-		return b.db.MarkProcessed(ctx, updateID)
+		return b.syncAckAndMarkProcessed(ctx, thought.ID, updateID)
 	}
 
 	correction, isValid := apply(current)
@@ -382,31 +374,7 @@ func (b *Bot) correct(
 		"classification_id", stored.ID,
 		"update_id", updateID,
 	)
-	b.showCorrection(ctx, thought, stored)
-	return b.db.MarkProcessed(ctx, updateID)
-}
-
-// showCorrection edits the Acknowledgement of Thought t to show its
-// Correction c. The Correction is saved by now, so a failure is logged and not
-// returned: retrying an edit that always fails, such as of an Acknowledgement
-// you deleted, would stall the inbox behind it.
-//
-// ponytail: an edit that fails only once, such as on a timeout, also leaves
-// the old Classification showing until the next Correction; retry the edit
-// if that ever happens.
-func (b *Bot) showCorrection(ctx context.Context, t cermin.Thought, c cermin.Classification) {
-	text, err := b.ackText(c)
-	if err == nil {
-		err = b.tg.EditMessageText(
-			ctx,
-			b.ownerID,
-			t.AckMessageID,
-			text,
-		)
-	}
-	if err != nil {
-		slog.WarnContext(ctx, "showing correction", "thought_id", t.ID, "classification_id", c.ID, "err", err)
-	}
+	return b.syncAckAndMarkProcessed(ctx, thought.ID, updateID)
 }
 
 // deleteThought runs /delete, sent as message m in update updateID, in reply
@@ -478,6 +446,16 @@ func (b *Bot) replyAndMarkProcessed(ctx context.Context, updateID int64, m *tele
 	return b.db.MarkProcessed(ctx, updateID)
 }
 
+// syncAckAndMarkProcessed brings the Acknowledgement of Thought thoughtID up
+// to date, and marks update updateID, which captured or corrected it,
+// processed. The caller holds b.mu.
+func (b *Bot) syncAckAndMarkProcessed(ctx context.Context, thoughtID, updateID int64) error {
+	if err := b.syncAck(ctx, thoughtID); err != nil {
+		return err
+	}
+	return b.db.MarkProcessed(ctx, updateID)
+}
+
 // kindUsage is the reply to a /kind that can't be run, listing kinds.
 func kindUsage(kinds []cermin.Kind) string {
 	names := make([]string, 0, len(kinds))
@@ -487,66 +465,150 @@ func kindUsage(kinds []cermin.Kind) string {
 	return "Reply to a Thought or its Acknowledgement with /kind and one of: " + strings.Join(names, ", ") + "."
 }
 
-// acknowledge sends text as a Thought's Acknowledgement, in reply to the
-// Thought in the owner's private chat, records its message ID and returns it.
-func (b *Bot) acknowledge(ctx context.Context, t cermin.Thought, text string) (int64, error) {
-	ack, err := b.tg.SendMessage(
-		ctx,
-		b.ownerID,
-		text,
-		t.TGMessageID,
-	)
-	if err != nil {
-		return 0, err
-	}
-	// Once sent, it is recorded even during shutdown, or a restart would send
-	// it again.
-	if err := b.db.SetAckMessageID(context.WithoutCancel(ctx), t.ID, ack.ID); err != nil {
-		return 0, err
-	}
-	return ack.ID, nil
-}
-
-// classifyThought gives a Thought its Classification and returns the
-// Acknowledgement that shows it. It gives up after classifyTimeout.
-func (b *Bot) classifyThought(ctx context.Context, t cermin.Thought) (string, error) {
+// classifyThought gives a Thought its Classification, unless it has one. It
+// gives up after classifyTimeout.
+func (b *Bot) classifyThought(ctx context.Context, t cermin.Thought) error {
 	ctx, cancel := context.WithTimeout(ctx, classifyTimeout)
 	defer cancel()
 
-	// A Thought processed again, because its Acknowledgement failed to send,
-	// keeps the Classification it already has.
-	current, isClassified, err := b.db.CurrentClassification(ctx, t.ID)
-	if err != nil {
-		return "", err
-	}
-	if isClassified {
-		return b.ackText(current)
+	// A Thought processed again after a crash, before its Acknowledgement
+	// was sent, keeps the Classification it already has.
+	_, isClassified, err := b.db.CurrentClassification(ctx, t.ID)
+	if err != nil || isClassified {
+		return err
 	}
 	c, language, err := b.callClassifier(ctx, t)
 	if err != nil {
-		return "", err
+		return err
 	}
-	stored, err := b.db.SaveClassification(ctx, c, language)
-	if err != nil {
-		return "", err
-	}
-	return b.ackText(stored)
+	_, err = b.db.SaveClassification(ctx, c, language)
+	return err
 }
 
-// CatchUp finishes the Captures that a crash or the classifier left undone.
-// It sends the Acknowledgement of each Thought that has none, then
-// classifies up to catchUpLimit Thoughts that have no Classification, oldest
-// first, and edits their ✓ saved Acknowledgements to show it. A Thought that
-// fails is logged and left for the next call.
+// syncAck brings the Acknowledgement of Thought thoughtID up to date: it sends
+// one if the Thought has none, or edits it if it shows anything other than
+// the Thought's current Classification, and records what it shows. It does
+// nothing if the Thought is gone, didn't come from Telegram, or has an
+// Acknowledgement that is up to date. The caller holds b.mu.
+//
+// It shows the current Classification whatever its source. So a Declared
+// Topic backfill's declared Classifications edit past Acknowledgements, too;
+// to keep those as they are, skip declared Classifications here.
+//
+// A failed send or edit is logged and not returned, and the catch-up retries
+// it; only SQLite errors are returned. A crash between sending and recording
+// still sends a second one.
+func (b *Bot) syncAck(ctx context.Context, thoughtID int64) error {
+	t, isFound, err := b.db.Thought(ctx, thoughtID)
+	if err != nil || !isFound {
+		return err
+	}
+	if t.TGMessageID == 0 {
+		return nil // from WhatsApp, with no message to reply to
+	}
+	current, isClassified, err := b.db.CurrentClassification(ctx, thoughtID)
+	if err != nil {
+		return err
+	}
+	// With no Classification, current.ID is 0, as is the
+	// AckClassificationID of ✓ saved.
+	if t.AckMessageID != 0 && t.AckClassificationID == current.ID {
+		return nil
+	}
+	text := savedAck
+	if isClassified {
+		if text, err = b.ackText(current); err != nil {
+			// Logged and not returned, so that it never stalls the inbox.
+			slog.WarnContext(ctx, "rendering acknowledgement",
+				"thought_id", t.ID,
+				"classification_id", current.ID,
+				"err", err,
+			)
+			return nil
+		}
+	}
+
+	ackID := t.AckMessageID
+	if ackID == 0 {
+		var ack telegram.Message
+		ack, err = b.tg.SendMessage(
+			ctx,
+			b.ownerID,
+			text,
+			t.TGMessageID,
+		)
+		ackID = ack.ID
+	} else {
+		err = b.tg.EditMessageText(
+			ctx,
+			b.ownerID,
+			ackID,
+			text,
+		)
+	}
+	// An Acknowledgement you deleted stays deleted: it counts as shown, so
+	// its edit isn't retried and no message is sent to replace it.
+	isDeleted := errors.Is(err, telegram.ErrMessageNotFound)
+	if err != nil && !isDeleted {
+		slog.WarnContext(ctx, "showing acknowledgement",
+			"thought_id", t.ID,
+			"classification_id", current.ID,
+			"err", err,
+		)
+		return nil
+	}
+	// Once shown, it is recorded even during shutdown, or a restart would
+	// show it again.
+	err = b.db.SetAck(
+		context.WithoutCancel(ctx),
+		t.ID,
+		ackID,
+		current.ID,
+	)
+	if err != nil {
+		return err
+	}
+	msg := "acknowledgement shown"
+	if isDeleted {
+		msg = "acknowledgement deleted, left as it is"
+	}
+	slog.InfoContext(ctx, msg,
+		"thought_id", t.ID,
+		"ack_message_id", ackID,
+		"classification_id", current.ID,
+	)
+	return nil
+}
+
+// CatchUp finishes what a crash, the classifier or Telegram left undone. It
+// brings every out-of-date Acknowledgement up to date, sending the ones never
+// sent, then classifies up to catchUpLimit Thoughts that have no
+// Classification, oldest first, and edits their Acknowledgements to show it.
+// A Thought that fails is logged and left for the next call.
 //
 // ponytail: a Thought the classifier always fails on, such as one it
 // refuses, costs a paid call on every call of CatchUp, and catchUpLimit of
 // them would stall the rest; count attempts and give up on it if that ever
 // happens.
 func (b *Bot) CatchUp(ctx context.Context) error {
-	if err := b.sendMissingAcks(ctx); err != nil {
+	outOfDate, err := b.db.OutOfDateAckThoughts(ctx)
+	if err != nil {
 		return err
 	}
+	// ponytail: unbounded; cap it at catchUpLimit if a Declared Topic
+	// backfill hits Telegram's 429s.
+	for _, t := range outOfDate {
+		// Locked per Thought, so that this delays a Capture by one send or
+		// edit at most. syncAck reads the Thought again under the lock, in
+		// case a Capture or Correction has shown it since.
+		b.mu.Lock()
+		err := b.syncAck(ctx, t.ID)
+		b.mu.Unlock()
+		if err != nil && ctx.Err() == nil {
+			slog.WarnContext(ctx, "updating acknowledgement", "thought_id", t.ID, "err", err)
+		}
+	}
+
 	// Under the lock no Capture is under way, so none of these Thoughts is
 	// being classified by one.
 	b.mu.Lock()
@@ -563,50 +625,9 @@ func (b *Bot) CatchUp(ctx context.Context) error {
 	return nil
 }
 
-// sendMissingAcks sends the Acknowledgement of each Thought that has none, as
-// a crash between saving a Thought and replying leaves it.
-func (b *Bot) sendMissingAcks(ctx context.Context) error {
-	// Under the lock no Capture is under way, so none of these Thoughts is
-	// about to get its Acknowledgement from one.
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	unacked, err := b.db.UnackedThoughts(ctx)
-	if err != nil {
-		return err
-	}
-	for _, t := range unacked {
-		if err := b.sendMissingAck(ctx, t); err != nil && ctx.Err() == nil {
-			slog.WarnContext(ctx, "sending missing acknowledgement", "thought_id", t.ID, "err", err)
-		}
-	}
-	return nil
-}
-
-// sendMissingAck sends the Acknowledgement of a Thought that has none,
-// showing its Classification, or ✓ saved if it has none yet. The caller holds
-// b.mu.
-func (b *Bot) sendMissingAck(ctx context.Context, t cermin.Thought) error {
-	current, isClassified, err := b.db.CurrentClassification(ctx, t.ID)
-	if err != nil {
-		return err
-	}
-	text := savedAck
-	if isClassified {
-		if text, err = b.ackText(current); err != nil {
-			return err
-		}
-	}
-	ackID, err := b.acknowledge(ctx, t, text)
-	if err != nil {
-		return err
-	}
-	slog.InfoContext(ctx, "missing acknowledgement sent", "thought_id", t.ID, "ack_message_id", ackID)
-	return nil
-}
-
 // classifyLate gives a Thought that has no Classification one, waiting up to
-// catchUpClassifyTimeout for the classifier, and edits its ✓ saved
-// Acknowledgement to show it.
+// catchUpClassifyTimeout for the classifier, and brings its Acknowledgement
+// up to date to show it.
 func (b *Bot) classifyLate(ctx context.Context, t cermin.Thought) error {
 	classifyCtx, cancel := context.WithTimeout(ctx, catchUpClassifyTimeout)
 	defer cancel()
@@ -622,12 +643,11 @@ func (b *Bot) classifyLate(ctx context.Context, t cermin.Thought) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	// Meanwhile you may have deleted the Thought.
-	current, isFound, err := b.db.Thought(ctx, t.ID)
+	_, isFound, err := b.db.Thought(ctx, t.ID)
 	if err != nil || !isFound {
 		return err
 	}
-	// Or the inbox may have classified the Thought, which keeps that
-	// Classification, or sent its Acknowledgement.
+	// Or the inbox may have classified it, which keeps that Classification.
 	_, isClassified, err := b.db.CurrentClassification(ctx, t.ID)
 	if err != nil || isClassified {
 		return err
@@ -637,22 +657,7 @@ func (b *Bot) classifyLate(ctx context.Context, t cermin.Thought) error {
 		return err
 	}
 	slog.InfoContext(ctx, "thought classified late", "thought_id", t.ID, "classification_id", stored.ID)
-	if current.AckMessageID == 0 {
-		return nil // the Acknowledgement goes out showing the Classification
-	}
-	text, err := b.ackText(stored)
-	if err != nil {
-		return err
-	}
-	// ponytail: a failed edit, or a crash before it, leaves ✓ saved for good,
-	// because the Thought is classified now; record which Classification the
-	// Acknowledgement shows if that ever happens.
-	return b.tg.EditMessageText(
-		ctx,
-		b.ownerID,
-		current.AckMessageID,
-		text,
-	)
+	return b.syncAck(ctx, t.ID)
 }
 
 // callClassifier asks the classifier for a Thought's Classification, with

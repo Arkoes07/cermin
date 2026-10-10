@@ -9,13 +9,14 @@ import "time"
 // Bahasa Indonesia. It is never edited once captured; deleting it erases it
 // completely.
 type Thought struct {
-	ID                 int64
-	Text               string
-	Source             string    // "telegram" or "whatsapp"
-	TGMessageID        int64     // the Telegram message that carried it
-	TGReplyToMessageID int64     // the message it replied to; 0 if none
-	AckMessageID       int64     // the Acknowledgement's message; 0 until sent
-	ThoughtAt          time.Time // Thought time
-	ReceivedAt         time.Time // when Cermin stored it
-	Language           string    // en, id or mixed; "" until classified
+	ID                  int64
+	Text                string
+	Source              string    // "telegram" or "whatsapp"
+	TGMessageID         int64     // the Telegram message that carried it
+	TGReplyToMessageID  int64     // the message it replied to; 0 if none
+	AckMessageID        int64     // the Acknowledgement's message; 0 until sent
+	AckClassificationID int64     // the Classification the Acknowledgement shows; 0 if none
+	ThoughtAt           time.Time // Thought time
+	ReceivedAt          time.Time // when Cermin stored it
+	Language            string    // en, id or mixed; "" until classified
 }

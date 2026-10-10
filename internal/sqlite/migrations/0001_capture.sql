@@ -18,6 +18,9 @@ CREATE TABLE thoughts (
     tg_message_id          INTEGER UNIQUE,
     tg_reply_to_message_id INTEGER,
     ack_message_id         INTEGER UNIQUE,
+    -- The Classification the Acknowledgement shows; NULL if it shows none.
+    -- No foreign key: a Classification is only deleted with its Thought.
+    ack_classification_id  INTEGER,
     thought_at             TEXT    NOT NULL,
     received_at            TEXT    NOT NULL,
     language               TEXT

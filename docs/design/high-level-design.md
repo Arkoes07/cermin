@@ -97,7 +97,7 @@ flowchart TB
 | Telegram poller | 1 | Long-polls `getUpdates`, writes each raw update into the `telegram_updates` inbox, then confirms the offset. |
 | Update handler | 1 | Works through inbox rows in order: owner check, Capture, `/delete`, `/kind`, `/topics`, edge cases; later `/ask`, `/topic` and Reactions. |
 | Classifier | 1 | One Claude call per Thought with structured output: Kind, candidate Topics, stated confidences, language, `kind_suggestion`. |
-| Catch-up loop | 1 | Every minute: classifies Thoughts that have no Classification, sends missing Acknowledgements, edits `✓ saved` ones. From week 2 it also embeds. |
+| Catch-up loop | 1 | Every minute: sends missing Acknowledgements and edits out-of-date ones, then classifies Thoughts that have no Classification and edits their Acknowledgements. From week 2 it also embeds. |
 | HTTP server | 1 | `/healthz` for Fly; `/mcp` from week 3. |
 | Embedder | 2 | Embeds Thoughts and queries; backfills when the embedding model changes. |
 | Resurfacer | 2 | Finds strong matches for a new Thought and sends at most 2 as an Insight with 👍/👎. |
@@ -195,6 +195,7 @@ erDiagram
         int tg_message_id UK
         int tg_reply_to_message_id
         int ack_message_id UK
+        int ack_classification_id "the Classification the Acknowledgement shows"
         datetime thought_at "UTC"
         datetime received_at "UTC"
         text language "en, id or mixed"
@@ -369,11 +370,11 @@ sequenceDiagram
     else AI slow or down
         H->>TG: reply "✓ saved"
     end
-    H->>DB: store Acknowledgement message ID, mark update processed
+    H->>DB: store Acknowledgement message ID and the Classification it shows, mark update processed
     Note over H,DB: The catch-up loop later classifies any unclassified Thought and edits its Acknowledgement.
 ```
 
-Every step is idempotent. The Thought is unique on its Telegram message ID, and an update is processed again after a crash until it is marked processed. A Thought with no Acknowledgement ID gets one from the catch-up loop.
+Every step is idempotent. The Thought is unique on its Telegram message ID, and an update is processed again after a crash until it is marked processed. A Thought whose Acknowledgement is missing, or shows other than its current Classification, gets it sent or edited by the catch-up loop.
 
 ### 7.2 Correction (week 1)
 
@@ -396,7 +397,7 @@ Every step is idempotent. The Thought is unique on its Telegram message ID, and 
 - **WhatsApp import (wk 2).** Cermin parses the chat export and creates Thoughts with `source = whatsapp` and the export's timestamps, deduped on time and text. The catch-up loop then classifies and embeds them. How the file reaches the server is decided in week 2 (⏳).
 - **Ask (wk 3).** `/ask <question>` embeds the question, retrieves the top Thoughts, and has Claude answer citing them. The answer is stored as an Insight.
 - **MCP (wk 3).** Claude Code or Desktop calls read-only retrieval tools, and the client's model writes the answer.
-- **Declared Topics (wk 3).** `/topic add` creates the Topic or takes it over. Cermin then backfills past Thoughts that match (⏳ matching), adding Classifications with source `declared`.
+- **Declared Topics (wk 3).** `/topic add` creates the Topic or takes it over. Cermin then backfills past Thoughts that match (⏳ matching), adding Classifications with source `declared`. Each one leaves its Thought's Acknowledgement out of date, so the catch-up loop edits it, silently, to show the Declared Topic. To keep past Acknowledgements as they are, make the step that brings an Acknowledgement up to date skip `declared` Classifications.
 - **Accuracy (wk 3).** Compares Cermin's first Classification against Corrections and hand-labelled Thoughts. Calibration compares stored confidence against the same.
 - **Digest, Loops, Portrait (wk 4).** The scheduler sends the Digest every Sunday morning (WIB). Loops and the Portrait are computed from the Corpus, with every claim citing Thought IDs.
 

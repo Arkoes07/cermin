@@ -203,11 +203,13 @@ func (db *DB) SaveThought(ctx context.Context, t cermin.Thought) (cermin.Thought
 	return stored, nil
 }
 
-// SetAckMessageID records the message ID of a Thought's Acknowledgement.
-func (db *DB) SetAckMessageID(ctx context.Context, thoughtID, ackMessageID int64) error {
+// SetAck records that message ackMessageID is a Thought's Acknowledgement and
+// shows Classification classificationID, or none if it is 0.
+func (db *DB) SetAck(ctx context.Context, thoughtID, ackMessageID, classificationID int64) error {
 	_, err := db.pool.ExecContext(ctx,
-		`UPDATE thoughts SET ack_message_id = ? WHERE id = ?`,
+		`UPDATE thoughts SET ack_message_id = ?, ack_classification_id = NULLIF(?, 0) WHERE id = ?`,
 		ackMessageID,
+		classificationID,
 		thoughtID,
 	)
 	if err != nil {
@@ -290,13 +292,22 @@ func (db *DB) Thoughts(ctx context.Context) ([]cermin.Thought, error) {
 	return db.queryThoughts(ctx, `SELECT `+thoughtColumns+` FROM thoughts ORDER BY id`)
 }
 
-// UnackedThoughts returns the Thoughts from Telegram that have no
-// Acknowledgement, oldest first.
-func (db *DB) UnackedThoughts(ctx context.Context) ([]cermin.Thought, error) {
+// OutOfDateAckThoughts returns the Thoughts from Telegram whose
+// Acknowledgement is out of date, oldest first: those that have none, and
+// those whose Acknowledgement shows a Classification other than their current
+// one. An Acknowledgement that shows none is up to date until the Thought is
+// classified.
+func (db *DB) OutOfDateAckThoughts(ctx context.Context) ([]cermin.Thought, error) {
+	// The join reads classifications once, where a subquery in WHERE would
+	// read it once per Thought. IS NOT takes NULL as equal to NULL.
 	return db.queryThoughts(ctx, `
 		SELECT `+thoughtColumns+` FROM thoughts
-		WHERE ack_message_id IS NULL AND tg_message_id IS NOT NULL
-		ORDER BY id`,
+		LEFT JOIN (
+			SELECT thought_id, MAX(id) AS current_id FROM classifications GROUP BY thought_id
+		) ON thought_id = thoughts.id
+		WHERE tg_message_id IS NOT NULL
+			AND (ack_message_id IS NULL OR ack_classification_id IS NOT current_id)
+		ORDER BY thoughts.id`,
 	)
 }
 
@@ -326,7 +337,8 @@ func (db *DB) queryThoughts(ctx context.Context, query string, args ...any) ([]c
 
 // thoughtColumns are the columns scanThought reads, in its order.
 const thoughtColumns = `id, text, source, COALESCE(tg_message_id, 0), COALESCE(tg_reply_to_message_id, 0),
-	COALESCE(ack_message_id, 0), thought_at, received_at, COALESCE(language, '')`
+	COALESCE(ack_message_id, 0), COALESCE(ack_classification_id, 0), thought_at, received_at,
+	COALESCE(language, '')`
 
 func scanThought(row scanner) (cermin.Thought, error) {
 	var t cermin.Thought
@@ -338,6 +350,7 @@ func scanThought(row scanner) (cermin.Thought, error) {
 		&t.TGMessageID,
 		&t.TGReplyToMessageID,
 		&t.AckMessageID,
+		&t.AckClassificationID,
 		&thoughtAt,
 		&receivedAt,
 		&t.Language,

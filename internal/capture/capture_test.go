@@ -72,13 +72,14 @@ func TestBot_ProcessInbox_CapturesOwnerText(t *testing.T) {
 	}
 	got.ThoughtAt, got.ReceivedAt = time.Time{}, time.Time{}
 	want := cermin.Thought{
-		ID:                 got.ID,
-		Text:               "What if bus stops showed how full the next bus is?",
-		Source:             "telegram",
-		TGMessageID:        messageID,
-		TGReplyToMessageID: 5,
-		AckMessageID:       1001,
-		Language:           "en",
+		ID:                  got.ID,
+		Text:                "What if bus stops showed how full the next bus is?",
+		Source:              "telegram",
+		TGMessageID:         messageID,
+		TGReplyToMessageID:  5,
+		AckMessageID:        1001,
+		AckClassificationID: got.AckClassificationID, // shown by what was sent
+		Language:            "en",
 	}
 	if got != want {
 		t.Errorf("Thought = %+v, want %+v", got, want)
@@ -268,15 +269,14 @@ func TestBot_ProcessInbox_RetryKeepsClassification(t *testing.T) {
 	bot, db, api := newBot(t, classifier.classify)
 	api.failNextSend()
 	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
-	if err := bot.Poll(ctx); err != nil {
-		t.Fatalf("Poll: %v", err)
-	}
+	processQueued(t, bot)
 
-	if err := bot.ProcessInbox(ctx); err == nil {
-		t.Fatal("ProcessInbox succeeded although the Acknowledgement failed to send")
+	// The failed Acknowledgement holds up no update behind it.
+	if updates, err := db.UnprocessedUpdates(ctx); err != nil || len(updates) != 0 {
+		t.Errorf("unprocessed updates = %+v, %v; want none", updates, err)
 	}
-	if err := bot.ProcessInbox(ctx); err != nil {
-		t.Fatalf("ProcessInbox again: %v", err)
+	if err := bot.CatchUp(ctx); err != nil {
+		t.Fatalf("CatchUp: %v", err)
 	}
 
 	if calls := len(classifier.gotTopics); calls != 1 {
@@ -462,18 +462,12 @@ func TestBot_Process_SafeToRepeat(t *testing.T) {
 	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
 	bot, db, api := newBot(t, classifier.classify)
 	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
-	if err := bot.Poll(ctx); err != nil {
-		t.Fatalf("Poll: %v", err)
-	}
-	updates, err := db.UnprocessedUpdates(ctx)
-	if err != nil || len(updates) != 1 {
-		t.Fatalf("unprocessed updates = %+v, %v; want 1", updates, err)
-	}
+	in := pollUpdate(t, bot, db)
 
 	// After a crash before the update was marked processed, a restart
 	// processes it again.
 	for range 2 {
-		if err := bot.Process(ctx, updates[0]); err != nil {
+		if err := bot.Process(ctx, in); err != nil {
 			t.Fatalf("Process: %v", err)
 		}
 	}
@@ -692,18 +686,12 @@ func TestBot_Process_CorrectionSafeToRepeat(t *testing.T) {
 	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
 	thought := captureQueued(t, bot, db)
 	api.queue(commandUpdate(t, commandID, "/kind plan", ackID))
-	if err := bot.Poll(ctx); err != nil {
-		t.Fatalf("Poll: %v", err)
-	}
-	updates, err := db.UnprocessedUpdates(ctx)
-	if err != nil || len(updates) != 1 {
-		t.Fatalf("unprocessed updates = %+v, %v; want 1", updates, err)
-	}
+	in := pollUpdate(t, bot, db)
 
 	// After a crash before the update was marked processed, a restart
 	// processes it again.
 	for range 2 {
-		if err := bot.Process(ctx, updates[0]); err != nil {
+		if err := bot.Process(ctx, in); err != nil {
 			t.Fatalf("Process: %v", err)
 		}
 	}
@@ -711,11 +699,10 @@ func TestBot_Process_CorrectionSafeToRepeat(t *testing.T) {
 	if classifications, err := db.Classifications(ctx, thought.ID); err != nil || len(classifications) != 2 {
 		t.Errorf("Classifications = %+v, %v; want Cermin's and one Correction", classifications, err)
 	}
-	// Both runs show it; Telegram leaves the second edit, which changes
-	// nothing, as it is.
-	edit := editedMessage{ChatID: ownerID, MessageID: ackID, Text: "✏️ 📋 plan · running"}
-	if edits := api.editedMessages(); !slices.Equal(edits, []editedMessage{edit, edit}) {
-		t.Errorf("edited %+v, want %+v twice", edits, edit)
+	// The second run finds the Acknowledgement showing it already.
+	wantEdits := []editedMessage{{ChatID: ownerID, MessageID: ackID, Text: "✏️ 📋 plan · running"}}
+	if edits := api.editedMessages(); !slices.Equal(edits, wantEdits) {
+		t.Errorf("edited %+v, want %+v", edits, wantEdits)
 	}
 }
 
@@ -727,13 +714,12 @@ func TestBot_ProcessInbox_KeepsCorrectionWhenEditFails(t *testing.T) {
 	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
 	thought := captureQueued(t, bot, db)
 
-	// As when you deleted the Acknowledgement: no retry could edit it.
 	api.failNextEdit()
 	api.queue(commandUpdate(t, commandID, "/kind plan", messageID))
 	processQueued(t, bot)
 
 	if edits := api.editedMessages(); len(edits) != 0 {
-		t.Fatalf("edited %+v, want the edit refused", edits)
+		t.Fatalf("edited %+v, want the edit failed", edits)
 	}
 	classifications, err := db.Classifications(ctx, thought.ID)
 	if err != nil || len(classifications) != 2 || classifications[1].Kind != "plan" {
@@ -741,6 +727,14 @@ func TestBot_ProcessInbox_KeepsCorrectionWhenEditFails(t *testing.T) {
 	}
 	if updates, err := db.UnprocessedUpdates(ctx); err != nil || len(updates) != 0 {
 		t.Errorf("unprocessed updates = %+v, %v; want none, so nothing waits behind the Correction", updates, err)
+	}
+
+	if err := bot.CatchUp(ctx); err != nil {
+		t.Fatalf("CatchUp: %v", err)
+	}
+	wantEdits := []editedMessage{{ChatID: ownerID, MessageID: ackID, Text: "✏️ 📋 plan · running"}}
+	if edits := api.editedMessages(); !slices.Equal(edits, wantEdits) {
+		t.Errorf("after CatchUp, edited %+v, want %+v", edits, wantEdits)
 	}
 }
 
@@ -939,6 +933,94 @@ func TestBot_CatchUp_ClassifiesOnceClassifierRecovers(t *testing.T) {
 	}
 }
 
+func TestBot_CatchUp_RetriesLateClassificationEdit(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	classifier := &fakeClassifier{
+		candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}},
+		err:        errors.New("classifier down"),
+	}
+	bot, db, api := newBot(t, classifier.classify)
+	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
+	thought := captureQueued(t, bot, db)
+
+	classifier.err = nil
+	api.failNextEdit()
+	if err := bot.CatchUp(ctx); err != nil {
+		t.Fatalf("CatchUp: %v", err)
+	}
+	if edits := api.editedMessages(); len(edits) != 0 {
+		t.Fatalf("edited %+v, want the edit failed", edits)
+	}
+	if err := bot.CatchUp(ctx); err != nil {
+		t.Fatalf("CatchUp again: %v", err)
+	}
+
+	wantEdits := []editedMessage{{ChatID: ownerID, MessageID: ackID, Text: "💡 idea · running"}}
+	if edits := api.editedMessages(); !slices.Equal(edits, wantEdits) {
+		t.Errorf("edited %+v, want %+v", edits, wantEdits)
+	}
+	if classifications, err := db.Classifications(ctx, thought.ID); err != nil || len(classifications) != 1 {
+		t.Errorf("Classifications = %+v, %v; want 1", classifications, err)
+	}
+	if calls := len(classifier.gotTopics); calls != 2 {
+		t.Errorf("classified %d times, want twice: at Capture and by the first CatchUp", calls)
+	}
+}
+
+func TestBot_CatchUp_LeavesDeletedAcknowledgementDeleted(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	bot, db, api := newBot(t, classifier.classify)
+	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
+	thought := captureQueued(t, bot, db)
+
+	api.deleteMessage(ackID)
+	api.queue(commandUpdate(t, commandID, "/kind plan", messageID))
+	processQueued(t, bot)
+	for range 2 {
+		if err := bot.CatchUp(ctx); err != nil {
+			t.Fatalf("CatchUp: %v", err)
+		}
+	}
+
+	wantRefused := []editedMessage{{ChatID: ownerID, MessageID: ackID, Text: "✏️ 📋 plan · running"}}
+	if refused := api.refusedEdits(); !slices.Equal(refused, wantRefused) {
+		t.Errorf("tried edits %+v, want only %+v", refused, wantRefused)
+	}
+	if sent := api.sentMessages(); len(sent) != 1 {
+		t.Errorf("sent %+v, want only the Acknowledgement, and none to replace it", sent)
+	}
+	classifications, err := db.Classifications(ctx, thought.ID)
+	if err != nil || len(classifications) != 2 || classifications[1].Kind != "plan" {
+		t.Errorf("Classifications = %+v, %v; want Cermin's and the Correction to plan", classifications, err)
+	}
+}
+
+func TestBot_CatchUp_LeavesDeletedThoughtsAcknowledgement(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	bot, db, api := newBot(t, classifier.classify)
+	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
+	captureQueued(t, bot, db)
+	// The Correction's edit fails, so the Acknowledgement is out of date when
+	// you delete the Thought.
+	api.failNextEdit()
+	api.queue(commandUpdate(t, commandID, "/kind plan", messageID))
+	api.queue(commandUpdate(t, commandID+1, "/delete", messageID))
+	processQueued(t, bot)
+
+	if err := bot.CatchUp(ctx); err != nil {
+		t.Fatalf("CatchUp: %v", err)
+	}
+	wantEdits := []editedMessage{{ChatID: ownerID, MessageID: ackID, Text: "🗑 deleted"}}
+	if edits := api.editedMessages(); !slices.Equal(edits, wantEdits) {
+		t.Errorf("edited %+v, want %+v", edits, wantEdits)
+	}
+}
+
 func TestBot_CatchUp_SendsMissingAcknowledgement(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -964,16 +1046,14 @@ func TestBot_CatchUp_SendsMissingAcknowledgement(t *testing.T) {
 				candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}},
 				err:        tt.classifierErr,
 			}
-			bot, _, api := newBot(t, classifier.classify)
+			bot, db, api := newBot(t, classifier.classify)
 			// A failed reply leaves what a crash before replying does: the
 			// Thought saved without an Acknowledgement.
 			api.failNextSend()
 			api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
-			if err := bot.Poll(ctx); err != nil {
-				t.Fatalf("Poll: %v", err)
-			}
-			if err := bot.ProcessInbox(ctx); err == nil {
-				t.Fatal("ProcessInbox succeeded although the Acknowledgement failed to send")
+			in := pollUpdate(t, bot, db)
+			if err := bot.Process(ctx, in); err != nil {
+				t.Fatalf("Process: %v", err)
 			}
 
 			for range 2 {
@@ -986,12 +1066,13 @@ func TestBot_CatchUp_SendsMissingAcknowledgement(t *testing.T) {
 				t.Errorf("sent %+v, want %+v", sent, wantSent)
 			}
 
-			// The inbox retries the update too, and must not send another.
-			if err := bot.ProcessInbox(ctx); err != nil {
-				t.Fatalf("ProcessInbox again: %v", err)
+			// After a crash before the update was marked processed, a restart
+			// processes it again, and must not send another.
+			if err := bot.Process(ctx, in); err != nil {
+				t.Fatalf("Process again: %v", err)
 			}
 			if sent := api.sentMessages(); !slices.Equal(sent, wantSent) {
-				t.Errorf("after the inbox retry, sent %+v, want %+v", sent, wantSent)
+				t.Errorf("after processing again, sent %+v, want %+v", sent, wantSent)
 			}
 		})
 	}
@@ -1108,18 +1189,16 @@ func TestBot_CatchUp_KeepsClassificationMadeMeanwhile(t *testing.T) {
 				return cermin.Classification{}, "", ctx.Err()
 			}
 			return slow.classify(ctx, text, kinds, topics)
-		default: // the inbox retry's
+		default: // at Capture again
 			return fast.classify(ctx, text, kinds, topics)
 		}
 	}
 	bot, db, api := newBot(t, classify)
-	api.failNextSend()
 	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
-	if err := bot.Poll(ctx); err != nil {
-		t.Fatalf("Poll: %v", err)
-	}
-	if err := bot.ProcessInbox(ctx); err == nil {
-		t.Fatal("ProcessInbox succeeded although the Acknowledgement failed to send")
+	in := pollUpdate(t, bot, db)
+	api.failNextSend()
+	if err := bot.Process(ctx, in); err != nil {
+		t.Fatalf("Process: %v", err)
 	}
 
 	// The catch-up's Acknowledgement fails too, then its classifier is slow.
@@ -1127,9 +1206,10 @@ func TestBot_CatchUp_KeepsClassificationMadeMeanwhile(t *testing.T) {
 	caughtUp := make(chan error, 1)
 	go func() { caughtUp <- bot.CatchUp(ctx) }()
 	<-slowStarted
-	// Meanwhile the inbox retries the update, classifying the Thought itself.
-	if err := bot.ProcessInbox(ctx); err != nil {
-		t.Fatalf("ProcessInbox again: %v", err)
+	// Meanwhile a restart after a crash processes the update again, which
+	// classifies the Thought itself.
+	if err := bot.Process(ctx, in); err != nil {
+		t.Fatalf("Process again: %v", err)
 	}
 	close(release)
 	if err := <-caughtUp; err != nil {
@@ -1146,7 +1226,7 @@ func TestBot_CatchUp_KeepsClassificationMadeMeanwhile(t *testing.T) {
 	}
 	wantTopics := []cermin.TopicCandidate{{Name: "running", Confidence: 0.9, Kept: true}}
 	if got := classifications[0].Topics; !slices.Equal(got, wantTopics) {
-		t.Errorf("kept the Classification with Topics %+v, want the inbox retry's %+v", got, wantTopics)
+		t.Errorf("kept the Classification with Topics %+v, want the Capture's %+v", got, wantTopics)
 	}
 	wantSent := []sentMessage{{ChatID: ownerID, Text: "💡 idea · running", ReplyToID: messageID}}
 	if sent := api.sentMessages(); !slices.Equal(sent, wantSent) {
@@ -1154,6 +1234,66 @@ func TestBot_CatchUp_KeepsClassificationMadeMeanwhile(t *testing.T) {
 	}
 	if edits := api.editedMessages(); len(edits) != 0 {
 		t.Errorf("edited %+v, want nothing", edits)
+	}
+}
+
+func TestBot_CatchUp_SendsOneAcknowledgementWhenCaptureRaces(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	slow := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	slowStarted, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	classify := func(
+		ctx context.Context,
+		text string,
+		kinds []cermin.Kind,
+		topics []string,
+	) (cermin.Classification, string, error) {
+		switch calls.Add(1) {
+		case 2: // the catch-up's
+			close(slowStarted)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return cermin.Classification{}, "", ctx.Err()
+			}
+			return slow.classify(ctx, text, kinds, topics)
+		default: // at Capture, and at Capture again
+			return cermin.Classification{}, "", errors.New("classifier down")
+		}
+	}
+	bot, db, api := newBot(t, classify)
+	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
+	in := pollUpdate(t, bot, db)
+	api.failNextSend()
+	if err := bot.Process(ctx, in); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+
+	// The catch-up's Acknowledgement fails too, then its classifier is slow.
+	api.failNextSend()
+	caughtUp := make(chan error, 1)
+	go func() { caughtUp <- bot.CatchUp(ctx) }()
+	<-slowStarted
+	// Meanwhile a restart after a crash processes the update again, which
+	// sends the Acknowledgement.
+	if err := bot.Process(ctx, in); err != nil {
+		t.Fatalf("Process again: %v", err)
+	}
+	close(release)
+	if err := <-caughtUp; err != nil {
+		t.Fatalf("CatchUp: %v", err)
+	}
+
+	// The catch-up edits the Acknowledgement the Capture sent, rather than
+	// sending a second.
+	wantSent := []sentMessage{{ChatID: ownerID, Text: "✓ saved", ReplyToID: messageID}}
+	if sent := api.sentMessages(); !slices.Equal(sent, wantSent) {
+		t.Errorf("sent %+v, want %+v", sent, wantSent)
+	}
+	wantEdits := []editedMessage{{ChatID: ownerID, MessageID: ackID, Text: "💡 idea · running"}}
+	if edits := api.editedMessages(); !slices.Equal(edits, wantEdits) {
+		t.Errorf("edited %+v, want %+v", edits, wantEdits)
 	}
 }
 
@@ -1273,6 +1413,20 @@ func processQueued(t *testing.T, bot *capture.Bot) {
 	if err := bot.ProcessInbox(t.Context()); err != nil {
 		t.Fatalf("ProcessInbox: %v", err)
 	}
+}
+
+// pollUpdate polls the one queued update and returns it as the inbox holds
+// it, unprocessed.
+func pollUpdate(t *testing.T, bot *capture.Bot, db *sqlite.DB) sqlite.InboxUpdate {
+	t.Helper()
+	if err := bot.Poll(t.Context()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	updates, err := db.UnprocessedUpdates(t.Context())
+	if err != nil || len(updates) != 1 {
+		t.Fatalf("unprocessed updates = %+v, %v; want 1", updates, err)
+	}
+	return updates[0]
 }
 
 // classificationsOf returns the Classifications of each of thoughts.
@@ -1496,13 +1650,16 @@ type editedMessage struct {
 // fakeBotAPI stands in for the Telegram Bot API: getUpdates delivers the
 // queued updates once, sendChatAction records the action, sendMessage
 // records the message and gives it the next message ID, starting at 1001,
-// and editMessageText records the edit.
+// and editMessageText records the edit, or the refusal of an edit of a
+// deleted message.
 type fakeBotAPI struct {
 	mu               sync.Mutex
 	updates          []string
 	actions          []string
 	sent             []sentMessage
 	edits            []editedMessage
+	refused          []editedMessage // edits of deleted messages
+	deleted          []int64         // the IDs of the messages you deleted
 	isNextSendFailed bool
 	isNextEditFailed bool
 }
@@ -1514,12 +1671,20 @@ func (f *fakeBotAPI) failNextSend() {
 	f.isNextSendFailed = true
 }
 
-// failNextEdit makes the next editMessageText fail, as Telegram refuses to
-// edit a deleted message, editing nothing.
+// failNextEdit makes the next editMessageText fail, as on a Telegram outage,
+// editing nothing.
 func (f *fakeBotAPI) failNextEdit() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.isNextEditFailed = true
+}
+
+// deleteMessage deletes message id, as you can in Telegram: every later edit
+// of it is refused as Telegram refuses it, and recorded as refused.
+func (f *fakeBotAPI) deleteMessage(id int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleted = append(f.deleted, id)
 }
 
 func (f *fakeBotAPI) queue(update string) {
@@ -1544,6 +1709,12 @@ func (f *fakeBotAPI) editedMessages() []editedMessage {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.edits)
+}
+
+func (f *fakeBotAPI) refusedEdits() []editedMessage {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.refused)
 }
 
 func (f *fakeBotAPI) handler(t *testing.T) http.Handler {
@@ -1621,15 +1792,23 @@ func (f *fakeBotAPI) handler(t *testing.T) http.Handler {
 		if req.ParseMode != nil {
 			t.Errorf("editMessageText with parse_mode %q, want plain text", *req.ParseMode)
 		}
+		edit := editedMessage{ChatID: req.ChatID, MessageID: req.MessageID, Text: req.Text}
 		f.mu.Lock()
 		if f.isNextEditFailed {
 			f.isNextEditFailed = false
+			f.mu.Unlock()
+			w.WriteHeader(http.StatusInternalServerError)
+			writeJSON(t, w, `{"ok":false,"error_code":500,"description":"Internal Server Error"}`)
+			return
+		}
+		if slices.Contains(f.deleted, req.MessageID) {
+			f.refused = append(f.refused, edit)
 			f.mu.Unlock()
 			w.WriteHeader(http.StatusBadRequest)
 			writeJSON(t, w, `{"ok":false,"error_code":400,"description":"Bad Request: message to edit not found"}`)
 			return
 		}
-		f.edits = append(f.edits, editedMessage{ChatID: req.ChatID, MessageID: req.MessageID, Text: req.Text})
+		f.edits = append(f.edits, edit)
 		f.mu.Unlock()
 		msg, err := json.Marshal(map[string]any{
 			"message_id": req.MessageID,

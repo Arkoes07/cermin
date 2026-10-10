@@ -2,6 +2,7 @@ package telegram_test
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -30,7 +31,7 @@ func TestClient_EditMessageText(t *testing.T) {
 	tests := []struct {
 		name        string
 		description string // why Telegram refuses the edit
-		wantErr     bool
+		wantErr     error
 	}{
 		{
 			// As when the same Correction is sent twice: the message already
@@ -39,7 +40,12 @@ func TestClient_EditMessageText(t *testing.T) {
 			description: "Bad Request: message is not modified: specified new message content and reply markup " +
 				"are exactly the same as a current content and reply markup of the message",
 		},
-		{name: "message gone", description: "Bad Request: message to edit not found", wantErr: true},
+		{
+			// As when you deleted it.
+			name:        "message gone",
+			description: "Bad Request: message to edit not found",
+			wantErr:     telegram.ErrMessageNotFound,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -63,8 +69,8 @@ func TestClient_EditMessageText(t *testing.T) {
 				1001,
 				"✏️ 📋 plan · running",
 			)
-			if gotErr := err != nil; gotErr != tt.wantErr {
-				t.Errorf("EditMessageText = %v, want error: %t", err, tt.wantErr)
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("EditMessageText = %v, want %v", err, tt.wantErr)
 			}
 		})
 	}

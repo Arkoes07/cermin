@@ -20,6 +20,10 @@ const APIURL = "https://api.telegram.org"
 // sendTimeout bounds every call except the long poll.
 const sendTimeout = 10 * time.Second
 
+// ErrMessageNotFound is EditMessageText's error for a message that is gone,
+// as when the user deleted it.
+var ErrMessageNotFound = errors.New("telegram: message to edit not found")
+
 // Client calls the Bot API as one bot.
 type Client struct {
 	apiURL string
@@ -117,7 +121,8 @@ func (c *Client) SendMessage(ctx context.Context, chatID int64, text string, rep
 
 // EditMessageText replaces the text of message messageID, which the bot sent
 // in chatID, with text, as plain text with no parse mode. A message that
-// already reads text is left as it is.
+// already reads text is left as it is. A message that is gone fails with
+// ErrMessageNotFound.
 func (c *Client) EditMessageText(ctx context.Context, chatID, messageID int64, text string) error {
 	ctx, cancel := context.WithTimeout(ctx, sendTimeout)
 	defer cancel()
@@ -126,13 +131,19 @@ func (c *Client) EditMessageText(ctx context.Context, chatID, messageID int64, t
 	var edited Message
 	err := c.call(ctx, "editMessageText", params, &edited)
 	// Telegram refuses an edit that changes nothing, as when the same
-	// Correction is sent twice, and only its description says so.
+	// Correction is sent twice, and an edit of a message that is gone. Only
+	// the description tells them apart.
 	apiErr, isAPIErr := errors.AsType[*apiError](err)
-	isUnchanged := isAPIErr && strings.Contains(apiErr.description, "message is not modified")
-	if isUnchanged {
+	switch {
+	case !isAPIErr:
+		return err
+	case strings.Contains(apiErr.description, "message is not modified"):
 		return nil
+	case strings.Contains(apiErr.description, "message to edit not found"):
+		return ErrMessageNotFound
+	default:
+		return err
 	}
-	return err
 }
 
 // SendChatAction shows action, such as "typing", in the chat until the bot
