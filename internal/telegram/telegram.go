@@ -104,6 +104,17 @@ func (c *Client) SendMessage(ctx context.Context, chatID int64, text string, rep
 	return sent, nil
 }
 
+// EditMessageText replaces the text of message messageID, which the bot sent
+// in chatID, with text, as plain text with no parse mode.
+func (c *Client) EditMessageText(ctx context.Context, chatID, messageID int64, text string) error {
+	ctx, cancel := context.WithTimeout(ctx, sendTimeout)
+	defer cancel()
+
+	params := map[string]any{"chat_id": chatID, "message_id": messageID, "text": text}
+	var edited Message
+	return c.call(ctx, "editMessageText", params, &edited)
+}
+
 // SendChatAction shows action, such as "typing", in the chat until the bot
 // sends a message there or a few seconds pass.
 func (c *Client) SendChatAction(ctx context.Context, chatID int64, action string) error {

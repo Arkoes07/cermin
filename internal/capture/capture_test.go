@@ -1,16 +1,20 @@
 package capture_test
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"maps"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -417,6 +421,269 @@ func TestBot_Process_SafeToRepeat(t *testing.T) {
 	}
 }
 
+func TestBot_CatchUp_ClassifiesOnceClassifierRecovers(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	classifier := &fakeClassifier{
+		candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}},
+		err:        errors.New("classifier down"),
+	}
+	var gotTimeout time.Duration
+	classify := func(
+		ctx context.Context,
+		text string,
+		kinds []cermin.Kind,
+		topics []string,
+	) (cermin.Classification, string, error) {
+		if deadline, ok := ctx.Deadline(); ok {
+			gotTimeout = time.Until(deadline)
+		}
+		return classifier.classify(ctx, text, kinds, topics)
+	}
+	bot, db, api := newBot(t, classify)
+	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
+	thought := captureQueued(t, bot, db)
+
+	classifier.err = nil
+	if err := bot.CatchUp(ctx); err != nil {
+		t.Fatalf("CatchUp: %v", err)
+	}
+
+	if gotTimeout <= 8*time.Second || gotTimeout > 60*time.Second {
+		t.Errorf("classified with %v left, want more than Capture's 8s and at most 60s", gotTimeout)
+	}
+	classifications, err := db.Classifications(ctx, thought.ID)
+	if err != nil || len(classifications) != 1 {
+		t.Fatalf("Classifications = %+v, %v; want 1", classifications, err)
+	}
+	wantSent := []sentMessage{{ChatID: ownerID, Text: "✓ saved", ReplyToID: messageID}}
+	if sent := api.sentMessages(); !slices.Equal(sent, wantSent) {
+		t.Errorf("sent %+v, want %+v", sent, wantSent)
+	}
+	wantEdits := []editedMessage{{ChatID: ownerID, MessageID: 1001, Text: "💡 idea · running"}}
+	if edits := api.editedMessages(); !slices.Equal(edits, wantEdits) {
+		t.Errorf("edited %+v, want %+v", edits, wantEdits)
+	}
+}
+
+func TestBot_CatchUp_SendsMissingAcknowledgement(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name          string
+		classifierErr error
+		wantAck       string
+	}{
+		{
+			name:    "classified before the crash",
+			wantAck: "💡 idea · running",
+		},
+		{
+			name:          "unclassified",
+			classifierErr: errors.New("classifier down"),
+			wantAck:       "✓ saved",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			classifier := &fakeClassifier{
+				candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}},
+				err:        tt.classifierErr,
+			}
+			bot, _, api := newBot(t, classifier.classify)
+			// A failed reply leaves what a crash before replying does: the
+			// Thought saved without an Acknowledgement.
+			api.failNextSend()
+			api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
+			if err := bot.Poll(ctx); err != nil {
+				t.Fatalf("Poll: %v", err)
+			}
+			if err := bot.ProcessInbox(ctx); err == nil {
+				t.Fatal("ProcessInbox succeeded although the Acknowledgement failed to send")
+			}
+
+			for range 2 {
+				if err := bot.CatchUp(ctx); err != nil {
+					t.Fatalf("CatchUp: %v", err)
+				}
+			}
+			wantSent := []sentMessage{{ChatID: ownerID, Text: tt.wantAck, ReplyToID: messageID}}
+			if sent := api.sentMessages(); !slices.Equal(sent, wantSent) {
+				t.Errorf("sent %+v, want %+v", sent, wantSent)
+			}
+
+			// The inbox retries the update too, and must not send another.
+			if err := bot.ProcessInbox(ctx); err != nil {
+				t.Fatalf("ProcessInbox again: %v", err)
+			}
+			if sent := api.sentMessages(); !slices.Equal(sent, wantSent) {
+				t.Errorf("after the inbox retry, sent %+v, want %+v", sent, wantSent)
+			}
+		})
+	}
+}
+
+func TestBot_CatchUp_RetriesFailedClassification(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	running := []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}
+	classifier := &fakeClassifier{candidates: running, err: errors.New("classifier down")}
+	bot, db, api := newBot(t, classifier.classify)
+	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
+	thought := captureQueued(t, bot, db)
+
+	failures := []struct {
+		name       string
+		err        error
+		kind       string
+		candidates []cermin.TopicCandidate
+	}{
+		{name: "classifier down", err: errors.New("classifier down"), candidates: running},
+		{name: "classifier timing out", err: context.DeadlineExceeded, candidates: running},
+		{name: "no topic", candidates: nil},
+		{name: "unknown kind", kind: "rant", candidates: running}, // fails as it is saved
+	}
+	// Each failure follows the ones before it on the same Thought, so these
+	// subtests run in order.
+	for _, f := range failures {
+		t.Run(f.name, func(t *testing.T) {
+			ctx := t.Context()
+			classifier.err, classifier.kind, classifier.candidates = f.err, f.kind, f.candidates
+			if err := bot.CatchUp(ctx); err != nil {
+				t.Fatalf("CatchUp: %v", err)
+			}
+			if classifications, err := db.Classifications(ctx, thought.ID); err != nil || len(classifications) != 0 {
+				t.Errorf("Classifications = %+v, %v; want none", classifications, err)
+			}
+			if topics, err := db.TopicNames(ctx); err != nil || len(topics) != 0 {
+				t.Errorf("TopicNames = %q, %v; want none", topics, err)
+			}
+			if edits := api.editedMessages(); len(edits) != 0 {
+				t.Errorf("edited %+v, want nothing", edits)
+			}
+		})
+	}
+
+	classifier.err, classifier.kind, classifier.candidates = nil, "", running
+	for range 2 {
+		if err := bot.CatchUp(ctx); err != nil {
+			t.Fatalf("CatchUp: %v", err)
+		}
+	}
+	if classifications, err := db.Classifications(ctx, thought.ID); err != nil || len(classifications) != 1 {
+		t.Errorf("Classifications = %+v, %v; want 1", classifications, err)
+	}
+	wantEdits := []editedMessage{{ChatID: ownerID, MessageID: 1001, Text: "💡 idea · running"}}
+	if edits := api.editedMessages(); !slices.Equal(edits, wantEdits) {
+		t.Errorf("edited %+v, want %+v", edits, wantEdits)
+	}
+}
+
+func TestBot_CatchUp_ClassifiesAtMost20(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	classifier := &fakeClassifier{
+		candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}},
+		err:        errors.New("classifier down"),
+	}
+	bot, db, api := newBot(t, classifier.classify)
+	for i := range 21 {
+		api.queue(update(t, "message", ownerID, map[string]any{
+			"message_id": messageID + i,
+			"text":       "Run " + strconv.Itoa(i+1) + " km on Saturday.",
+		}))
+	}
+	captureQueued(t, bot, db)
+
+	classifier.err, classifier.gotTopics = nil, nil
+	if err := bot.CatchUp(ctx); err != nil {
+		t.Fatalf("CatchUp: %v", err)
+	}
+	if calls := len(classifier.gotTopics); calls != 20 {
+		t.Errorf("first CatchUp classified %d Thoughts, want 20", calls)
+	}
+	if err := bot.CatchUp(ctx); err != nil {
+		t.Fatalf("CatchUp again: %v", err)
+	}
+	if calls := len(classifier.gotTopics); calls != 21 {
+		t.Errorf("classified %d Thoughts after two CatchUps, want all 21", calls)
+	}
+}
+
+func TestBot_CatchUp_KeepsClassificationMadeMeanwhile(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	slow := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "errands", Confidence: 0.9}}}
+	fast := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	slowStarted, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	classify := func(
+		ctx context.Context,
+		text string,
+		kinds []cermin.Kind,
+		topics []string,
+	) (cermin.Classification, string, error) {
+		switch calls.Add(1) {
+		case 1: // at Capture
+			return cermin.Classification{}, "", errors.New("classifier down")
+		case 2: // the catch-up's
+			close(slowStarted)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return cermin.Classification{}, "", ctx.Err()
+			}
+			return slow.classify(ctx, text, kinds, topics)
+		default: // the inbox retry's
+			return fast.classify(ctx, text, kinds, topics)
+		}
+	}
+	bot, db, api := newBot(t, classify)
+	api.failNextSend()
+	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
+	if err := bot.Poll(ctx); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if err := bot.ProcessInbox(ctx); err == nil {
+		t.Fatal("ProcessInbox succeeded although the Acknowledgement failed to send")
+	}
+
+	// The catch-up's Acknowledgement fails too, then its classifier is slow.
+	api.failNextSend()
+	caughtUp := make(chan error, 1)
+	go func() { caughtUp <- bot.CatchUp(ctx) }()
+	<-slowStarted
+	// Meanwhile the inbox retries the update, classifying the Thought itself.
+	if err := bot.ProcessInbox(ctx); err != nil {
+		t.Fatalf("ProcessInbox again: %v", err)
+	}
+	close(release)
+	if err := <-caughtUp; err != nil {
+		t.Fatalf("CatchUp: %v", err)
+	}
+
+	thoughts, err := db.Thoughts(ctx)
+	if err != nil || len(thoughts) != 1 {
+		t.Fatalf("Thoughts = %+v, %v; want 1", thoughts, err)
+	}
+	classifications, err := db.Classifications(ctx, thoughts[0].ID)
+	if err != nil || len(classifications) != 1 {
+		t.Fatalf("Classifications = %+v, %v; want 1", classifications, err)
+	}
+	wantTopics := []cermin.TopicCandidate{{Name: "running", Confidence: 0.9, Kept: true}}
+	if got := classifications[0].Topics; !slices.Equal(got, wantTopics) {
+		t.Errorf("kept the Classification with Topics %+v, want the inbox retry's %+v", got, wantTopics)
+	}
+	wantSent := []sentMessage{{ChatID: ownerID, Text: "💡 idea · running", ReplyToID: messageID}}
+	if sent := api.sentMessages(); !slices.Equal(sent, wantSent) {
+		t.Errorf("sent %+v, want %+v", sent, wantSent)
+	}
+	if edits := api.editedMessages(); len(edits) != 0 {
+		t.Errorf("edited %+v, want nothing", edits)
+	}
+}
+
 func newBot(t *testing.T, classify capture.ClassifyFunc) (*capture.Bot, *sqlite.DB, *fakeBotAPI) {
 	t.Helper()
 	api := &fakeBotAPI{}
@@ -464,10 +731,13 @@ func captureQueued(t *testing.T, bot *capture.Bot, db *sqlite.DB) cermin.Thought
 // Classification.
 const fakeRawOutput = `{"language":"en","kind":{"value":"idea","confidence":0.9}}`
 
-// fakeClassifier classifies every Thought as an English idea with its
-// candidate Topics, and records the existing Topics it was given.
+// fakeClassifier classifies every Thought as English, of Kind kind (idea if
+// unset), with its candidate Topics, or fails with err if set. It records the
+// existing Topics it was given.
 type fakeClassifier struct {
+	kind       string
 	candidates []cermin.TopicCandidate
+	err        error
 	gotTopics  [][]string // the existing Topics given to each call
 }
 
@@ -478,8 +748,11 @@ func (f *fakeClassifier) classify(
 	topics []string,
 ) (cermin.Classification, string, error) {
 	f.gotTopics = append(f.gotTopics, topics)
+	if f.err != nil {
+		return cermin.Classification{}, "", f.err
+	}
 	c := cermin.Classification{
-		Kind:             "idea",
+		Kind:             cmp.Or(f.kind, "idea"),
 		KindConfidence:   0.9,
 		Topics:           slices.Clone(f.candidates),
 		Model:            "claude-test",
@@ -533,14 +806,23 @@ type sentMessage struct {
 	ReplyToID int64
 }
 
+// editedMessage is an edit the bot asked the Bot API to make.
+type editedMessage struct {
+	ChatID    int64
+	MessageID int64
+	Text      string
+}
+
 // fakeBotAPI stands in for the Telegram Bot API: getUpdates delivers the
-// queued updates once, sendChatAction records the action, and sendMessage
-// records the message and gives it the next message ID, starting at 1001.
+// queued updates once, sendChatAction records the action, sendMessage
+// records the message and gives it the next message ID, starting at 1001,
+// and editMessageText records the edit.
 type fakeBotAPI struct {
 	mu               sync.Mutex
 	updates          []string
 	actions          []string
 	sent             []sentMessage
+	edits            []editedMessage
 	isNextSendFailed bool
 }
 
@@ -567,6 +849,12 @@ func (f *fakeBotAPI) sentMessages() []sentMessage {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.sent)
+}
+
+func (f *fakeBotAPI) editedMessages() []editedMessage {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.edits)
 }
 
 func (f *fakeBotAPI) handler(t *testing.T) http.Handler {
@@ -628,6 +916,34 @@ func (f *fakeBotAPI) handler(t *testing.T) http.Handler {
 		})
 		if err != nil {
 			t.Errorf("encoding sent message: %v", err)
+		}
+		writeResult(t, w, string(msg))
+	})
+	mux.HandleFunc("POST /bot"+botToken+"/editMessageText", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ChatID    int64   `json:"chat_id"`
+			MessageID int64   `json:"message_id"`
+			Text      string  `json:"text"`
+			ParseMode *string `json:"parse_mode"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decoding editMessageText: %v", err)
+		}
+		if req.ParseMode != nil {
+			t.Errorf("editMessageText with parse_mode %q, want plain text", *req.ParseMode)
+		}
+		f.mu.Lock()
+		f.edits = append(f.edits, editedMessage{ChatID: req.ChatID, MessageID: req.MessageID, Text: req.Text})
+		f.mu.Unlock()
+		msg, err := json.Marshal(map[string]any{
+			"message_id": req.MessageID,
+			"chat":       map[string]any{"id": req.ChatID},
+			"date":       0,
+			"edit_date":  0,
+			"text":       req.Text,
+		})
+		if err != nil {
+			t.Errorf("encoding edited message: %v", err)
 		}
 		writeResult(t, w, string(msg))
 	})

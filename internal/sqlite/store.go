@@ -206,9 +206,49 @@ func (db *DB) SetAckMessageID(ctx context.Context, thoughtID, ackMessageID int64
 	return nil
 }
 
+// Thought returns the Thought id.
+func (db *DB) Thought(ctx context.Context, id int64) (cermin.Thought, error) {
+	row := db.pool.QueryRowContext(ctx, `SELECT `+thoughtColumns+` FROM thoughts WHERE id = ?`, id)
+	t, err := scanThought(row)
+	if err != nil {
+		return cermin.Thought{}, fmt.Errorf("reading thought %d: %w", id, err)
+	}
+	return t, nil
+}
+
 // Thoughts returns every Thought, oldest first.
 func (db *DB) Thoughts(ctx context.Context) ([]cermin.Thought, error) {
-	rows, err := db.pool.QueryContext(ctx, `SELECT `+thoughtColumns+` FROM thoughts ORDER BY id`)
+	return db.queryThoughts(ctx, `SELECT `+thoughtColumns+` FROM thoughts ORDER BY id`)
+}
+
+// UnackedThoughts returns the Thoughts from Telegram that have no
+// Acknowledgement, oldest first.
+func (db *DB) UnackedThoughts(ctx context.Context) ([]cermin.Thought, error) {
+	return db.queryThoughts(ctx, `
+		SELECT `+thoughtColumns+` FROM thoughts
+		WHERE ack_message_id IS NULL AND tg_message_id IS NOT NULL
+		ORDER BY id`,
+	)
+}
+
+// UnclassifiedThoughts returns up to limit Thoughts that have no
+// Classification, oldest first.
+func (db *DB) UnclassifiedThoughts(ctx context.Context, limit int) ([]cermin.Thought, error) {
+	// NOT IN reads classifications once, where NOT EXISTS would read it once
+	// per Thought.
+	return db.queryThoughts(ctx, `
+		SELECT `+thoughtColumns+` FROM thoughts
+		WHERE id NOT IN (SELECT thought_id FROM classifications)
+		ORDER BY id
+		LIMIT ?`,
+		limit,
+	)
+}
+
+// queryThoughts runs query, which selects thoughtColumns, and returns the
+// Thoughts it finds.
+func (db *DB) queryThoughts(ctx context.Context, query string, args ...any) ([]cermin.Thought, error) {
+	rows, err := db.pool.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("listing thoughts: %w", err)
 	}
