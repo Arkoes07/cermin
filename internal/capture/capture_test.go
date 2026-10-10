@@ -16,7 +16,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -79,7 +78,6 @@ func TestBot_ProcessInbox_CapturesOwnerText(t *testing.T) {
 		TGReplyToMessageID:  5,
 		AckMessageID:        1001,
 		AckClassificationID: got.AckClassificationID, // shown by what was sent
-		Language:            "en",
 	}
 	if got != want {
 		t.Errorf("Thought = %+v, want %+v", got, want)
@@ -115,6 +113,7 @@ func TestBot_ProcessInbox_CapturesOwnerText(t *testing.T) {
 		PromptVersion:    "classify-v1",
 		ConfidenceMethod: "verbalized-v1",
 		RawOutput:        fakeRawOutput,
+		Language:         "en",
 	}
 	if !reflect.DeepEqual(gotClassification, wantClassification) {
 		t.Errorf("Classification = %+v, want %+v", gotClassification, wantClassification)
@@ -235,12 +234,12 @@ func TestBot_ProcessInbox_ReusesTopicIgnoringCase(t *testing.T) {
 func TestBot_ProcessInbox_SavesWhenClassificationTimesOut(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
-	timesOut := func(ctx context.Context, _ string, _ []cermin.Kind, _ []string) (cermin.Classification, string, error) {
+	timesOut := func(ctx context.Context, _ string, _ []cermin.Kind, _ []string) (cermin.Classification, error) {
 		deadline, ok := ctx.Deadline()
 		if !ok || time.Until(deadline) > 8*time.Second {
 			t.Errorf("classifying with deadline %v (set: %t), want one at most 8s away", deadline, ok)
 		}
-		return cermin.Classification{}, "", context.DeadlineExceeded
+		return cermin.Classification{}, context.DeadlineExceeded
 	}
 	bot, db, api := newBot(t, timesOut)
 	api.queue(textUpdate(t, ownerID, "Why does Go still not have sum types?", 0))
@@ -254,11 +253,54 @@ func TestBot_ProcessInbox_SavesWhenClassificationTimesOut(t *testing.T) {
 	if classifications, err := db.Classifications(ctx, thought.ID); err != nil || len(classifications) != 0 {
 		t.Errorf("Classifications = %+v, %v; want none", classifications, err)
 	}
-	if thought.Language != "" {
-		t.Errorf("Language = %q, want none until classified", thought.Language)
-	}
 	if updates, err := db.UnprocessedUpdates(ctx); err != nil || len(updates) != 0 {
 		t.Errorf("unprocessed updates = %+v, %v; want none", updates, err)
+	}
+}
+
+// A Classification that arrives as Capture's context ends, at its 8 s
+// timeout or at shutdown, is saved, so that the catch-up doesn't pay for it
+// again.
+func TestBot_Process_SavesClassificationArrivingAsCaptureEnds(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	captureCtx, endCapture := context.WithCancel(ctx)
+	classify := func(
+		ctx context.Context,
+		text string,
+		kinds []cermin.Kind,
+		topics []string,
+	) (cermin.Classification, error) {
+		endCapture()
+		return classifier.classify(ctx, text, kinds, topics)
+	}
+	bot, db, api := newBot(t, classify)
+	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
+	in := pollUpdate(t, bot, db)
+
+	// With its context ended, the Capture can't send the Acknowledgement or
+	// mark the update processed.
+	if err := bot.Process(captureCtx, in); err == nil {
+		t.Fatal("Process with its context ended succeeded, want it to fail")
+	}
+	if err := bot.CatchUp(ctx); err != nil {
+		t.Fatalf("CatchUp: %v", err)
+	}
+
+	if calls := len(classifier.gotTopics); calls != 1 {
+		t.Errorf("classified %d times, want once", calls)
+	}
+	thoughts, err := db.Thoughts(ctx)
+	if err != nil || len(thoughts) != 1 {
+		t.Fatalf("Thoughts = %+v, %v; want 1", thoughts, err)
+	}
+	if classifications, err := db.Classifications(ctx, thoughts[0].ID); err != nil || len(classifications) != 1 {
+		t.Errorf("Classifications = %+v, %v; want 1", classifications, err)
+	}
+	wantSent := []sentMessage{{ChatID: ownerID, Text: "💡 idea · running", ReplyToID: messageID}}
+	if sent := api.sentMessages(); !slices.Equal(sent, wantSent) {
+		t.Errorf("sent %+v, want %+v", sent, wantSent)
 	}
 }
 
@@ -901,7 +943,7 @@ func TestBot_CatchUp_ClassifiesOnceClassifierRecovers(t *testing.T) {
 		text string,
 		kinds []cermin.Kind,
 		topics []string,
-	) (cermin.Classification, string, error) {
+	) (cermin.Classification, error) {
 		if deadline, ok := ctx.Deadline(); ok {
 			gotTimeout = time.Until(deadline)
 		}
@@ -1165,54 +1207,51 @@ func TestBot_CatchUp_ClassifiesAtMost20(t *testing.T) {
 	}
 }
 
+// The race tests below need no goroutines: the catch-up calls the classifier
+// without the lock, so a fake classifier runs the competing step inside its
+// own call, then answers.
+
 func TestBot_CatchUp_KeepsClassificationMadeMeanwhile(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
-	slow := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "errands", Confidence: 0.9}}}
-	fast := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
-	slowStarted, release := make(chan struct{}), make(chan struct{})
-	var calls atomic.Int32
+	late := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "errands", Confidence: 0.9}}}
+	first := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	var bot *capture.Bot
+	var in sqlite.InboxUpdate
+	calls := 0
 	classify := func(
-		ctx context.Context,
+		_ context.Context,
 		text string,
 		kinds []cermin.Kind,
 		topics []string,
-	) (cermin.Classification, string, error) {
-		switch calls.Add(1) {
+	) (cermin.Classification, error) {
+		calls++
+		switch calls {
 		case 1: // at Capture
-			return cermin.Classification{}, "", errors.New("classifier down")
+			return cermin.Classification{}, errors.New("classifier down")
 		case 2: // the catch-up's
-			close(slowStarted)
-			select {
-			case <-release:
-			case <-ctx.Done():
-				return cermin.Classification{}, "", ctx.Err()
+			// Meanwhile a restart after a crash processes the update again,
+			// which classifies the Thought itself.
+			if err := bot.Process(ctx, in); err != nil {
+				t.Fatalf("Process again: %v", err)
 			}
-			return slow.classify(ctx, text, kinds, topics)
+			return late.classify(ctx, text, kinds, topics)
 		default: // at Capture again
-			return fast.classify(ctx, text, kinds, topics)
+			return first.classify(ctx, text, kinds, topics)
 		}
 	}
 	bot, db, api := newBot(t, classify)
 	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
-	in := pollUpdate(t, bot, db)
+	in = pollUpdate(t, bot, db)
 	api.failNextSend()
 	if err := bot.Process(ctx, in); err != nil {
 		t.Fatalf("Process: %v", err)
 	}
 
-	// The catch-up's Acknowledgement fails too, then its classifier is slow.
+	// The catch-up's Acknowledgement fails too, so the Thought still has none
+	// when it is classified.
 	api.failNextSend()
-	caughtUp := make(chan error, 1)
-	go func() { caughtUp <- bot.CatchUp(ctx) }()
-	<-slowStarted
-	// Meanwhile a restart after a crash processes the update again, which
-	// classifies the Thought itself.
-	if err := bot.Process(ctx, in); err != nil {
-		t.Fatalf("Process again: %v", err)
-	}
-	close(release)
-	if err := <-caughtUp; err != nil {
+	if err := bot.CatchUp(ctx); err != nil {
 		t.Fatalf("CatchUp: %v", err)
 	}
 
@@ -1228,6 +1267,9 @@ func TestBot_CatchUp_KeepsClassificationMadeMeanwhile(t *testing.T) {
 	if got := classifications[0].Topics; !slices.Equal(got, wantTopics) {
 		t.Errorf("kept the Classification with Topics %+v, want the Capture's %+v", got, wantTopics)
 	}
+	if topics, err := db.TopicNames(ctx); err != nil || !slices.Equal(topics, []string{"running"}) {
+		t.Errorf("TopicNames = %q, %v; want running only", topics, err)
+	}
 	wantSent := []sentMessage{{ChatID: ownerID, Text: "💡 idea · running", ReplyToID: messageID}}
 	if sent := api.sentMessages(); !slices.Equal(sent, wantSent) {
 		t.Errorf("sent %+v, want %+v", sent, wantSent)
@@ -1240,48 +1282,39 @@ func TestBot_CatchUp_KeepsClassificationMadeMeanwhile(t *testing.T) {
 func TestBot_CatchUp_SendsOneAcknowledgementWhenCaptureRaces(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
-	slow := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
-	slowStarted, release := make(chan struct{}), make(chan struct{})
-	var calls atomic.Int32
+	late := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	var bot *capture.Bot
+	var in sqlite.InboxUpdate
+	calls := 0
 	classify := func(
-		ctx context.Context,
+		_ context.Context,
 		text string,
 		kinds []cermin.Kind,
 		topics []string,
-	) (cermin.Classification, string, error) {
-		switch calls.Add(1) {
-		case 2: // the catch-up's
-			close(slowStarted)
-			select {
-			case <-release:
-			case <-ctx.Done():
-				return cermin.Classification{}, "", ctx.Err()
-			}
-			return slow.classify(ctx, text, kinds, topics)
-		default: // at Capture, and at Capture again
-			return cermin.Classification{}, "", errors.New("classifier down")
+	) (cermin.Classification, error) {
+		calls++
+		if calls != 2 { // at Capture, and at Capture again
+			return cermin.Classification{}, errors.New("classifier down")
 		}
+		// The catch-up's. Meanwhile a restart after a crash processes the
+		// update again, which sends the Acknowledgement.
+		if err := bot.Process(ctx, in); err != nil {
+			t.Fatalf("Process again: %v", err)
+		}
+		return late.classify(ctx, text, kinds, topics)
 	}
 	bot, db, api := newBot(t, classify)
 	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
-	in := pollUpdate(t, bot, db)
+	in = pollUpdate(t, bot, db)
 	api.failNextSend()
 	if err := bot.Process(ctx, in); err != nil {
 		t.Fatalf("Process: %v", err)
 	}
 
-	// The catch-up's Acknowledgement fails too, then its classifier is slow.
+	// The catch-up's Acknowledgement fails too, so the Thought still has none
+	// when it is classified.
 	api.failNextSend()
-	caughtUp := make(chan error, 1)
-	go func() { caughtUp <- bot.CatchUp(ctx) }()
-	<-slowStarted
-	// Meanwhile a restart after a crash processes the update again, which
-	// sends the Acknowledgement.
-	if err := bot.Process(ctx, in); err != nil {
-		t.Fatalf("Process again: %v", err)
-	}
-	close(release)
-	if err := <-caughtUp; err != nil {
+	if err := bot.CatchUp(ctx); err != nil {
 		t.Fatalf("CatchUp: %v", err)
 	}
 
@@ -1300,45 +1333,35 @@ func TestBot_CatchUp_SendsOneAcknowledgementWhenCaptureRaces(t *testing.T) {
 func TestBot_CatchUp_DropsClassificationOfThoughtDeletedMeanwhile(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
-	slow := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
-	slowStarted, release := make(chan struct{}), make(chan struct{})
-	var calls atomic.Int32
+	late := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	var bot *capture.Bot
+	var api *fakeBotAPI
+	calls := 0
 	classify := func(
-		ctx context.Context,
+		_ context.Context,
 		text string,
 		kinds []cermin.Kind,
 		topics []string,
-	) (cermin.Classification, string, error) {
-		switch calls.Add(1) {
-		case 2: // the catch-up's
-			close(slowStarted)
-			select {
-			case <-release:
-			case <-ctx.Done():
-				return cermin.Classification{}, "", ctx.Err()
-			}
-			return slow.classify(ctx, text, kinds, topics)
-		default: // at each Capture
-			return cermin.Classification{}, "", errors.New("classifier down")
+	) (cermin.Classification, error) {
+		calls++
+		if calls != 2 { // at each Capture
+			return cermin.Classification{}, errors.New("classifier down")
 		}
+		// The catch-up's. Meanwhile you delete the Thought and capture
+		// another, which the classifier fails on too.
+		api.queue(commandUpdate(t, commandID, "/delete", messageID))
+		api.queue(update(t, "message", ownerID, map[string]any{
+			"message_id": commandID + 1, // after the /delete
+			"text":       "Buy new running shoes.",
+		}))
+		processQueued(t, bot)
+		return late.classify(ctx, text, kinds, topics)
 	}
 	bot, db, api := newBot(t, classify)
 	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
 	deleted := captureQueued(t, bot, db)
 
-	caughtUp := make(chan error, 1)
-	go func() { caughtUp <- bot.CatchUp(ctx) }()
-	<-slowStarted
-	// Meanwhile you delete the Thought and capture another, which the
-	// classifier fails on too.
-	api.queue(commandUpdate(t, commandID, "/delete", messageID))
-	api.queue(update(t, "message", ownerID, map[string]any{
-		"message_id": commandID + 1, // after the /delete
-		"text":       "Buy new running shoes.",
-	}))
-	processQueued(t, bot)
-	close(release)
-	if err := <-caughtUp; err != nil {
+	if err := bot.CatchUp(ctx); err != nil {
 		t.Fatalf("CatchUp: %v", err)
 	}
 
@@ -1354,6 +1377,9 @@ func TestBot_CatchUp_DropsClassificationOfThoughtDeletedMeanwhile(t *testing.T) 
 	}
 	if got, err := db.Classifications(ctx, thoughts[0].ID); err != nil || len(got) != 0 {
 		t.Errorf("Classifications of the new Thought = %+v, %v; want none, not the deleted Thought's", got, err)
+	}
+	if topics, err := db.TopicNames(ctx); err != nil || len(topics) != 0 {
+		t.Errorf("TopicNames = %q, %v; want none", topics, err)
 	}
 	wantEdits := []editedMessage{{ChatID: ownerID, MessageID: ackID, Text: "🗑 deleted"}}
 	if edits := api.editedMessages(); !slices.Equal(edits, wantEdits) {
@@ -1544,10 +1570,10 @@ func (f *fakeClassifier) classify(
 	_ string,
 	_ []cermin.Kind,
 	topics []string,
-) (cermin.Classification, string, error) {
+) (cermin.Classification, error) {
 	f.gotTopics = append(f.gotTopics, topics)
 	if f.err != nil {
-		return cermin.Classification{}, "", f.err
+		return cermin.Classification{}, f.err
 	}
 	c := cermin.Classification{
 		Kind:             cmp.Or(f.kind, "idea"),
@@ -1557,8 +1583,9 @@ func (f *fakeClassifier) classify(
 		PromptVersion:    "classify-v1",
 		ConfidenceMethod: "verbalized-v1",
 		RawOutput:        fakeRawOutput,
+		Language:         "en",
 	}
-	return c, "en", nil
+	return c, nil
 }
 
 // textUpdate is an update carrying a text message. A non-zero replyToID

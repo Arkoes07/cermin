@@ -22,6 +22,5 @@ CREATE TABLE thoughts (
     -- No foreign key: a Classification is only deleted with its Thought.
     ack_classification_id  INTEGER,
     thought_at             TEXT    NOT NULL,
-    received_at            TEXT    NOT NULL,
-    language               TEXT
+    received_at            TEXT    NOT NULL
 );

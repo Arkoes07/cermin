@@ -48,7 +48,7 @@ func TestClassifier_Classify(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			start := time.Now()
-			c, language, err := classifier.Classify(
+			c, err := classifier.Classify(
 				t.Context(),
 				tt.text,
 				kinds,
@@ -59,8 +59,8 @@ func TestClassifier_Classify(t *testing.T) {
 			}
 			t.Logf("%s in %v: %s", c.Model, time.Since(start).Round(time.Millisecond), c.RawOutput)
 
-			if language != tt.wantLanguage {
-				t.Errorf("language = %q, want %q", language, tt.wantLanguage)
+			if c.Language != tt.wantLanguage {
+				t.Errorf("Language = %q, want %q", c.Language, tt.wantLanguage)
 			}
 			if !slices.ContainsFunc(kinds, func(k cermin.Kind) bool { return k.Name == c.Kind }) {
 				t.Errorf("Kind = %q, want one of the Kinds", c.Kind)

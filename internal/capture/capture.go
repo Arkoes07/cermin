@@ -63,15 +63,15 @@ const (
 	unknownCommandReply = "Unknown command.\n\n" + helpReply
 )
 
-// ClassifyFunc gives a Thought's text a Classification, with one of kinds
-// and candidate Topics that reuse the existing topics where one fits, and
-// returns the Thought's language. (*claude.Classifier).Classify is one.
+// ClassifyFunc gives a Thought's text a Classification: one of kinds,
+// candidate Topics that reuse the existing topics where one fits, and the
+// Thought's language. (*claude.Classifier).Classify is one.
 type ClassifyFunc func(
 	ctx context.Context,
 	text string,
 	kinds []cermin.Kind,
 	topics []string,
-) (c cermin.Classification, language string, err error)
+) (cermin.Classification, error)
 
 // Bot moves Telegram updates into the inbox, captures the owner's Thoughts
 // and runs their Corrections and deletes from it, and catches up on the
@@ -246,7 +246,7 @@ func (b *Bot) Process(ctx context.Context, in sqlite.InboxUpdate) error {
 		if err := b.tg.SendChatAction(ctx, m.Chat.ID, "typing"); err != nil {
 			slog.WarnContext(ctx, "showing typing", "thought_id", thought.ID, "err", err)
 		}
-		if err := b.classifyThought(ctx, thought); err != nil {
+		if _, err := b.classifyThought(ctx, thought, classifyTimeout); err != nil {
 			// A slow or failing classifier never fails a Capture: the
 			// Thought is saved and stays unclassified until the catch-up.
 			slog.WarnContext(ctx, "classifying thought", "thought_id", thought.ID, "err", err)
@@ -365,7 +365,7 @@ func (b *Bot) correct(
 		)
 	}
 	correction.TGMessageID = m.ID
-	stored, err := b.db.SaveClassification(ctx, correction, "")
+	stored, err := b.db.SaveClassification(ctx, correction)
 	if err != nil {
 		return err
 	}
@@ -465,24 +465,54 @@ func kindUsage(kinds []cermin.Kind) string {
 	return "Reply to a Thought or its Acknowledgement with /kind and one of: " + strings.Join(names, ", ") + "."
 }
 
-// classifyThought gives a Thought its Classification, unless it has one. It
-// gives up after classifyTimeout.
-func (b *Bot) classifyThought(ctx context.Context, t cermin.Thought) error {
-	ctx, cancel := context.WithTimeout(ctx, classifyTimeout)
+// classifyThought gives a Thought its first Classification, waiting up to
+// timeout for the classifier, and reports whether it saved one. It makes no
+// paid call for a Thought that has a Classification, and saves none if the
+// Thought got one, or was deleted, while the classifier ran.
+func (b *Bot) classifyThought(ctx context.Context, t cermin.Thought, timeout time.Duration) (bool, error) {
+	// The paid call is done once it returns, so its Classification is saved
+	// even past the deadline or during shutdown.
+	saveCtx := context.WithoutCancel(ctx)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	// A Thought processed again after a crash, before its Acknowledgement
-	// was sent, keeps the Classification it already has.
+	// was sent, keeps the Classification it has, and so does one the
+	// catch-up reaches minutes after listing it.
 	_, isClassified, err := b.db.CurrentClassification(ctx, t.ID)
 	if err != nil || isClassified {
-		return err
+		return false, err
 	}
-	c, language, err := b.callClassifier(ctx, t)
+	topics, err := b.db.TopicNames(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
-	_, err = b.db.SaveClassification(ctx, c, language)
-	return err
+	c, err := b.classify(
+		ctx,
+		t.Text,
+		b.db.Kinds(),
+		topics,
+	)
+	if err != nil {
+		return false, err
+	}
+	c.ThoughtID = t.ID
+	c.Source = cermin.SourceCermin
+	c.Topics = cermin.KeepTopics(c.Topics)
+	if len(c.Topics) == 0 {
+		return false, errors.New("classified with no topic")
+	}
+
+	_, isSaved, err := b.db.SaveFirstClassification(saveCtx, c)
+	if err != nil {
+		return false, err
+	}
+	if !isSaved {
+		// The paid call is wasted: meanwhile the Thought was deleted, or
+		// classified, perhaps by another process.
+		slog.InfoContext(ctx, "classification not saved", "thought_id", t.ID)
+	}
+	return isSaved, nil
 }
 
 // syncAck brings the Acknowledgement of Thought thoughtID up to date: it sends
@@ -625,68 +655,23 @@ func (b *Bot) CatchUp(ctx context.Context) error {
 	return nil
 }
 
-// classifyLate gives a Thought that has no Classification one, waiting up to
-// catchUpClassifyTimeout for the classifier, and brings its Acknowledgement
-// up to date to show it.
+// classifyLate gives a Thought that had no Classification when the catch-up
+// listed it one, waiting up to catchUpClassifyTimeout for the classifier, and
+// brings its Acknowledgement up to date to show it.
 func (b *Bot) classifyLate(ctx context.Context, t cermin.Thought) error {
-	classifyCtx, cancel := context.WithTimeout(ctx, catchUpClassifyTimeout)
-	defer cancel()
-	c, language, err := b.callClassifier(classifyCtx, t)
-	if err != nil {
+	// Unlocked, so that a slow classifier never holds up a Capture.
+	isSaved, err := b.classifyThought(ctx, t, catchUpClassifyTimeout)
+	if err != nil || !isSaved {
+		// With none saved there is nothing new to show: the Thought is gone,
+		// or whatever classified it shows that, or the next catch-up does.
 		return err
 	}
-	// The paid call is done, so its Classification is saved and shown even
-	// during shutdown.
-	ctx = context.WithoutCancel(ctx)
+	slog.InfoContext(ctx, "thought classified late", "thought_id", t.ID)
 
-	// Locked only now, so that a slow classifier never holds up a Capture.
+	// Saved, it is shown even during shutdown.
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	// Meanwhile you may have deleted the Thought.
-	_, isFound, err := b.db.Thought(ctx, t.ID)
-	if err != nil || !isFound {
-		return err
-	}
-	// Or the inbox may have classified it, which keeps that Classification.
-	_, isClassified, err := b.db.CurrentClassification(ctx, t.ID)
-	if err != nil || isClassified {
-		return err
-	}
-	stored, err := b.db.SaveClassification(ctx, c, language)
-	if err != nil {
-		return err
-	}
-	slog.InfoContext(ctx, "thought classified late", "thought_id", t.ID, "classification_id", stored.ID)
-	return b.syncAck(ctx, t.ID)
-}
-
-// callClassifier asks the classifier for a Thought's Classification, with
-// the Topics it keeps marked, and returns it unsaved with the Thought's
-// language.
-func (b *Bot) callClassifier(
-	ctx context.Context,
-	t cermin.Thought,
-) (c cermin.Classification, language string, err error) {
-	topics, err := b.db.TopicNames(ctx)
-	if err != nil {
-		return cermin.Classification{}, "", err
-	}
-	c, language, err = b.classify(
-		ctx,
-		t.Text,
-		b.db.Kinds(),
-		topics,
-	)
-	if err != nil {
-		return cermin.Classification{}, "", err
-	}
-	c.ThoughtID = t.ID
-	c.Source = cermin.SourceCermin
-	c.Topics = cermin.KeepTopics(c.Topics)
-	if len(c.Topics) == 0 {
-		return cermin.Classification{}, "", errors.New("classified with no topic")
-	}
-	return c, language, nil
+	return b.syncAck(context.WithoutCancel(ctx), t.ID)
 }
 
 // ackText is the Acknowledgement of a Thought classified as c, such as

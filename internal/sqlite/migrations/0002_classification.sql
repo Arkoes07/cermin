@@ -38,12 +38,13 @@ CREATE TABLE classifications (
     prompt_version    TEXT,
     confidence_method TEXT,
     raw_output        TEXT,    -- includes kind_suggestion
+    language          TEXT    CHECK (language IN ('en', 'id', 'mixed')), -- the Thought's, as the model detected it
     tg_message_id     INTEGER, -- the Correction's message
     created_at        TEXT    NOT NULL,
     -- Week 3 measures Cermin's Classifications, so each records what made it.
     CHECK (source <> 'cermin' OR (
         kind_confidence IS NOT NULL AND model IS NOT NULL AND prompt_version IS NOT NULL
-        AND confidence_method IS NOT NULL AND raw_output IS NOT NULL
+        AND confidence_method IS NOT NULL AND raw_output IS NOT NULL AND language IS NOT NULL
     ))
 );
 

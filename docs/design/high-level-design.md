@@ -198,7 +198,6 @@ erDiagram
         int ack_classification_id "the Classification the Acknowledgement shows"
         datetime thought_at "UTC"
         datetime received_at "UTC"
-        text language "en, id or mixed"
     }
     KINDS {
         text name PK
@@ -217,6 +216,7 @@ erDiagram
         text prompt_version
         text confidence_method
         text raw_output "includes kind_suggestion"
+        text language "en, id or mixed"
         int tg_message_id "the Correction's message"
         datetime created_at
     }
@@ -332,10 +332,11 @@ Each table is created in the week that first needs it:
 These can't be reconstructed later, so week 1 records them:
 
 1. **Raw inbound updates.** Every Telegram update as raw JSON in `telegram_updates`. Parsing bugs can be replayed, and edits are logged.
-2. **The Thought.** Its verbatim text, Thought time, arrival time and Telegram message ID, the message it replied to, the Acknowledgement's message ID, and its detected language.
+2. **The Thought.** Its verbatim text, Thought time, arrival time and Telegram message ID, the message it replied to, and the Acknowledgement's message ID.
 3. **Every Classification Cermin makes.**
    - the model, prompt version and confidence method;
    - the raw model output, including `kind_suggestion`;
+   - the Thought's detected language;
    - the Kind and its confidence;
    - every candidate Topic and its confidence, including the dropped ones.
 4. **Corrections** as new Classifications. Cermin's are never changed.

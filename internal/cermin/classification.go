@@ -45,6 +45,7 @@ type Classification struct {
 	PromptVersion    string
 	ConfidenceMethod string // how the confidences were measured
 	RawOutput        string // the model's output, verbatim
+	Language         string // the Thought's, as the model detected it: en, id or mixed; "" for a Correction
 	TGMessageID      int64  // the Correction's Telegram message; 0 if none
 	CreatedAt        time.Time
 }

@@ -337,8 +337,7 @@ func (db *DB) queryThoughts(ctx context.Context, query string, args ...any) ([]c
 
 // thoughtColumns are the columns scanThought reads, in its order.
 const thoughtColumns = `id, text, source, COALESCE(tg_message_id, 0), COALESCE(tg_reply_to_message_id, 0),
-	COALESCE(ack_message_id, 0), COALESCE(ack_classification_id, 0), thought_at, received_at,
-	COALESCE(language, '')`
+	COALESCE(ack_message_id, 0), COALESCE(ack_classification_id, 0), thought_at, received_at`
 
 func scanThought(row scanner) (cermin.Thought, error) {
 	var t cermin.Thought
@@ -353,7 +352,6 @@ func scanThought(row scanner) (cermin.Thought, error) {
 		&t.AckClassificationID,
 		&thoughtAt,
 		&receivedAt,
-		&t.Language,
 	)
 	if err != nil {
 		return cermin.Thought{}, err
@@ -400,19 +398,45 @@ func scanName(row scanner) (string, error) {
 // Topic doesn't exist yet creates it, with origin cermin, or you for a
 // Correction. A candidate naming an existing Topic, in any case, takes that
 // Topic's spelling. A Correction's confidences are stored as NULL, since it
-// states none. A language other than "" becomes the Thought's.
-func (db *DB) SaveClassification(ctx context.Context, c cermin.Classification, language string) (cermin.Classification, error) {
-	stored, err := db.saveClassification(ctx, c, language)
+// states none, and its language as NULL.
+func (db *DB) SaveClassification(ctx context.Context, c cermin.Classification) (cermin.Classification, error) {
+	stored, _, err := db.saveClassification(ctx, c, false)
 	if err != nil {
 		return cermin.Classification{}, fmt.Errorf("saving classification of thought %d: %w", c.ThoughtID, err)
 	}
 	return stored, nil
 }
 
-func (db *DB) saveClassification(ctx context.Context, c cermin.Classification, language string) (cermin.Classification, error) {
+// SaveFirstClassification stores Cermin's Classification c as
+// SaveClassification does, but only if its Thought exists and has no
+// Classification, and reports whether it did. So a Thought keeps the first
+// Classification Cermin gives it, even when two processes classify it at
+// once. It returns false and no error for a Thought deleted meanwhile.
+func (db *DB) SaveFirstClassification(
+	ctx context.Context,
+	c cermin.Classification,
+) (cermin.Classification, bool, error) {
+	stored, isSaved, err := db.saveClassification(ctx, c, true)
+	if err != nil {
+		return cermin.Classification{}, false, fmt.Errorf(
+			"saving first classification of thought %d: %w",
+			c.ThoughtID,
+			err,
+		)
+	}
+	return stored, isSaved, nil
+}
+
+// saveClassification stores c, or if isFirst only while its Thought exists
+// and has no Classification, and reports whether it did.
+func (db *DB) saveClassification(
+	ctx context.Context,
+	c cermin.Classification,
+	isFirst bool,
+) (cermin.Classification, bool, error) {
 	tx, err := db.pool.BeginTx(ctx, nil)
 	if err != nil {
-		return cermin.Classification{}, err
+		return cermin.Classification{}, false, err
 	}
 	defer tx.Rollback() //nolint:errcheck // after Commit it only returns sql.ErrTxDone
 
@@ -424,10 +448,19 @@ func (db *DB) saveClassification(ctx context.Context, c cermin.Classification, l
 		origin = "you"
 	}
 	c.CreatedAt = time.Now().UTC().Truncate(time.Millisecond) // as stored
+	// isFirst's condition is checked in the INSERT itself, so that no other
+	// process can write between the check and the write. Checked in a read
+	// before it, another process's write would fail this transaction with
+	// SQLITE_BUSY_SNAPSHOT, which busy_timeout doesn't retry. No row back
+	// means not saved.
 	err = tx.QueryRowContext(ctx, `
 		INSERT INTO classifications (thought_id, source, kind, kind_confidence, model, prompt_version,
-			confidence_method, raw_output, tg_message_id, created_at)
-		VALUES (?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, 0), ?)
+			confidence_method, raw_output, language, tg_message_id, created_at)
+		SELECT ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, 0), ?
+		WHERE NOT ? OR (
+			EXISTS (SELECT 1 FROM thoughts WHERE id = ?)
+			AND NOT EXISTS (SELECT 1 FROM classifications WHERE thought_id = ?)
+		)
 		RETURNING id`,
 		c.ThoughtID,
 		c.Source,
@@ -437,11 +470,18 @@ func (db *DB) saveClassification(ctx context.Context, c cermin.Classification, l
 		c.PromptVersion,
 		c.ConfidenceMethod,
 		c.RawOutput,
+		c.Language,
 		c.TGMessageID,
 		formatTime(c.CreatedAt),
+		isFirst,
+		c.ThoughtID,
+		c.ThoughtID,
 	).Scan(&c.ID)
+	if isFirst && errors.Is(err, sql.ErrNoRows) {
+		return cermin.Classification{}, false, nil
+	}
 	if err != nil {
-		return cermin.Classification{}, err
+		return cermin.Classification{}, false, err
 	}
 
 	topics := make([]cermin.TopicCandidate, 0, len(c.Topics))
@@ -457,7 +497,7 @@ func (db *DB) saveClassification(ctx context.Context, c cermin.Classification, l
 				formatTime(c.CreatedAt),
 			)
 			if err != nil {
-				return cermin.Classification{}, err
+				return cermin.Classification{}, false, err
 			}
 		}
 		err := tx.QueryRowContext(ctx, `
@@ -471,26 +511,16 @@ func (db *DB) saveClassification(ctx context.Context, c cermin.Classification, l
 			t.Kept,
 		).Scan(&t.Name)
 		if err != nil {
-			return cermin.Classification{}, err
+			return cermin.Classification{}, false, err
 		}
 		topics = append(topics, t)
 	}
 	c.Topics = topics
 
-	if language != "" {
-		_, err := tx.ExecContext(ctx,
-			`UPDATE thoughts SET language = ? WHERE id = ?`,
-			language,
-			c.ThoughtID,
-		)
-		if err != nil {
-			return cermin.Classification{}, err
-		}
-	}
 	if err := tx.Commit(); err != nil {
-		return cermin.Classification{}, err
+		return cermin.Classification{}, false, err
 	}
-	return c, nil
+	return c, true, nil
 }
 
 // Classifications returns every Classification of the Thought thoughtID,
@@ -547,7 +577,7 @@ func (db *DB) CurrentClassification(ctx context.Context, thoughtID int64) (cermi
 // order.
 const classificationColumns = `id, thought_id, source, kind, COALESCE(kind_confidence, 0), COALESCE(model, ''),
 	COALESCE(prompt_version, ''), COALESCE(confidence_method, ''), COALESCE(raw_output, ''),
-	COALESCE(tg_message_id, 0), created_at`
+	COALESCE(language, ''), COALESCE(tg_message_id, 0), created_at`
 
 // scanClassification reads a Classification without its candidate Topics.
 func scanClassification(row scanner) (cermin.Classification, error) {
@@ -563,6 +593,7 @@ func scanClassification(row scanner) (cermin.Classification, error) {
 		&c.PromptVersion,
 		&c.ConfidenceMethod,
 		&c.RawOutput,
+		&c.Language,
 		&c.TGMessageID,
 		&createdAt,
 	)

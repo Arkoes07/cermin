@@ -41,15 +41,15 @@ func New(apiKey, model string) *Classifier {
 }
 
 // Classify asks Claude for the Classification of a Thought's text: one of
-// kinds, and up to 5 candidate Topics that reuse topics where one fits. It
-// also returns the Thought's language: en, id or mixed. The candidates come
-// back as Claude gave them, none of them kept; cermin.KeepTopics picks those.
+// kinds, up to 5 candidate Topics that reuse topics where one fits, and the
+// Thought's language: en, id or mixed. The candidates come back as Claude
+// gave them, none of them kept; cermin.KeepTopics picks those.
 func (c *Classifier) Classify(
 	ctx context.Context,
 	text string,
 	kinds []cermin.Kind,
 	topics []string,
-) (cermin.Classification, string, error) {
+) (cermin.Classification, error) {
 	resp, err := c.client.Messages.New(ctx, anthropic.MessageNewParams{
 		Model:     c.model,
 		MaxTokens: maxTokens,
@@ -61,11 +61,11 @@ func (c *Classifier) Classify(
 		},
 	})
 	if err != nil {
-		return cermin.Classification{}, "", fmt.Errorf("classify: %w", err)
+		return cermin.Classification{}, fmt.Errorf("classify: %w", err)
 	}
 	// A refused or cut-off output may not match the schema.
 	if resp.StopReason != anthropic.StopReasonEndTurn {
-		return cermin.Classification{}, "", fmt.Errorf("classify: model stopped with %s", resp.StopReason)
+		return cermin.Classification{}, fmt.Errorf("classify: model stopped with %s", resp.StopReason)
 	}
 	var raw string
 	for _, block := range resp.Content {
@@ -76,7 +76,7 @@ func (c *Classifier) Classify(
 	}
 	var out output
 	if err := json.Unmarshal([]byte(raw), &out); err != nil {
-		return cermin.Classification{}, "", fmt.Errorf("classify: decoding output: %w", err)
+		return cermin.Classification{}, fmt.Errorf("classify: decoding output: %w", err)
 	}
 
 	candidates := make([]cermin.TopicCandidate, 0, len(out.Topics))
@@ -91,8 +91,9 @@ func (c *Classifier) Classify(
 		PromptVersion:    promptVersion,
 		ConfidenceMethod: confidenceMethod,
 		RawOutput:        raw,
+		Language:         out.Language,
 	}
-	return classification, out.Language, nil
+	return classification, nil
 }
 
 // output is the model's output, as outputSchema shapes it. Its

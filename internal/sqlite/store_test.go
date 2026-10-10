@@ -29,7 +29,8 @@ func TestDB_SaveClassification_StoresCorrection(t *testing.T) {
 		PromptVersion:    "classify-v1",
 		ConfidenceMethod: "verbalized-v1",
 		RawOutput:        "{}",
-	}, "en")
+		Language:         "en",
+	})
 	if err != nil {
 		t.Fatalf("SaveClassification of Cermin's: %v", err)
 	}
@@ -55,7 +56,7 @@ func TestDB_SaveClassification_StoresCorrection(t *testing.T) {
 			{Name: "cermin", Kept: true},
 		},
 		TGMessageID: 20,
-	}, "")
+	})
 	if err != nil {
 		t.Fatalf("SaveClassification of the Correction: %v", err)
 	}
@@ -70,6 +71,14 @@ func TestDB_SaveClassification_StoresCorrection(t *testing.T) {
 	).Scan(&kindConfidence)
 	if err != nil || kindConfidence.Valid {
 		t.Errorf("kind_confidence = %+v, %v; want NULL", kindConfidence, err)
+	}
+	var language sql.Null[string]
+	err = db.pool.QueryRowContext(ctx,
+		`SELECT language FROM classifications WHERE id = ?`,
+		correction.ID,
+	).Scan(&language)
+	if err != nil || language.Valid {
+		t.Errorf("language = %+v, %v; want NULL", language, err)
 	}
 	var stated int
 	err = db.pool.QueryRowContext(ctx,
@@ -100,6 +109,106 @@ func TestDB_SaveClassification_StoresCorrection(t *testing.T) {
 	}
 }
 
+func TestDB_SaveFirstClassification(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		earlier   *cermin.Classification // saved first with SaveClassification, if set
+		isDeleted bool                   // the Thought is deleted first
+		wantSaved bool
+	}{
+		{
+			name:      "unclassified",
+			wantSaved: true,
+		},
+		{
+			name: "classified by Cermin",
+			earlier: &cermin.Classification{
+				Source:           cermin.SourceCermin,
+				Kind:             "plan",
+				KindConfidence:   0.8,
+				Topics:           []cermin.TopicCandidate{{Name: "running", Confidence: 0.8, Kept: true}},
+				Model:            "claude-test",
+				PromptVersion:    "classify-v1",
+				ConfidenceMethod: "verbalized-v1",
+				RawOutput:        "{}",
+				Language:         "en",
+			},
+		},
+		{
+			// Or a Declared Topic backfill's, which can come first.
+			name: "with only a Correction",
+			earlier: &cermin.Classification{
+				Source: cermin.SourceCorrection,
+				Kind:   "plan",
+				Topics: []cermin.TopicCandidate{{Name: "running", Kept: true}},
+			},
+		},
+		{
+			name:      "deleted",
+			isDeleted: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			db := openDB(t)
+			thought := saveThought(t, db)
+			want := []cermin.Classification{}
+			if tt.earlier != nil {
+				earlier := *tt.earlier
+				earlier.ThoughtID = thought.ID
+				stored, err := db.SaveClassification(ctx, earlier)
+				if err != nil {
+					t.Fatalf("SaveClassification: %v", err)
+				}
+				want = append(want, stored)
+			}
+			if tt.isDeleted {
+				if err := db.DeleteThought(ctx, thought.ID); err != nil {
+					t.Fatalf("DeleteThought: %v", err)
+				}
+			}
+
+			stored, isSaved, err := db.SaveFirstClassification(ctx, cermin.Classification{
+				ThoughtID:        thought.ID,
+				Source:           cermin.SourceCermin,
+				Kind:             "idea",
+				KindConfidence:   0.9,
+				Topics:           []cermin.TopicCandidate{{Name: "errands", Confidence: 0.9, Kept: true}},
+				Model:            "claude-test",
+				PromptVersion:    "classify-v1",
+				ConfidenceMethod: "verbalized-v1",
+				RawOutput:        "{}",
+				Language:         "id",
+			})
+			if err != nil {
+				t.Fatalf("SaveFirstClassification: %v", err)
+			}
+			if isSaved != tt.wantSaved {
+				t.Errorf("SaveFirstClassification saved: %t, want %t", isSaved, tt.wantSaved)
+			}
+			if isSaved {
+				want = append(want, stored)
+			} else if !reflect.DeepEqual(stored, cermin.Classification{}) {
+				t.Errorf("SaveFirstClassification returned %+v unsaved, want none", stored)
+			}
+
+			if got, err := db.Classifications(ctx, thought.ID); err != nil || !reflect.DeepEqual(got, want) {
+				t.Errorf("Classifications = %+v, %v; want %+v", got, err, want)
+			}
+			topics, err := db.TopicNames(ctx)
+			if err != nil {
+				t.Fatalf("TopicNames: %v", err)
+			}
+			if hasErrands := slices.Contains(topics, "errands"); hasErrands != tt.wantSaved {
+				t.Errorf("TopicNames = %q, want errands only if saved", topics)
+			}
+		})
+	}
+}
+
 func TestDB_CurrentClassification(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
@@ -126,6 +235,7 @@ func TestDB_CurrentClassification(t *testing.T) {
 			PromptVersion:    "classify-v1",
 			ConfidenceMethod: "verbalized-v1",
 			RawOutput:        "{}",
+			Language:         "id",
 		},
 		{
 			ThoughtID:   thought.ID,
@@ -143,7 +253,7 @@ func TestDB_CurrentClassification(t *testing.T) {
 		},
 	}
 	for i, c := range classifications {
-		want, err := db.SaveClassification(ctx, c, "")
+		want, err := db.SaveClassification(ctx, c)
 		if err != nil {
 			t.Fatalf("SaveClassification %d: %v", i, err)
 		}
