@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -105,14 +106,23 @@ func (c *Client) SendMessage(ctx context.Context, chatID int64, text string, rep
 }
 
 // EditMessageText replaces the text of message messageID, which the bot sent
-// in chatID, with text, as plain text with no parse mode.
+// in chatID, with text, as plain text with no parse mode. A message that
+// already reads text is left as it is.
 func (c *Client) EditMessageText(ctx context.Context, chatID, messageID int64, text string) error {
 	ctx, cancel := context.WithTimeout(ctx, sendTimeout)
 	defer cancel()
 
 	params := map[string]any{"chat_id": chatID, "message_id": messageID, "text": text}
 	var edited Message
-	return c.call(ctx, "editMessageText", params, &edited)
+	err := c.call(ctx, "editMessageText", params, &edited)
+	// Telegram refuses an edit that changes nothing, as when the same
+	// Correction is sent twice, and only its description says so.
+	apiErr, isAPIErr := errors.AsType[*apiError](err)
+	isUnchanged := isAPIErr && strings.Contains(apiErr.description, "message is not modified")
+	if isUnchanged {
+		return nil
+	}
+	return err
 }
 
 // SendChatAction shows action, such as "typing", in the chat until the bot
@@ -152,12 +162,23 @@ func (c *Client) call(ctx context.Context, method string, params, result any) er
 		return fmt.Errorf("telegram: %s: decoding response with status %d: %w", method, resp.StatusCode, err)
 	}
 	if !r.OK {
-		return fmt.Errorf("telegram: %s: status %d: %s", method, resp.StatusCode, r.Description)
+		return &apiError{method: method, status: resp.StatusCode, description: r.Description}
 	}
 	if err := json.Unmarshal(r.Result, result); err != nil {
 		return fmt.Errorf("telegram: %s: decoding result: %w", method, err)
 	}
 	return nil
+}
+
+// apiError is the Bot API's refusal of a call.
+type apiError struct {
+	method      string
+	status      int
+	description string // Telegram's reason, such as "Bad Request: message to edit not found"
+}
+
+func (e *apiError) Error() string {
+	return fmt.Sprintf("telegram: %s: status %d: %s", e.method, e.status, e.description)
 }
 
 // withoutURL drops the request URL from err, because the URL carries the bot

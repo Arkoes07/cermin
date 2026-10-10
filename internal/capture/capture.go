@@ -1,8 +1,8 @@
-// Package capture turns the owner's Telegram messages into Thoughts and
-// classifies them. Every update is stored in the inbox before anything else
-// happens and processed from there, so a crash or a failed reply never loses
-// one. A catch-up loop later finishes the Captures that a crash or the
-// classifier left undone.
+// Package capture turns the owner's Telegram messages into Thoughts,
+// classifies them, and applies the owner's Corrections. Every update is
+// stored in the inbox before anything else happens and processed from there,
+// so a crash or a failed reply never loses one. A catch-up loop later
+// finishes the Captures that a crash or the classifier left undone.
 package capture
 
 import (
@@ -39,6 +39,11 @@ const (
 	catchUpLimit = 20
 	// savedAck is the Acknowledgement of a Thought not yet classified.
 	savedAck = "✓ saved"
+	// topicsUsage is the reply to a /topics that can't be run.
+	topicsUsage = "Reply to a Thought or its Acknowledgement with /topics and 1 to 3 Topics, separated by commas."
+	// notReadyReply is the reply to a Correction of a Thought not yet
+	// classified.
+	notReadyReply = "Kind and Topics aren't ready yet. Try again in a minute."
 )
 
 // ClassifyFunc gives a Thought's text a Classification, with one of kinds
@@ -52,9 +57,9 @@ type ClassifyFunc func(
 ) (c cermin.Classification, language string, err error)
 
 // Bot moves Telegram updates into the inbox, captures the owner's Thoughts
-// from it, and catches up on the Captures left unfinished. One goroutine at a
-// time may call Poll, or Run, which polls; the other methods are safe for
-// concurrent use.
+// and runs their Corrections from it, and catches up on the Captures left
+// unfinished. One goroutine at a time may call Poll, or Run, which polls; the
+// other methods are safe for concurrent use.
 type Bot struct {
 	db       *sqlite.DB
 	tg       *telegram.Client
@@ -62,9 +67,9 @@ type Bot struct {
 	classify ClassifyFunc
 	offset   int64 // the next update_id to ask Telegram for
 
-	// mu is held while a Thought is captured or caught up on, except while
-	// the catch-up waits for the classifier, so that two of them never act on
-	// the same Thought at once.
+	// mu is held while a Thought is captured, corrected or caught up on,
+	// except while the catch-up waits for the classifier, so that two of them
+	// never act on the same Thought at once.
 	//
 	// ponytail: one lock for every Thought, held across Telegram calls, so a
 	// slow catch-up send or edit can delay a Capture by up to the send
@@ -164,21 +169,24 @@ func (b *Bot) ProcessInbox(ctx context.Context) error {
 }
 
 // Process handles one inbox update: the owner's text message becomes a
-// Thought, which is classified and gets an Acknowledgement. Anything else is
-// only marked processed.
+// Thought, which is classified and gets an Acknowledgement, and the owner's
+// /kind or /topics corrects one. Anything else is only marked processed.
 func (b *Bot) Process(ctx context.Context, in sqlite.InboxUpdate) error {
 	var update telegram.Update
 	if err := json.Unmarshal(in.Payload, &update); err != nil {
 		return fmt.Errorf("decoding: %w", err)
 	}
 	// Only the owner's plain text in their private chat with the bot is a
-	// Thought. Edits and non-text messages carry none, text starting with / is
-	// a command, and a message ID from another chat could clash with a
-	// captured Thought's.
+	// Thought or a command. Edits and non-text messages carry none, text
+	// starting with / is a command, and a message ID from another chat could
+	// clash with a captured Thought's.
 	m := update.Message
 	isOwner := m != nil && m.From != nil && m.From.ID == b.ownerID
 	isPrivate := isOwner && m.Chat.ID == b.ownerID // a private chat's ID is the user's
-	isThought := isPrivate && m.Text != "" && !strings.HasPrefix(m.Text, "/")
+	if isPrivate && strings.HasPrefix(m.Text, "/") {
+		return b.runCommand(ctx, in, m.Text)
+	}
+	isThought := isPrivate && m.Text != ""
 	if !isThought {
 		slog.InfoContext(ctx, "update not captured", "update_id", in.ID)
 		return b.db.MarkProcessed(ctx, in.ID)
@@ -222,6 +230,127 @@ func (b *Bot) Process(ctx context.Context, in sqlite.InboxUpdate) error {
 		)
 	}
 	return b.db.MarkProcessed(ctx, in.ID)
+}
+
+// runCommand runs the owner's command text, sent as message in, and marks in
+// processed. Only /kind and /topics do anything yet.
+func (b *Bot) runCommand(ctx context.Context, in sqlite.InboxUpdate, text string) error {
+	command, args, _ := strings.Cut(text, " ")
+	switch command {
+	case "/kind", "/topics":
+		if err := b.correct(ctx, in, command, args); err != nil {
+			return err
+		}
+	default:
+		slog.InfoContext(ctx, "update not captured", "update_id", in.ID)
+	}
+	return b.db.MarkProcessed(ctx, in.ID)
+}
+
+// correct runs /kind or /topics, sent as message in with args after the
+// command, in reply to a Thought or its Acknowledgement. It adds the
+// Correction that replaces the Thought's Kind or its whole set of Topics and
+// keeps the rest of its current Classification, then edits the
+// Acknowledgement to show it. A command it can't run gets a reply saying why.
+func (b *Bot) correct(ctx context.Context, in sqlite.InboxUpdate, command, args string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	kinds, err := b.db.Kinds(ctx)
+	if err != nil {
+		return err
+	}
+	usage := topicsUsage
+	if command == "/kind" {
+		usage = kindUsage(kinds)
+	}
+	// A message that isn't a reply has ReplyToMessageID 0, which no Thought's
+	// messages have.
+	thought, isFound, err := b.db.ThoughtByMessage(ctx, in.ReplyToMessageID)
+	if err != nil {
+		return err
+	}
+	if !isFound {
+		return b.reply(ctx, in, usage)
+	}
+	classifications, err := b.db.Classifications(ctx, thought.ID)
+	if err != nil {
+		return err
+	}
+	if len(classifications) == 0 {
+		return b.reply(ctx, in, notReadyReply)
+	}
+	current := classifications[len(classifications)-1]
+	if current.TGMessageID == in.MessageID {
+		// Processed again after a crash, the Correction is current already.
+		b.showCorrection(ctx, kinds, thought, current)
+		return nil
+	}
+
+	var correction cermin.Classification
+	var isValid bool
+	if command == "/kind" {
+		correction, isValid = current.CorrectKind(args, kinds)
+	} else {
+		correction, isValid = current.CorrectTopics(strings.Split(args, ","))
+	}
+	if !isValid {
+		return b.reply(ctx, in, usage)
+	}
+	correction.TGMessageID = in.MessageID
+	stored, err := b.db.SaveClassification(ctx, correction, "")
+	if err != nil {
+		return err
+	}
+	slog.InfoContext(ctx, "thought corrected",
+		"thought_id", thought.ID,
+		"classification_id", stored.ID,
+		"update_id", in.ID,
+	)
+	b.showCorrection(ctx, kinds, thought, stored)
+	return nil
+}
+
+// showCorrection edits the Acknowledgement of Thought t to show its
+// Correction c. The Correction is saved by now, so a failure is logged and not
+// returned: retrying an edit that always fails, such as of an Acknowledgement
+// you deleted, would stall the inbox behind it.
+//
+// ponytail: an edit that fails only once, such as on a timeout, also leaves
+// the old Classification showing until the next Correction; retry the edit
+// if that ever happens.
+func (b *Bot) showCorrection(ctx context.Context, kinds []cermin.Kind, t cermin.Thought, c cermin.Classification) {
+	text, err := ackText(kinds, c)
+	if err == nil {
+		err = b.tg.EditMessageText(
+			ctx,
+			b.ownerID,
+			t.AckMessageID,
+			text,
+		)
+	}
+	if err != nil {
+		slog.WarnContext(ctx, "showing correction", "thought_id", t.ID, "classification_id", c.ID, "err", err)
+	}
+}
+
+// reply sends text in reply to the owner's message in.
+func (b *Bot) reply(ctx context.Context, in sqlite.InboxUpdate, text string) error {
+	_, err := b.tg.SendMessage(
+		ctx,
+		b.ownerID,
+		text,
+		in.MessageID,
+	)
+	return err
+}
+
+// kindUsage is the reply to a /kind that can't be run, listing kinds.
+func kindUsage(kinds []cermin.Kind) string {
+	names := make([]string, 0, len(kinds))
+	for _, k := range kinds {
+		names = append(names, k.Name)
+	}
+	return "Reply to a Thought or its Acknowledgement with /kind and one of: " + strings.Join(names, ", ") + "."
 }
 
 // acknowledge sends text as a Thought's Acknowledgement, in reply to the
@@ -433,17 +562,16 @@ func (b *Bot) callClassifier(
 }
 
 // ackText is the Acknowledgement of a Thought classified as c, such as
-// "💡 idea · business, retail": the Kind and the kept Topics, best first.
+// "💡 idea · business, retail": the Kind and the kept Topics, best first,
+// marked ✏️ if c is a Correction.
 func ackText(kinds []cermin.Kind, c cermin.Classification) (string, error) {
 	i := slices.IndexFunc(kinds, func(k cermin.Kind) bool { return k.Name == c.Kind })
 	if i < 0 {
 		return "", fmt.Errorf("classified with unknown kind %q", c.Kind)
 	}
-	topics := []string{}
-	for _, t := range c.Topics {
-		if t.Kept {
-			topics = append(topics, t.Name)
-		}
+	text := kinds[i].Emoji + " " + c.Kind + " · " + strings.Join(c.KeptTopics(), ", ")
+	if c.Source == "correction" {
+		text = "✏️ " + text
 	}
-	return kinds[i].Emoji + " " + c.Kind + " · " + strings.Join(topics, ", "), nil
+	return text, nil
 }

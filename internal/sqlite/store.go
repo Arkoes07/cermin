@@ -216,6 +216,24 @@ func (db *DB) Thought(ctx context.Context, id int64) (cermin.Thought, error) {
 	return t, nil
 }
 
+// ThoughtByMessage returns the Thought that Telegram message messageID
+// carried or acknowledged, and false if there is none.
+func (db *DB) ThoughtByMessage(ctx context.Context, messageID int64) (cermin.Thought, bool, error) {
+	row := db.pool.QueryRowContext(ctx,
+		`SELECT `+thoughtColumns+` FROM thoughts WHERE tg_message_id = ? OR ack_message_id = ?`,
+		messageID,
+		messageID,
+	)
+	t, err := scanThought(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return cermin.Thought{}, false, nil
+	}
+	if err != nil {
+		return cermin.Thought{}, false, fmt.Errorf("reading thought of message %d: %w", messageID, err)
+	}
+	return t, true, nil
+}
+
 // Thoughts returns every Thought, oldest first.
 func (db *DB) Thoughts(ctx context.Context) ([]cermin.Thought, error) {
 	return db.queryThoughts(ctx, `SELECT `+thoughtColumns+` FROM thoughts ORDER BY id`)
@@ -346,9 +364,10 @@ func (db *DB) TopicNames(ctx context.Context) ([]string, error) {
 }
 
 // SaveClassification stores c and returns it as stored. A kept candidate whose
-// Topic doesn't exist yet creates it, with origin cermin. A candidate naming
-// an existing Topic, in any case, takes that Topic's spelling. A language
-// other than "" becomes the Thought's.
+// Topic doesn't exist yet creates it, with origin cermin, or you for a
+// Correction. A candidate naming an existing Topic, in any case, takes that
+// Topic's spelling. A Correction's confidences are stored as NULL, since it
+// states none. A language other than "" becomes the Thought's.
 func (db *DB) SaveClassification(ctx context.Context, c cermin.Classification, language string) (cermin.Classification, error) {
 	stored, err := db.saveClassification(ctx, c, language)
 	if err != nil {
@@ -364,6 +383,13 @@ func (db *DB) saveClassification(ctx context.Context, c cermin.Classification, l
 	}
 	defer tx.Rollback() //nolint:errcheck // after Commit it only returns sql.ErrTxDone
 
+	// A Correction is yours: it states no confidence, and a Topic it names
+	// first is your Topic.
+	isCorrection := c.Source == "correction"
+	origin := "cermin"
+	if isCorrection {
+		origin = "you"
+	}
 	c.CreatedAt = time.Now().UTC().Truncate(time.Millisecond) // as stored
 	err = tx.QueryRowContext(ctx, `
 		INSERT INTO classifications (thought_id, source, kind, kind_confidence, model, prompt_version,
@@ -373,7 +399,7 @@ func (db *DB) saveClassification(ctx context.Context, c cermin.Classification, l
 		c.ThoughtID,
 		c.Source,
 		c.Kind,
-		c.KindConfidence,
+		sql.Null[float64]{V: c.KindConfidence, Valid: !isCorrection},
 		c.Model,
 		c.PromptVersion,
 		c.ConfidenceMethod,
@@ -391,9 +417,10 @@ func (db *DB) saveClassification(ctx context.Context, c cermin.Classification, l
 		// skip archived Topics here once /topic archive exists.
 		if t.Kept {
 			_, err := tx.ExecContext(ctx, `
-				INSERT INTO topics (name, origin, created_at) VALUES (?, 'cermin', ?)
+				INSERT INTO topics (name, origin, created_at) VALUES (?, ?, ?)
 				ON CONFLICT (name) DO NOTHING`,
 				t.Name,
+				origin,
 				formatTime(c.CreatedAt),
 			)
 			if err != nil {
@@ -407,7 +434,7 @@ func (db *DB) saveClassification(ctx context.Context, c cermin.Classification, l
 			c.ID,
 			t.Name,
 			t.Name,
-			t.Confidence,
+			sql.Null[float64]{V: t.Confidence, Valid: !isCorrection},
 			t.Kept,
 		).Scan(&t.Name)
 		if err != nil {

@@ -27,7 +27,9 @@ import (
 const (
 	botToken  = "123456:test-token"
 	ownerID   = 42
-	messageID = 7 // the Telegram message carrying the Thought
+	messageID = 7    // the Telegram message carrying the Thought
+	ackID     = 1001 // its Acknowledgement, the first message the fake Bot API sends
+	commandID = 20   // the Telegram message carrying a command
 )
 
 // thoughtTime is when the test Thoughts were sent: 08:30 WIB.
@@ -421,6 +423,264 @@ func TestBot_Process_SafeToRepeat(t *testing.T) {
 	}
 }
 
+func TestBot_ProcessInbox_CorrectsKindKeepingTopics(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		replyToID int64
+	}{
+		{name: "reply to the thought", replyToID: messageID},
+		{name: "reply to its acknowledgement", replyToID: ackID},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{
+				{Name: "transport", Confidence: 0.95},
+				{Name: "cities", Confidence: 0.8},
+				{Name: "design", Confidence: 0.4},
+			}}
+			bot, db, api := newBot(t, classifier.classify)
+			api.queue(textUpdate(t, ownerID, "What if bus stops showed how full the next bus is?", 0))
+			thought := captureQueued(t, bot, db)
+			before, err := db.Classifications(ctx, thought.ID)
+			if err != nil || len(before) != 1 {
+				t.Fatalf("Classifications = %+v, %v; want 1", before, err)
+			}
+
+			api.queue(commandUpdate(t, commandID, "/kind plan", tt.replyToID))
+			processQueued(t, bot)
+
+			after, err := db.Classifications(ctx, thought.ID)
+			if err != nil || len(after) != 2 {
+				t.Fatalf("Classifications = %+v, %v; want Cermin's and the Correction", after, err)
+			}
+			if !reflect.DeepEqual(after[0], before[0]) {
+				t.Errorf("Cermin's Classification = %+v, want it unchanged: %+v", after[0], before[0])
+			}
+			got := after[1]
+			got.ID, got.CreatedAt = 0, time.Time{}
+			want := cermin.Classification{
+				ThoughtID: thought.ID,
+				Source:    "correction",
+				Kind:      "plan",
+				Topics: []cermin.TopicCandidate{
+					{Name: "transport", Kept: true},
+					{Name: "cities", Kept: true},
+				},
+				TGMessageID: commandID,
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("Correction = %+v, want %+v", got, want)
+			}
+			wantEdits := []editedMessage{
+				{ChatID: ownerID, MessageID: ackID, Text: "✏️ 📋 plan · transport, cities"},
+			}
+			if edits := api.editedMessages(); !slices.Equal(edits, wantEdits) {
+				t.Errorf("edited %+v, want %+v", edits, wantEdits)
+			}
+			if sent := api.sentMessages(); len(sent) != 1 {
+				t.Errorf("sent %+v, want only the Acknowledgement", sent)
+			}
+			if updates, err := db.UnprocessedUpdates(ctx); err != nil || len(updates) != 0 {
+				t.Errorf("unprocessed updates = %+v, %v; want none", updates, err)
+			}
+		})
+	}
+}
+
+func TestBot_ProcessInbox_CorrectsTopicsKeepingKind(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{
+		{Name: "transport", Confidence: 0.95},
+		{Name: "cities", Confidence: 0.8},
+	}}
+	bot, db, api := newBot(t, classifier.classify)
+	api.queue(textUpdate(t, ownerID, "What if bus stops showed how full the next bus is?", 0))
+	thought := captureQueued(t, bot, db)
+
+	api.queue(commandUpdate(t, commandID, "/topics  Cities, Bus Stops ", messageID))
+	processQueued(t, bot)
+	// The current Classification is now the Correction above, so this one
+	// copies that Correction's Topics.
+	api.queue(commandUpdate(t, commandID+1, "/kind plan", ackID))
+	processQueued(t, bot)
+
+	classifications, err := db.Classifications(ctx, thought.ID)
+	if err != nil || len(classifications) != 3 {
+		t.Fatalf("Classifications = %+v, %v; want Cermin's and 2 Corrections", classifications, err)
+	}
+	got := classifications[1:]
+	for i := range got {
+		got[i].ID, got[i].CreatedAt = 0, time.Time{}
+	}
+	correctedTopics := []cermin.TopicCandidate{{Name: "cities", Kept: true}, {Name: "bus stops", Kept: true}}
+	want := []cermin.Classification{
+		{
+			ThoughtID:   thought.ID,
+			Source:      "correction",
+			Kind:        "idea",
+			Topics:      correctedTopics,
+			TGMessageID: commandID,
+		},
+		{
+			ThoughtID:   thought.ID,
+			Source:      "correction",
+			Kind:        "plan",
+			Topics:      correctedTopics,
+			TGMessageID: commandID + 1,
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Corrections = %+v, want %+v", got, want)
+	}
+	wantEdits := []editedMessage{
+		{ChatID: ownerID, MessageID: ackID, Text: "✏️ 💡 idea · cities, bus stops"},
+		{ChatID: ownerID, MessageID: ackID, Text: "✏️ 📋 plan · cities, bus stops"},
+	}
+	if edits := api.editedMessages(); !slices.Equal(edits, wantEdits) {
+		t.Errorf("edited %+v, want %+v", edits, wantEdits)
+	}
+	wantTopics := []string{"bus stops", "cities", "transport"}
+	if got, err := db.TopicNames(ctx); err != nil || !slices.Equal(got, wantTopics) {
+		t.Errorf("TopicNames = %q, %v; want %q", got, err, wantTopics)
+	}
+}
+
+func TestBot_ProcessInbox_RejectsCorrection(t *testing.T) {
+	t.Parallel()
+	const (
+		kindUsage = "Reply to a Thought or its Acknowledgement with /kind and one of: " +
+			"idea, question, observation, reflection, plan."
+		topicsUsage = "Reply to a Thought or its Acknowledgement with /topics and 1 to 3 Topics, " +
+			"separated by commas."
+	)
+	tests := []struct {
+		name          string
+		classifierErr error
+		command       string
+		replyToID     int64
+		wantReply     string
+	}{
+		{name: "kind not a reply", command: "/kind plan", wantReply: kindUsage},
+		{name: "topics not a reply", command: "/topics running", wantReply: topicsUsage},
+		{name: "reply to another message", command: "/kind plan", replyToID: 999, wantReply: kindUsage},
+		{name: "unknown kind", command: "/kind rant", replyToID: ackID, wantReply: kindUsage},
+		{name: "no kind", command: "/kind", replyToID: ackID, wantReply: kindUsage},
+		{name: "no topics", command: "/topics , ", replyToID: ackID, wantReply: topicsUsage},
+		{
+			name:      "4 topics",
+			command:   "/topics running, health, weekend, habits",
+			replyToID: ackID,
+			wantReply: topicsUsage,
+		},
+		{
+			name:          "thought not classified yet",
+			classifierErr: errors.New("classifier down"),
+			command:       "/kind plan",
+			replyToID:     messageID,
+			wantReply:     "Kind and Topics aren't ready yet. Try again in a minute.",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			classifier := &fakeClassifier{
+				candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}},
+				err:        tt.classifierErr,
+			}
+			bot, db, api := newBot(t, classifier.classify)
+			api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
+			thought := captureQueued(t, bot, db)
+			before, err := db.Classifications(ctx, thought.ID)
+			if err != nil {
+				t.Fatalf("Classifications: %v", err)
+			}
+
+			api.queue(commandUpdate(t, commandID, tt.command, tt.replyToID))
+			processQueued(t, bot)
+
+			sent := api.sentMessages()
+			wantReply := sentMessage{ChatID: ownerID, Text: tt.wantReply, ReplyToID: commandID}
+			if len(sent) != 2 || sent[1] != wantReply {
+				t.Errorf("sent %+v, want the Acknowledgement and then %+v", sent, wantReply)
+			}
+			if edits := api.editedMessages(); len(edits) != 0 {
+				t.Errorf("edited %+v, want nothing", edits)
+			}
+			if after, err := db.Classifications(ctx, thought.ID); err != nil || len(after) != len(before) {
+				t.Errorf("Classifications = %+v, %v; want %d as before", after, err, len(before))
+			}
+			if updates, err := db.UnprocessedUpdates(ctx); err != nil || len(updates) != 0 {
+				t.Errorf("unprocessed updates = %+v, %v; want none", updates, err)
+			}
+		})
+	}
+}
+
+func TestBot_Process_CorrectionSafeToRepeat(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	bot, db, api := newBot(t, classifier.classify)
+	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
+	thought := captureQueued(t, bot, db)
+	api.queue(commandUpdate(t, commandID, "/kind plan", ackID))
+	if err := bot.Poll(ctx); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	updates, err := db.UnprocessedUpdates(ctx)
+	if err != nil || len(updates) != 1 {
+		t.Fatalf("unprocessed updates = %+v, %v; want 1", updates, err)
+	}
+
+	// After a crash before the update was marked processed, a restart
+	// processes it again.
+	for range 2 {
+		if err := bot.Process(ctx, updates[0]); err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+	}
+
+	if classifications, err := db.Classifications(ctx, thought.ID); err != nil || len(classifications) != 2 {
+		t.Errorf("Classifications = %+v, %v; want Cermin's and one Correction", classifications, err)
+	}
+	// Both runs show it; Telegram leaves the second edit, which changes
+	// nothing, as it is.
+	edit := editedMessage{ChatID: ownerID, MessageID: ackID, Text: "✏️ 📋 plan · running"}
+	if edits := api.editedMessages(); !slices.Equal(edits, []editedMessage{edit, edit}) {
+		t.Errorf("edited %+v, want %+v twice", edits, edit)
+	}
+}
+
+func TestBot_ProcessInbox_KeepsCorrectionWhenEditFails(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	bot, db, api := newBot(t, classifier.classify)
+	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
+	thought := captureQueued(t, bot, db)
+
+	// As when you deleted the Acknowledgement: no retry could edit it.
+	api.failNextEdit()
+	api.queue(commandUpdate(t, commandID, "/kind plan", messageID))
+	processQueued(t, bot)
+
+	if edits := api.editedMessages(); len(edits) != 0 {
+		t.Fatalf("edited %+v, want the edit refused", edits)
+	}
+	classifications, err := db.Classifications(ctx, thought.ID)
+	if err != nil || len(classifications) != 2 || classifications[1].Kind != "plan" {
+		t.Errorf("Classifications = %+v, %v; want Cermin's and the Correction to plan", classifications, err)
+	}
+	if updates, err := db.UnprocessedUpdates(ctx); err != nil || len(updates) != 0 {
+		t.Errorf("unprocessed updates = %+v, %v; want none, so nothing waits behind the Correction", updates, err)
+	}
+}
+
 func TestBot_CatchUp_ClassifiesOnceClassifierRecovers(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
@@ -713,18 +973,23 @@ func newBot(t *testing.T, classify capture.ClassifyFunc) (*capture.Bot, *sqlite.
 // latest Thought.
 func captureQueued(t *testing.T, bot *capture.Bot, db *sqlite.DB) cermin.Thought {
 	t.Helper()
-	ctx := t.Context()
-	if err := bot.Poll(ctx); err != nil {
-		t.Fatalf("Poll: %v", err)
-	}
-	if err := bot.ProcessInbox(ctx); err != nil {
-		t.Fatalf("ProcessInbox: %v", err)
-	}
-	thoughts, err := db.Thoughts(ctx)
+	processQueued(t, bot)
+	thoughts, err := db.Thoughts(t.Context())
 	if err != nil || len(thoughts) == 0 {
 		t.Fatalf("Thoughts = %+v, %v; want some", thoughts, err)
 	}
 	return thoughts[len(thoughts)-1]
+}
+
+// processQueued polls the queued updates and processes the inbox.
+func processQueued(t *testing.T, bot *capture.Bot) {
+	t.Helper()
+	if err := bot.Poll(t.Context()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if err := bot.ProcessInbox(t.Context()); err != nil {
+		t.Fatalf("ProcessInbox: %v", err)
+	}
 }
 
 // fakeRawOutput is the raw model output of every fakeClassifier
@@ -769,14 +1034,31 @@ func textUpdate(t *testing.T, fromID int64, text string, replyToID int64) string
 	t.Helper()
 	fields := map[string]any{"text": text}
 	if replyToID != 0 {
-		fields["reply_to_message"] = map[string]any{
-			"message_id": replyToID,
-			"chat":       map[string]any{"id": fromID, "type": "private"},
-			"date":       thoughtTime.Add(-time.Hour).Unix(),
-			"text":       "Buses are always packed at 8am.",
-		}
+		fields["reply_to_message"] = repliedMessage(fromID, replyToID)
 	}
 	return update(t, "message", fromID, fields)
+}
+
+// commandUpdate is an update carrying the owner's command text in message id,
+// in reply to message replyToID, or to none if replyToID is 0.
+func commandUpdate(t *testing.T, id int64, text string, replyToID int64) string {
+	t.Helper()
+	fields := map[string]any{"message_id": id, "text": text}
+	if replyToID != 0 {
+		fields["reply_to_message"] = repliedMessage(ownerID, replyToID)
+	}
+	return update(t, "message", ownerID, fields)
+}
+
+// repliedMessage is message id in the private chat of user chatID, as a reply
+// carries the message it replies to.
+func repliedMessage(chatID, id int64) map[string]any {
+	return map[string]any{
+		"message_id": id,
+		"chat":       map[string]any{"id": chatID, "type": "private"},
+		"date":       thoughtTime.Add(-time.Hour).Unix(),
+		"text":       "Buses are always packed at 8am.",
+	}
 }
 
 // update is a Telegram update whose field ("message" or "edited_message") is
@@ -824,6 +1106,7 @@ type fakeBotAPI struct {
 	sent             []sentMessage
 	edits            []editedMessage
 	isNextSendFailed bool
+	isNextEditFailed bool
 }
 
 // failNextSend makes the next sendMessage fail, sending nothing.
@@ -831,6 +1114,14 @@ func (f *fakeBotAPI) failNextSend() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.isNextSendFailed = true
+}
+
+// failNextEdit makes the next editMessageText fail, as Telegram refuses to
+// edit a deleted message, editing nothing.
+func (f *fakeBotAPI) failNextEdit() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.isNextEditFailed = true
 }
 
 func (f *fakeBotAPI) queue(update string) {
@@ -933,6 +1224,13 @@ func (f *fakeBotAPI) handler(t *testing.T) http.Handler {
 			t.Errorf("editMessageText with parse_mode %q, want plain text", *req.ParseMode)
 		}
 		f.mu.Lock()
+		if f.isNextEditFailed {
+			f.isNextEditFailed = false
+			f.mu.Unlock()
+			w.WriteHeader(http.StatusBadRequest)
+			writeJSON(t, w, `{"ok":false,"error_code":400,"description":"Bad Request: message to edit not found"}`)
+			return
+		}
 		f.edits = append(f.edits, editedMessage{ChatID: req.ChatID, MessageID: req.MessageID, Text: req.Text})
 		f.mu.Unlock()
 		msg, err := json.Marshal(map[string]any{

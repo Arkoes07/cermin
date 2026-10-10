@@ -29,8 +29,8 @@ type Classification struct {
 	ThoughtID        int64
 	Source           string // "cermin", "correction" or "declared"
 	Kind             string
-	KindConfidence   float64
-	Topics           []TopicCandidate // every candidate Topic, best first
+	KindConfidence   float64          // 0 for a Correction, which states none
+	Topics           []TopicCandidate // every candidate Topic, best first; a Correction's are all kept, in your order
 	Model            string           // the model that classified; "" for a Correction
 	PromptVersion    string
 	ConfidenceMethod string // how the confidences were measured
@@ -43,7 +43,7 @@ type Classification struct {
 // assigned to the Thought; the others were considered and dropped.
 type TopicCandidate struct {
 	Name       string
-	Confidence float64
+	Confidence float64 // 0 in a Correction, which states none
 	Kept       bool
 }
 
@@ -54,7 +54,7 @@ type TopicCandidate struct {
 func KeepTopics(candidates []TopicCandidate) []TopicCandidate {
 	sorted := make([]TopicCandidate, 0, len(candidates))
 	for _, c := range candidates {
-		c.Name = strings.ToLower(strings.TrimSpace(c.Name))
+		c.Name = lowerName(c.Name)
 		if c.Name != "" {
 			sorted = append(sorted, c)
 		}
@@ -76,4 +76,59 @@ func KeepTopics(candidates []TopicCandidate) []TopicCandidate {
 		unique[0].Kept = true // the best is kept even below the threshold
 	}
 	return unique
+}
+
+// KeptTopics returns the names of the Topics a Thought classified as c keeps,
+// in order.
+func (c Classification) KeptTopics() []string {
+	names := []string{}
+	for _, t := range c.Topics {
+		if t.Kept {
+			names = append(names, t.Name)
+		}
+	}
+	return names
+}
+
+// CorrectKind returns your Correction of a Thought classified as c, which
+// gives it the Kind named kind, in any case, and keeps its Topics. It returns
+// false unless kind is one of kinds, since a Correction never adds a Kind. A
+// Correction states no confidence.
+func (c Classification) CorrectKind(kind string, kinds []Kind) (Classification, bool) {
+	kind = lowerName(kind)
+	if !slices.ContainsFunc(kinds, func(k Kind) bool { return k.Name == kind }) {
+		return Classification{}, false
+	}
+	topics := []TopicCandidate{}
+	for _, name := range c.KeptTopics() {
+		topics = append(topics, TopicCandidate{Name: name, Kept: true})
+	}
+	return Classification{ThoughtID: c.ThoughtID, Source: "correction", Kind: kind, Topics: topics}, true
+}
+
+// CorrectTopics returns your Correction of a Thought classified as c, which
+// gives it the Topics named names, in your order, and keeps its Kind. Names
+// are trimmed and lowercased, and a blank or repeated name is dropped. It
+// returns false unless 1 to maxKept Topics remain, as a Thought has. A
+// Correction states no confidence.
+func (c Classification) CorrectTopics(names []string) (Classification, bool) {
+	topics := make([]TopicCandidate, 0, len(names))
+	for _, name := range names {
+		name = lowerName(name)
+		isRepeat := slices.ContainsFunc(topics, func(t TopicCandidate) bool { return t.Name == name })
+		if name == "" || isRepeat {
+			continue
+		}
+		topics = append(topics, TopicCandidate{Name: name, Kept: true})
+	}
+	if len(topics) == 0 || len(topics) > maxKept {
+		return Classification{}, false
+	}
+	return Classification{ThoughtID: c.ThoughtID, Source: "correction", Kind: c.Kind, Topics: topics}, true
+}
+
+// lowerName is name trimmed and lowercased, as Kind and Topic names are
+// written, except a Declared Topic's.
+func lowerName(name string) string {
+	return strings.ToLower(strings.TrimSpace(name))
 }
