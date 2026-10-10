@@ -379,6 +379,7 @@ func (b *Bot) classifyLate(ctx context.Context, kinds []cermin.Kind, t cermin.Th
 	if err != nil {
 		return err
 	}
+	slog.InfoContext(ctx, "thought classified late", "thought_id", t.ID, "classification_id", stored.ID)
 	current, err := b.db.Thought(ctx, t.ID)
 	if err != nil {
 		return err
