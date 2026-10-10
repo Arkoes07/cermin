@@ -30,37 +30,12 @@ const (
 	// classifyTimeout is how long an Acknowledgement waits for the Thought's
 	// Classification before it goes out without one.
 	classifyTimeout = 8 * time.Second
-	// catchUpInterval is how often Run catches up.
-	catchUpInterval = time.Minute
-	// catchUpClassifyTimeout is how long the catch-up loop waits for a
-	// Thought's Classification. No Acknowledgement waits on it, so a slow
-	// classifier gets time to finish.
-	catchUpClassifyTimeout = 60 * time.Second
-	// catchUpLimit is the most Thoughts one catch-up classifies, to cap cost.
-	catchUpLimit = 20
 	// savedAck is the Acknowledgement of a Thought not yet classified.
 	savedAck = "✓ saved"
-	// topicsUsage is the reply to a /topics that can't be run.
-	topicsUsage = "Reply to a Thought or its Acknowledgement with /topics and 1 to 3 Topics, separated by commas."
-	// notReadyReply is the reply to a Correction of a Thought not yet
-	// classified.
-	notReadyReply = "Kind and Topics aren't ready yet. Try again in a minute."
-	// deleteUsage is the reply to a /delete that can't be run.
-	deleteUsage = "Reply to a Thought or its Acknowledgement with /delete."
-	// deletedAck is the Acknowledgement of a deleted Thought.
-	deletedAck = "🗑 deleted"
 	// textOnlyReply is the reply to a message with no text, such as a photo.
 	textOnlyReply = "Text only for now."
 	// editReply is the reply to an edited message.
 	editReply = "Edits aren't saved. Send it as a new Thought."
-	// helpReply is the reply to /start and /help: the command list.
-	helpReply = "Send any text to save it as a Thought, unless it starts with /.\n\n" +
-		"Reply to a Thought or its Acknowledgement with:\n" +
-		"/kind <kind> to correct its Kind\n" +
-		"/topics <a>, <b>, <c> to replace its 1 to 3 Topics\n" +
-		"/delete to delete it"
-	// unknownCommandReply is the reply to an unknown command.
-	unknownCommandReply = "Unknown command.\n\n" + helpReply
 )
 
 // ClassifyFunc gives a Thought's text a Classification: one of kinds,
@@ -120,23 +95,6 @@ func (b *Bot) Run(ctx context.Context) {
 			case <-ctx.Done():
 			case <-time.After(retryDelay):
 			}
-		}
-	}
-}
-
-// catchUpEveryInterval calls CatchUp at once and then every catchUpInterval,
-// until ctx is cancelled.
-func (b *Bot) catchUpEveryInterval(ctx context.Context) {
-	ticker := time.NewTicker(catchUpInterval)
-	defer ticker.Stop()
-	for {
-		if err := b.CatchUp(ctx); err != nil && ctx.Err() == nil {
-			slog.ErrorContext(ctx, "catching up", "err", err)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
 		}
 	}
 }
@@ -259,173 +217,6 @@ func (b *Bot) Process(ctx context.Context, in sqlite.InboxUpdate) error {
 	return b.syncAckAndMarkProcessed(ctx, thought.ID, in.ID)
 }
 
-// runCommand runs the owner's command, sent as message m in update updateID,
-// and marks the update processed, or removes it for /delete. /start, /help and
-// an unknown command get the command list.
-func (b *Bot) runCommand(ctx context.Context, updateID int64, m *telegram.Message) error {
-	command, args, _ := strings.Cut(m.Text, " ")
-	switch command {
-	case "/delete":
-		return b.deleteThought(ctx, updateID, m)
-	case "/kind":
-		kinds := b.db.Kinds()
-		correctKind := func(c cermin.Classification) (cermin.Classification, bool) {
-			return c.CorrectKind(args, kinds)
-		}
-		return b.correct(
-			ctx,
-			updateID,
-			m,
-			kindUsage(kinds),
-			correctKind,
-		)
-	case "/topics":
-		correctTopics := func(c cermin.Classification) (cermin.Classification, bool) {
-			return c.CorrectTopics(strings.Split(args, ","))
-		}
-		return b.correct(
-			ctx,
-			updateID,
-			m,
-			topicsUsage,
-			correctTopics,
-		)
-	case "/start", "/help":
-		return b.replyAndMarkProcessed(
-			ctx,
-			updateID,
-			m,
-			helpReply,
-		)
-	default:
-		return b.replyAndMarkProcessed(
-			ctx,
-			updateID,
-			m,
-			unknownCommandReply,
-		)
-	}
-}
-
-// correct runs a Correction command, sent as message m in update updateID in
-// reply to a Thought or its Acknowledgement, and marks the update processed.
-// apply returns the Correction of the Thought's current Classification that
-// the command asks for, which replaces its Kind or its whole set of Topics and
-// keeps the rest, or false if the command's arguments ask for none. correct
-// adds it and brings the Acknowledgement up to date. A command it can't run
-// gets a reply saying why, which is usage unless the Thought isn't classified
-// yet.
-func (b *Bot) correct(
-	ctx context.Context,
-	updateID int64,
-	m *telegram.Message,
-	usage string,
-	apply func(cermin.Classification) (cermin.Classification, bool),
-) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	// A message that isn't a reply has ReplyToID 0, which no Thought's messages
-	// have.
-	thought, isFound, err := b.db.ThoughtByMessage(ctx, m.ReplyToID())
-	if err != nil {
-		return err
-	}
-	if !isFound {
-		return b.replyAndMarkProcessed(
-			ctx,
-			updateID,
-			m,
-			usage,
-		)
-	}
-	current, isClassified, err := b.db.CurrentClassification(ctx, thought.ID)
-	if err != nil {
-		return err
-	}
-	if !isClassified {
-		return b.replyAndMarkProcessed(
-			ctx,
-			updateID,
-			m,
-			notReadyReply,
-		)
-	}
-	if current.TGMessageID == m.ID {
-		// Processed again after a crash, the Correction is current already.
-		return b.syncAckAndMarkProcessed(ctx, thought.ID, updateID)
-	}
-
-	correction, isValid := apply(current)
-	if !isValid {
-		return b.replyAndMarkProcessed(
-			ctx,
-			updateID,
-			m,
-			usage,
-		)
-	}
-	correction.TGMessageID = m.ID
-	stored, err := b.db.SaveClassification(ctx, correction)
-	if err != nil {
-		return err
-	}
-	slog.InfoContext(ctx, "thought corrected",
-		"thought_id", thought.ID,
-		"classification_id", stored.ID,
-		"update_id", updateID,
-	)
-	return b.syncAckAndMarkProcessed(ctx, thought.ID, updateID)
-}
-
-// deleteThought runs /delete, sent as message m in update updateID, in reply
-// to a Thought or its Acknowledgement. In one transaction it deletes the
-// Thought, its Classifications and every inbox update that carries its text,
-// including updateID, then edits the Acknowledgement to 🗑 deleted. A /delete
-// it can't run gets a reply saying how, and is removed from the inbox too,
-// since one that replies to a Thought deleted already still carries its text.
-//
-// ponytail: a later /kind, /topics or text reply to the deleted Thought's
-// message, or an edit of it, brings its text back into the inbox, and stays;
-// delete your message in Telegram after /delete to prevent that, or store
-// replies without the replied-to copy if it ever matters.
-func (b *Bot) deleteThought(ctx context.Context, updateID int64, m *telegram.Message) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	// A message that isn't a reply has ReplyToID 0, which no Thought's messages
-	// have.
-	thought, isFound, err := b.db.ThoughtByMessage(ctx, m.ReplyToID())
-	if err != nil {
-		return err
-	}
-	if !isFound {
-		if err := b.reply(ctx, m, deleteUsage); err != nil {
-			return err
-		}
-		return b.db.DeleteUpdate(ctx, updateID)
-	}
-	if err := b.db.DeleteThought(ctx, thought.ID); err != nil {
-		return err
-	}
-	slog.InfoContext(ctx, "thought deleted", "thought_id", thought.ID, "update_id", updateID)
-
-	// The Thought is gone, so the edit can't be retried: it is made even
-	// during shutdown, and a failure is logged.
-	//
-	// ponytail: a failed edit, or a crash before it, leaves the
-	// Acknowledgement showing the deleted Thought's Kind and Topics; record
-	// the pending edit in the delete's transaction if that ever happens.
-	err = b.tg.EditMessageText(
-		context.WithoutCancel(ctx),
-		b.ownerID,
-		thought.AckMessageID,
-		deletedAck,
-	)
-	if err != nil {
-		slog.WarnContext(ctx, "showing deletion", "thought_id", thought.ID, "err", err)
-	}
-	return nil
-}
-
 // reply sends text in reply to the owner's message m.
 func (b *Bot) reply(ctx context.Context, m *telegram.Message, text string) error {
 	_, err := b.tg.SendMessage(
@@ -454,15 +245,6 @@ func (b *Bot) syncAckAndMarkProcessed(ctx context.Context, thoughtID, updateID i
 		return err
 	}
 	return b.db.MarkProcessed(ctx, updateID)
-}
-
-// kindUsage is the reply to a /kind that can't be run, listing kinds.
-func kindUsage(kinds []cermin.Kind) string {
-	names := make([]string, 0, len(kinds))
-	for _, k := range kinds {
-		names = append(names, k.Name)
-	}
-	return "Reply to a Thought or its Acknowledgement with /kind and one of: " + strings.Join(names, ", ") + "."
 }
 
 // classifyThought gives a Thought its first Classification, waiting up to
@@ -608,70 +390,6 @@ func (b *Bot) syncAck(ctx context.Context, thoughtID int64) error {
 		"classification_id", current.ID,
 	)
 	return nil
-}
-
-// CatchUp finishes what a crash, the classifier or Telegram left undone. It
-// brings every out-of-date Acknowledgement up to date, sending the ones never
-// sent, then classifies up to catchUpLimit Thoughts that have no
-// Classification, oldest first, and edits their Acknowledgements to show it.
-// A Thought that fails is logged and left for the next call.
-//
-// ponytail: a Thought the classifier always fails on, such as one it
-// refuses, costs a paid call on every call of CatchUp, and catchUpLimit of
-// them would stall the rest; count attempts and give up on it if that ever
-// happens.
-func (b *Bot) CatchUp(ctx context.Context) error {
-	outOfDate, err := b.db.OutOfDateAckThoughts(ctx)
-	if err != nil {
-		return err
-	}
-	// ponytail: unbounded; cap it at catchUpLimit if a Declared Topic
-	// backfill hits Telegram's 429s.
-	for _, t := range outOfDate {
-		// Locked per Thought, so that this delays a Capture by one send or
-		// edit at most. syncAck reads the Thought again under the lock, in
-		// case a Capture or Correction has shown it since.
-		b.mu.Lock()
-		err := b.syncAck(ctx, t.ID)
-		b.mu.Unlock()
-		if err != nil && ctx.Err() == nil {
-			slog.WarnContext(ctx, "updating acknowledgement", "thought_id", t.ID, "err", err)
-		}
-	}
-
-	// Under the lock no Capture is under way, so none of these Thoughts is
-	// being classified by one.
-	b.mu.Lock()
-	unclassified, err := b.db.UnclassifiedThoughts(ctx, catchUpLimit)
-	b.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	for _, t := range unclassified {
-		if err := b.classifyLate(ctx, t); err != nil && ctx.Err() == nil {
-			slog.WarnContext(ctx, "classifying thought late", "thought_id", t.ID, "err", err)
-		}
-	}
-	return nil
-}
-
-// classifyLate gives a Thought that had no Classification when the catch-up
-// listed it one, waiting up to catchUpClassifyTimeout for the classifier, and
-// brings its Acknowledgement up to date to show it.
-func (b *Bot) classifyLate(ctx context.Context, t cermin.Thought) error {
-	// Unlocked, so that a slow classifier never holds up a Capture.
-	isSaved, err := b.classifyThought(ctx, t, catchUpClassifyTimeout)
-	if err != nil || !isSaved {
-		// With none saved there is nothing new to show: the Thought is gone,
-		// or whatever classified it shows that, or the next catch-up does.
-		return err
-	}
-	slog.InfoContext(ctx, "thought classified late", "thought_id", t.ID)
-
-	// Saved, it is shown even during shutdown.
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.syncAck(context.WithoutCancel(ctx), t.ID)
 }
 
 // ackText is the Acknowledgement of a Thought classified as c, such as
