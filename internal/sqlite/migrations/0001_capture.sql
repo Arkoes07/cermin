@@ -10,8 +10,9 @@ CREATE TABLE telegram_updates (
     processed_at        TEXT
 );
 
+-- AUTOINCREMENT, so that a deleted Thought's ID never goes to a new one.
 CREATE TABLE thoughts (
-    id                     INTEGER PRIMARY KEY,
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
     text                   TEXT    NOT NULL,
     source                 TEXT    NOT NULL CHECK (source IN ('telegram', 'whatsapp')),
     tg_message_id          INTEGER UNIQUE,

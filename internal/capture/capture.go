@@ -1,11 +1,12 @@
 // Package capture turns the owner's Telegram messages into Thoughts,
-// classifies them, and applies the owner's Corrections. Every update is
-// stored in the inbox before anything else happens and processed from there,
-// so a crash or a failed reply never loses one. A catch-up loop later
-// finishes the Captures that a crash or the classifier left undone.
+// classifies them, and applies the owner's Corrections and deletes. Every
+// update is stored in the inbox before anything else happens and processed
+// from there, so a crash or a failed reply never loses one. A catch-up loop
+// later finishes the Captures that a crash or the classifier left undone.
 package capture
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -44,6 +45,10 @@ const (
 	// notReadyReply is the reply to a Correction of a Thought not yet
 	// classified.
 	notReadyReply = "Kind and Topics aren't ready yet. Try again in a minute."
+	// deleteUsage is the reply to a /delete that can't be run.
+	deleteUsage = "Reply to a Thought or its Acknowledgement with /delete."
+	// deletedAck is the Acknowledgement of a deleted Thought.
+	deletedAck = "🗑 deleted"
 )
 
 // ClassifyFunc gives a Thought's text a Classification, with one of kinds
@@ -57,9 +62,9 @@ type ClassifyFunc func(
 ) (c cermin.Classification, language string, err error)
 
 // Bot moves Telegram updates into the inbox, captures the owner's Thoughts
-// and runs their Corrections from it, and catches up on the Captures left
-// unfinished. One goroutine at a time may call Poll, or Run, which polls; the
-// other methods are safe for concurrent use.
+// and runs their Corrections and deletes from it, and catches up on the
+// Captures left unfinished. One goroutine at a time may call Poll, or Run,
+// which polls; the other methods are safe for concurrent use.
 type Bot struct {
 	db       *sqlite.DB
 	tg       *telegram.Client
@@ -67,9 +72,9 @@ type Bot struct {
 	classify ClassifyFunc
 	offset   int64 // the next update_id to ask Telegram for
 
-	// mu is held while a Thought is captured, corrected or caught up on,
-	// except while the catch-up waits for the classifier, so that two of them
-	// never act on the same Thought at once.
+	// mu is held while a Thought is captured, corrected, deleted or caught up
+	// on, except while the catch-up waits for the classifier, so that two of
+	// them never act on the same Thought at once.
 	//
 	// ponytail: one lock for every Thought, held across Telegram calls, so a
 	// slow catch-up send or edit can delay a Capture by up to the send
@@ -133,7 +138,8 @@ func (b *Bot) Poll(ctx context.Context) error {
 	}
 	for _, u := range updates {
 		row := sqlite.InboxUpdate{ID: u.ID, Payload: u.Raw}
-		if m := u.Message; m != nil {
+		// An edit carries the message's text too, so /delete must find it.
+		if m := cmp.Or(u.Message, u.EditedMessage); m != nil {
 			row.MessageID = m.ID
 			if m.ReplyToMessage != nil {
 				row.ReplyToMessageID = m.ReplyToMessage.ID
@@ -169,8 +175,9 @@ func (b *Bot) ProcessInbox(ctx context.Context) error {
 }
 
 // Process handles one inbox update: the owner's text message becomes a
-// Thought, which is classified and gets an Acknowledgement, and the owner's
-// /kind or /topics corrects one. Anything else is only marked processed.
+// Thought, which is classified and gets an Acknowledgement, the owner's /kind
+// or /topics corrects one, and their /delete deletes one. Anything else is only
+// marked processed.
 func (b *Bot) Process(ctx context.Context, in sqlite.InboxUpdate) error {
 	var update telegram.Update
 	if err := json.Unmarshal(in.Payload, &update); err != nil {
@@ -233,10 +240,13 @@ func (b *Bot) Process(ctx context.Context, in sqlite.InboxUpdate) error {
 }
 
 // runCommand runs the owner's command text, sent as message in, and marks in
-// processed. Only /kind and /topics do anything yet.
+// processed, or removes it for /delete. Only /kind, /topics and /delete do
+// anything yet.
 func (b *Bot) runCommand(ctx context.Context, in sqlite.InboxUpdate, text string) error {
 	command, args, _ := strings.Cut(text, " ")
 	switch command {
+	case "/delete":
+		return b.deleteThought(ctx, in)
 	case "/kind", "/topics":
 		if err := b.correct(ctx, in, command, args); err != nil {
 			return err
@@ -331,6 +341,55 @@ func (b *Bot) showCorrection(ctx context.Context, kinds []cermin.Kind, t cermin.
 	if err != nil {
 		slog.WarnContext(ctx, "showing correction", "thought_id", t.ID, "classification_id", c.ID, "err", err)
 	}
+}
+
+// deleteThought runs /delete, sent as message in, in reply to a Thought or its
+// Acknowledgement. In one transaction it deletes the Thought, its
+// Classifications and every inbox update that carries its text, including in
+// itself, then edits the Acknowledgement to 🗑 deleted. A /delete it can't run
+// gets a reply saying how, and is removed from the inbox too, since one that
+// replies to a Thought deleted already still carries its text.
+//
+// ponytail: a later /kind, /topics or text reply to the deleted Thought's
+// message, or an edit of it, brings its text back into the inbox, and stays;
+// delete your message in Telegram after /delete to prevent that, or store
+// replies without the replied-to copy if it ever matters.
+func (b *Bot) deleteThought(ctx context.Context, in sqlite.InboxUpdate) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// A message that isn't a reply has ReplyToMessageID 0, which no Thought's
+	// messages have.
+	thought, isFound, err := b.db.ThoughtByMessage(ctx, in.ReplyToMessageID)
+	if err != nil {
+		return err
+	}
+	if !isFound {
+		if err := b.reply(ctx, in, deleteUsage); err != nil {
+			return err
+		}
+		return b.db.DeleteUpdate(ctx, in.ID)
+	}
+	if err := b.db.DeleteThought(ctx, thought.ID); err != nil {
+		return err
+	}
+	slog.InfoContext(ctx, "thought deleted", "thought_id", thought.ID, "update_id", in.ID)
+
+	// The Thought is gone, so the edit can't be retried: it is made even
+	// during shutdown, and a failure is logged.
+	//
+	// ponytail: a failed edit, or a crash before it, leaves the
+	// Acknowledgement showing the deleted Thought's Kind and Topics; record
+	// the pending edit in the delete's transaction if that ever happens.
+	err = b.tg.EditMessageText(
+		context.WithoutCancel(ctx),
+		b.ownerID,
+		thought.AckMessageID,
+		deletedAck,
+	)
+	if err != nil {
+		slog.WarnContext(ctx, "showing deletion", "thought_id", thought.ID, "err", err)
+	}
+	return nil
 }
 
 // reply sends text in reply to the owner's message in.
@@ -495,7 +554,12 @@ func (b *Bot) classifyLate(ctx context.Context, kinds []cermin.Kind, t cermin.Th
 	// Locked only now, so that a slow classifier never holds up a Capture.
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	// Meanwhile the inbox may have classified the Thought, which keeps that
+	// Meanwhile you may have deleted the Thought.
+	current, isFound, err := b.db.Thought(ctx, t.ID)
+	if err != nil || !isFound {
+		return err
+	}
+	// Or the inbox may have classified the Thought, which keeps that
 	// Classification, or sent its Acknowledgement.
 	classifications, err := b.db.Classifications(ctx, t.ID)
 	if err != nil {
@@ -509,10 +573,6 @@ func (b *Bot) classifyLate(ctx context.Context, kinds []cermin.Kind, t cermin.Th
 		return err
 	}
 	slog.InfoContext(ctx, "thought classified late", "thought_id", t.ID, "classification_id", stored.ID)
-	current, err := b.db.Thought(ctx, t.ID)
-	if err != nil {
-		return err
-	}
 	if current.AckMessageID == 0 {
 		return nil // the Acknowledgement goes out showing the Classification
 	}

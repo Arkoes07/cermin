@@ -13,7 +13,7 @@ import (
 	"path/filepath"
 	"time"
 
-	_ "modernc.org/sqlite" // registers the "sqlite" driver; this package is its only user
+	_ "modernc.org/sqlite" // registers the "sqlite" driver; outside tests, this package is its only user
 
 	"github.com/arkoes07/cermin/internal/cermin"
 )
@@ -101,7 +101,7 @@ func applyMigration(ctx context.Context, pool *sql.DB, name string, version int)
 type InboxUpdate struct {
 	ID               int64  // Telegram's update_id
 	Payload          []byte // the update's JSON, as Telegram sent it
-	MessageID        int64  // 0 if the update carries no message
+	MessageID        int64  // the message, or edited message; 0 if the update carries neither
 	ReplyToMessageID int64  // 0 if the message isn't a reply
 }
 
@@ -164,6 +164,15 @@ func (db *DB) MarkProcessed(ctx context.Context, updateID int64) error {
 	return nil
 }
 
+// DeleteUpdate removes an update from the inbox.
+func (db *DB) DeleteUpdate(ctx context.Context, updateID int64) error {
+	_, err := db.pool.ExecContext(ctx, `DELETE FROM telegram_updates WHERE update_id = ?`, updateID)
+	if err != nil {
+		return fmt.Errorf("deleting update %d: %w", updateID, err)
+	}
+	return nil
+}
+
 // SaveThought stores a Thought taken from a Telegram message and returns it
 // as stored. If that message's Thought is already stored, it is returned
 // unchanged, so saving the same message twice keeps one Thought.
@@ -206,14 +215,17 @@ func (db *DB) SetAckMessageID(ctx context.Context, thoughtID, ackMessageID int64
 	return nil
 }
 
-// Thought returns the Thought id.
-func (db *DB) Thought(ctx context.Context, id int64) (cermin.Thought, error) {
+// Thought returns the Thought id, and false if there is none.
+func (db *DB) Thought(ctx context.Context, id int64) (cermin.Thought, bool, error) {
 	row := db.pool.QueryRowContext(ctx, `SELECT `+thoughtColumns+` FROM thoughts WHERE id = ?`, id)
 	t, err := scanThought(row)
-	if err != nil {
-		return cermin.Thought{}, fmt.Errorf("reading thought %d: %w", id, err)
+	if errors.Is(err, sql.ErrNoRows) {
+		return cermin.Thought{}, false, nil
 	}
-	return t, nil
+	if err != nil {
+		return cermin.Thought{}, false, fmt.Errorf("reading thought %d: %w", id, err)
+	}
+	return t, true, nil
 }
 
 // ThoughtByMessage returns the Thought that Telegram message messageID
@@ -232,6 +244,44 @@ func (db *DB) ThoughtByMessage(ctx context.Context, messageID int64) (cermin.Tho
 		return cermin.Thought{}, false, fmt.Errorf("reading thought of message %d: %w", messageID, err)
 	}
 	return t, true, nil
+}
+
+// DeleteThought deletes the Thought id, with its Classifications, and the
+// inbox updates that carry its text or its Acknowledgement's, all in one
+// transaction. Those are the message that carried it, the edits of that
+// message, and every reply to it or to its Acknowledgement, since a reply
+// carries the text of the message it replies to.
+func (db *DB) DeleteThought(ctx context.Context, id int64) error {
+	if err := db.deleteThought(ctx, id); err != nil {
+		return fmt.Errorf("deleting thought %d: %w", id, err)
+	}
+	return nil
+}
+
+func (db *DB) deleteThought(ctx context.Context, id int64) error {
+	tx, err := db.pool.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // after Commit it only returns sql.ErrTxDone
+
+	_, err = tx.ExecContext(ctx, `
+		DELETE FROM telegram_updates
+		WHERE EXISTS (
+			SELECT 1 FROM thoughts AS t
+			WHERE t.id = ?
+				AND (message_id = t.tg_message_id OR reply_to_message_id IN (t.tg_message_id, t.ack_message_id))
+		)`,
+		id,
+	)
+	if err != nil {
+		return err
+	}
+	// Its Classifications and their candidate Topics cascade.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM thoughts WHERE id = ?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Thoughts returns every Thought, oldest first.

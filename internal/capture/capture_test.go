@@ -3,8 +3,10 @@ package capture_test
 import (
 	"cmp"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -681,6 +683,156 @@ func TestBot_ProcessInbox_KeepsCorrectionWhenEditFails(t *testing.T) {
 	}
 }
 
+func TestBot_ProcessInbox_DeletesThought(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		replyToID int64
+	}{
+		{name: "reply to the thought", replyToID: messageID},
+		{name: "reply to its acknowledgement", replyToID: ackID},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "transport", Confidence: 0.9}}}
+			path := filepath.Join(t.TempDir(), "cermin.db")
+			bot, db, api := newBotAt(t, classifier.classify, path)
+			file := openFile(t, path)
+			// The Thought has the text every reply below carries. Another
+			// Thought, captured next, is left as it is.
+			api.queue(textUpdate(t, ownerID, repliedText, 0))
+			thought := captureQueued(t, bot, db)
+			api.queue(update(t, "message", ownerID, map[string]any{
+				"message_id": messageID + 1,
+				"text":       "Cafés near the office are full at 3pm.",
+			}))
+			// A reply to the Thought, which is a Thought of its own, and your
+			// edit of the Thought's message carry its text. A Correction
+			// replies to its Acknowledgement.
+			api.queue(update(t, "message", ownerID, map[string]any{
+				"message_id":       messageID + 2,
+				"text":             "Maybe leave at 7am instead.",
+				"reply_to_message": repliedMessage(ownerID, messageID),
+			}))
+			edit := update(t, "edited_message", ownerID, map[string]any{
+				"text":      repliedText + " Even on Fridays.",
+				"edit_date": thoughtTime.Unix() + 60,
+			})
+			api.queue(withUpdateID(t, edit, messageID+3))
+			api.queue(commandUpdate(t, commandID, "/kind observation", ackID))
+			processQueued(t, bot)
+
+			thoughts, err := db.Thoughts(ctx)
+			if err != nil || len(thoughts) != 3 {
+				t.Fatalf("Thoughts = %+v, %v; want 3", thoughts, err)
+			}
+			others := thoughts[1:]
+			othersClassifications := classificationsOf(t, db, others)
+			wantColumns := []string{"telegram_updates.payload", "thoughts.text"}
+			if got := columnsContaining(t, file, repliedText); !slices.Equal(got, wantColumns) {
+				t.Fatalf("before /delete, the Thought's text is in %q, want %q", got, wantColumns)
+			}
+
+			api.queue(commandUpdate(t, commandID+1, "/delete", tt.replyToID))
+			processQueued(t, bot)
+
+			if got := columnsContaining(t, file, repliedText); len(got) != 0 {
+				t.Errorf("after /delete, the Thought's text is in %q, want nowhere", got)
+			}
+			if got, err := db.Classifications(ctx, thought.ID); err != nil || len(got) != 0 {
+				t.Errorf("Classifications of the deleted Thought = %+v, %v; want none", got, err)
+			}
+			var orphans int
+			err = file.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM classification_topics
+				WHERE classification_id NOT IN (SELECT id FROM classifications)`,
+			).Scan(&orphans)
+			if err != nil || orphans != 0 {
+				t.Errorf("%d candidate Topics left without their Classification, %v; want none", orphans, err)
+			}
+			if got, err := db.Thoughts(ctx); err != nil || !reflect.DeepEqual(got, others) {
+				t.Errorf("Thoughts = %+v, %v; want the others unchanged: %+v", got, err, others)
+			}
+			if got := classificationsOf(t, db, others); !reflect.DeepEqual(got, othersClassifications) {
+				t.Errorf("Classifications of the others = %+v, want them unchanged: %+v", got, othersClassifications)
+			}
+			// The reply's update goes too, since it carries the deleted
+			// Thought's text, but the Thought it carried stays.
+			if got, want := updateIDs(t, file), []int64{messageID + 1}; !slices.Equal(got, want) {
+				t.Errorf("inbox updates = %v, want only the other Thought's: %v", got, want)
+			}
+			wantEdits := []editedMessage{
+				{ChatID: ownerID, MessageID: ackID, Text: "✏️ 👀 observation · transport"},
+				{ChatID: ownerID, MessageID: ackID, Text: "🗑 deleted"},
+			}
+			if edits := api.editedMessages(); !slices.Equal(edits, wantEdits) {
+				t.Errorf("edited %+v, want %+v", edits, wantEdits)
+			}
+			if sent := api.sentMessages(); len(sent) != 3 {
+				t.Errorf("sent %+v, want only the 3 Acknowledgements", sent)
+			}
+		})
+	}
+}
+
+func TestBot_ProcessInbox_RejectsDelete(t *testing.T) {
+	t.Parallel()
+	const deleteUsage = "Reply to a Thought or its Acknowledgement with /delete."
+	tests := []struct {
+		name           string
+		isDeletedFirst bool // the Thought is deleted before the /delete under test
+		replyToID      int64
+	}{
+		{name: "not a reply"},
+		{name: "reply to another message", replyToID: 999},
+		{name: "reply to a deleted thought", isDeletedFirst: true, replyToID: messageID},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "transport", Confidence: 0.9}}}
+			path := filepath.Join(t.TempDir(), "cermin.db")
+			bot, db, api := newBotAt(t, classifier.classify, path)
+			file := openFile(t, path)
+			api.queue(textUpdate(t, ownerID, repliedText, 0))
+			captureQueued(t, bot, db)
+			if tt.isDeletedFirst {
+				api.queue(commandUpdate(t, commandID, "/delete", messageID))
+				processQueued(t, bot)
+			}
+			thoughts, err := db.Thoughts(ctx)
+			if err != nil {
+				t.Fatalf("Thoughts: %v", err)
+			}
+			updates := updateIDs(t, file)
+			edits := api.editedMessages()
+
+			api.queue(commandUpdate(t, commandID+1, "/delete", tt.replyToID))
+			processQueued(t, bot)
+
+			sent := api.sentMessages()
+			wantReply := sentMessage{ChatID: ownerID, Text: deleteUsage, ReplyToID: commandID + 1}
+			if len(sent) != 2 || sent[1] != wantReply {
+				t.Errorf("sent %+v, want the Acknowledgement and then %+v", sent, wantReply)
+			}
+			if got, err := db.Thoughts(ctx); err != nil || !reflect.DeepEqual(got, thoughts) {
+				t.Errorf("Thoughts = %+v, %v; want them unchanged: %+v", got, err, thoughts)
+			}
+			// The /delete's own update goes too: one that replies to a deleted
+			// Thought carries its text.
+			if got := updateIDs(t, file); !slices.Equal(got, updates) {
+				t.Errorf("inbox updates = %v, want %v as before", got, updates)
+			}
+			if got := api.editedMessages(); !slices.Equal(got, edits) {
+				t.Errorf("edited %+v, want %+v as before", got, edits)
+			}
+		})
+	}
+}
+
 func TestBot_CatchUp_ClassifiesOnceClassifierRecovers(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
@@ -944,13 +1096,83 @@ func TestBot_CatchUp_KeepsClassificationMadeMeanwhile(t *testing.T) {
 	}
 }
 
+func TestBot_CatchUp_DropsClassificationOfThoughtDeletedMeanwhile(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	slow := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	slowStarted, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	classify := func(
+		ctx context.Context,
+		text string,
+		kinds []cermin.Kind,
+		topics []string,
+	) (cermin.Classification, string, error) {
+		switch calls.Add(1) {
+		case 2: // the catch-up's
+			close(slowStarted)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return cermin.Classification{}, "", ctx.Err()
+			}
+			return slow.classify(ctx, text, kinds, topics)
+		default: // at each Capture
+			return cermin.Classification{}, "", errors.New("classifier down")
+		}
+	}
+	bot, db, api := newBot(t, classify)
+	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
+	deleted := captureQueued(t, bot, db)
+
+	caughtUp := make(chan error, 1)
+	go func() { caughtUp <- bot.CatchUp(ctx) }()
+	<-slowStarted
+	// Meanwhile you delete the Thought and capture another, which the
+	// classifier fails on too.
+	api.queue(commandUpdate(t, commandID, "/delete", messageID))
+	api.queue(update(t, "message", ownerID, map[string]any{
+		"message_id": commandID + 1, // after the /delete
+		"text":       "Buy new running shoes.",
+	}))
+	processQueued(t, bot)
+	close(release)
+	if err := <-caughtUp; err != nil {
+		t.Fatalf("CatchUp: %v", err)
+	}
+
+	thoughts, err := db.Thoughts(ctx)
+	if err != nil || len(thoughts) != 1 {
+		t.Fatalf("Thoughts = %+v, %v; want only the new one", thoughts, err)
+	}
+	// Were the deleted Thought's ID reused, the catch-up would find the new
+	// Thought under it, unclassified, and give it the deleted one's
+	// Classification.
+	if thoughts[0].ID == deleted.ID {
+		t.Errorf("new Thought has the deleted Thought's ID %d, want a new one", deleted.ID)
+	}
+	if got, err := db.Classifications(ctx, thoughts[0].ID); err != nil || len(got) != 0 {
+		t.Errorf("Classifications of the new Thought = %+v, %v; want none, not the deleted Thought's", got, err)
+	}
+	wantEdits := []editedMessage{{ChatID: ownerID, MessageID: ackID, Text: "🗑 deleted"}}
+	if edits := api.editedMessages(); !slices.Equal(edits, wantEdits) {
+		t.Errorf("edited %+v, want %+v", edits, wantEdits)
+	}
+}
+
 func newBot(t *testing.T, classify capture.ClassifyFunc) (*capture.Bot, *sqlite.DB, *fakeBotAPI) {
+	t.Helper()
+	return newBotAt(t, classify, filepath.Join(t.TempDir(), "cermin.db"))
+}
+
+// newBotAt is newBot with its database at path.
+func newBotAt(t *testing.T, classify capture.ClassifyFunc, path string) (*capture.Bot, *sqlite.DB, *fakeBotAPI) {
 	t.Helper()
 	api := &fakeBotAPI{}
 	srv := httptest.NewServer(api.handler(t))
 	t.Cleanup(srv.Close)
 
-	db, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "cermin.db"))
+	db, err := sqlite.Open(t.Context(), path)
 	if err != nil {
 		t.Fatalf("sqlite.Open: %v", err)
 	}
@@ -990,6 +1212,102 @@ func processQueued(t *testing.T, bot *capture.Bot) {
 	if err := bot.ProcessInbox(t.Context()); err != nil {
 		t.Fatalf("ProcessInbox: %v", err)
 	}
+}
+
+// classificationsOf returns the Classifications of each of thoughts.
+func classificationsOf(t *testing.T, db *sqlite.DB, thoughts []cermin.Thought) [][]cermin.Classification {
+	t.Helper()
+	all := make([][]cermin.Classification, 0, len(thoughts))
+	for _, thought := range thoughts {
+		classifications, err := db.Classifications(t.Context(), thought.ID)
+		if err != nil {
+			t.Fatalf("Classifications: %v", err)
+		}
+		all = append(all, classifications)
+	}
+	return all
+}
+
+// openFile opens the database file at path directly, with the driver package
+// sqlite registers, to read what the store's methods don't show.
+func openFile(t *testing.T, path string) *sql.DB {
+	t.Helper()
+	file, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("opening %s: %v", path, err)
+	}
+	t.Cleanup(func() {
+		if err := file.Close(); err != nil {
+			t.Errorf("closing %s: %v", path, err)
+		}
+	})
+	return file
+}
+
+// columnsContaining returns each column of every table in file, as
+// "table.column", that has a value containing s.
+func columnsContaining(t *testing.T, file *sql.DB, s string) []string {
+	t.Helper()
+	ctx := t.Context()
+	rows, err := file.QueryContext(ctx, `
+		SELECT m.name, c.name
+		FROM sqlite_schema AS m, pragma_table_info(m.name) AS c
+		WHERE m.type = 'table'
+		ORDER BY m.name, c.cid`)
+	if err != nil {
+		t.Fatalf("listing columns: %v", err)
+	}
+	defer rows.Close()
+	type column struct{ table, name string }
+	columns := []column{}
+	for rows.Next() {
+		var c column
+		if err := rows.Scan(&c.table, &c.name); err != nil {
+			t.Fatalf("reading column: %v", err)
+		}
+		columns = append(columns, c)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("listing columns: %v", err)
+	}
+
+	found := []string{}
+	for _, c := range columns {
+		// The names come from the schema and are plain, so %q quotes them as
+		// SQL would.
+		query := fmt.Sprintf(`SELECT COUNT(*) FROM %q WHERE instr(CAST(%q AS TEXT), ?) > 0`, c.table, c.name)
+		var n int
+		if err := file.QueryRowContext(ctx, query, s).Scan(&n); err != nil {
+			t.Fatalf("searching %s.%s: %v", c.table, c.name, err)
+		}
+		if n > 0 {
+			found = append(found, c.table+"."+c.name)
+		}
+	}
+	return found
+}
+
+// updateIDs returns the IDs of the updates in the inbox in file, processed or
+// not, in order.
+func updateIDs(t *testing.T, file *sql.DB) []int64 {
+	t.Helper()
+	rows, err := file.QueryContext(t.Context(), `SELECT update_id FROM telegram_updates ORDER BY update_id`)
+	if err != nil {
+		t.Fatalf("listing updates: %v", err)
+	}
+	defer rows.Close()
+	ids := []int64{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("reading update: %v", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("listing updates: %v", err)
+	}
+	return ids
 }
 
 // fakeRawOutput is the raw model output of every fakeClassifier
@@ -1050,14 +1368,17 @@ func commandUpdate(t *testing.T, id int64, text string, replyToID int64) string 
 	return update(t, "message", ownerID, fields)
 }
 
-// repliedMessage is message id in the private chat of user chatID, as a reply
-// carries the message it replies to.
+// repliedText is the text of every message a test update replies to.
+const repliedText = "Buses are always packed at 8am."
+
+// repliedMessage is message id in the private chat of user chatID, reading
+// repliedText, as a reply carries the message it replies to.
 func repliedMessage(chatID, id int64) map[string]any {
 	return map[string]any{
 		"message_id": id,
 		"chat":       map[string]any{"id": chatID, "type": "private"},
 		"date":       thoughtTime.Add(-time.Hour).Unix(),
-		"text":       "Buses are always packed at 8am.",
+		"text":       repliedText,
 	}
 }
 
@@ -1075,6 +1396,22 @@ func update(t *testing.T, field string, fromID int64, fields map[string]any) str
 	}
 	maps.Copy(msg, fields)
 	b, err := json.Marshal(map[string]any{"update_id": msg["message_id"], field: msg})
+	if err != nil {
+		t.Fatalf("encoding update: %v", err)
+	}
+	return string(b)
+}
+
+// withUpdateID is update u with update_id id, as an edit has an update ID of
+// its own but the ID of the message it edits.
+func withUpdateID(t *testing.T, u string, id int64) string {
+	t.Helper()
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(u), &fields); err != nil {
+		t.Fatalf("decoding update: %v", err)
+	}
+	fields["update_id"] = json.RawMessage(strconv.FormatInt(id, 10))
+	b, err := json.Marshal(fields)
 	if err != nil {
 		t.Fatalf("encoding update: %v", err)
 	}

@@ -34,9 +34,10 @@ func New(apiURL, token string) *Client {
 
 // Update is an incoming update.
 type Update struct {
-	ID      int64           `json:"update_id"`
-	Message *Message        `json:"message"` // nil for other kinds of update, such as edits
-	Raw     json.RawMessage `json:"-"`       // the whole update, as Telegram sent it
+	ID            int64           `json:"update_id"`
+	Message       *Message        `json:"message"`        // nil for other kinds of update, such as edits
+	EditedMessage *Message        `json:"edited_message"` // the message as edited; nil unless this is an edit
+	Raw           json.RawMessage `json:"-"`              // the whole update, as Telegram sent it
 }
 
 // Message is a Telegram message.
