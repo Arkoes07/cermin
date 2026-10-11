@@ -18,4 +18,5 @@ type Thought struct {
 	AckClassificationID int64     // the Classification the Acknowledgement shows; 0 if none
 	ThoughtAt           time.Time // Thought time
 	ReceivedAt          time.Time // when Cermin stored it
+	ClassifyFailures    int       // how many times the catch-up has failed to classify it
 }

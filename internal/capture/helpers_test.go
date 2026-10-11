@@ -102,6 +102,19 @@ func pollUpdate(t *testing.T, bot *capture.Bot, db *sqlite.DB) sqlite.InboxUpdat
 	return updates[0]
 }
 
+// catchUpEvery calls the catch-up n times, once every interval, starting at
+// *now, which is the time bot reads, and moving it on by interval after each
+// call.
+func catchUpEvery(t *testing.T, bot *capture.Bot, now *time.Time, interval time.Duration, n int) {
+	t.Helper()
+	for range n {
+		if err := bot.CatchUp(t.Context()); err != nil {
+			t.Fatalf("CatchUp at %v: %v", *now, err)
+		}
+		*now = now.Add(interval)
+	}
+}
+
 // classificationsOf returns the Classifications of each of thoughts.
 func classificationsOf(t *testing.T, db *sqlite.DB, thoughts []cermin.Thought) [][]cermin.Classification {
 	t.Helper()

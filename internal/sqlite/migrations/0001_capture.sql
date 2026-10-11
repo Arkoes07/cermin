@@ -22,5 +22,9 @@ CREATE TABLE thoughts (
     -- No foreign key: a Classification is only deleted with its Thought.
     ack_classification_id  INTEGER,
     thought_at             TEXT    NOT NULL,
-    received_at            TEXT    NOT NULL
+    received_at            TEXT    NOT NULL,
+    -- How many times the catch-up has failed to classify it, and when the
+    -- catch-up next tries; NULL: at once.
+    classify_failures      INTEGER NOT NULL DEFAULT 0,
+    classify_retry_at      TEXT
 );

@@ -54,6 +54,21 @@ func (db *DB) SetAck(ctx context.Context, thoughtID, ackMessageID, classificatio
 	return nil
 }
 
+// PostponeClassification records that the catch-up has failed to classify a
+// Thought failures times, and is to try again once it is retryAt.
+func (db *DB) PostponeClassification(ctx context.Context, thoughtID int64, failures int, retryAt time.Time) error {
+	_, err := db.pool.ExecContext(ctx,
+		`UPDATE thoughts SET classify_failures = ?, classify_retry_at = ? WHERE id = ?`,
+		failures,
+		formatTime(retryAt),
+		thoughtID,
+	)
+	if err != nil {
+		return fmt.Errorf("postponing classification of thought %d: %w", thoughtID, err)
+	}
+	return nil
+}
+
 // Thought returns the Thought id, and false if there is none.
 func (db *DB) Thought(ctx context.Context, id int64) (cermin.Thought, bool, error) {
 	row := db.pool.QueryRowContext(ctx, `SELECT `+thoughtColumns+` FROM thoughts WHERE id = ?`, id)
@@ -148,15 +163,18 @@ func (db *DB) OutOfDateAckThoughts(ctx context.Context) ([]cermin.Thought, error
 }
 
 // UnclassifiedThoughts returns up to limit Thoughts that have no
-// Classification, oldest first.
-func (db *DB) UnclassifiedThoughts(ctx context.Context, limit int) ([]cermin.Thought, error) {
+// Classification and are due at now, oldest first: those the catch-up has
+// never failed to classify, and those it is to try again at now or earlier.
+func (db *DB) UnclassifiedThoughts(ctx context.Context, now time.Time, limit int) ([]cermin.Thought, error) {
 	// NOT IN reads classifications once, where NOT EXISTS would read it once
-	// per Thought.
+	// per Thought. Times are stored so that text order is time order.
 	return db.queryThoughts(ctx, `
 		SELECT `+thoughtColumns+` FROM thoughts
 		WHERE id NOT IN (SELECT thought_id FROM classifications)
+			AND (classify_retry_at IS NULL OR classify_retry_at <= ?)
 		ORDER BY id
 		LIMIT ?`,
+		formatTime(now),
 		limit,
 	)
 }
@@ -173,7 +191,7 @@ func (db *DB) queryThoughts(ctx context.Context, query string, args ...any) ([]c
 
 // thoughtColumns are the columns scanThought reads, in its order.
 const thoughtColumns = `id, text, source, COALESCE(tg_message_id, 0), COALESCE(tg_reply_to_message_id, 0),
-	COALESCE(ack_message_id, 0), COALESCE(ack_classification_id, 0), thought_at, received_at`
+	COALESCE(ack_message_id, 0), COALESCE(ack_classification_id, 0), thought_at, received_at, classify_failures`
 
 func scanThought(row scanner) (cermin.Thought, error) {
 	var t cermin.Thought
@@ -188,6 +206,7 @@ func scanThought(row scanner) (cermin.Thought, error) {
 		&t.AckClassificationID,
 		&thoughtAt,
 		&receivedAt,
+		&t.ClassifyFailures,
 	)
 	if err != nil {
 		return cermin.Thought{}, err

@@ -17,6 +17,12 @@ const (
 	catchUpClassifyTimeout = 60 * time.Second
 	// catchUpLimit is the most Thoughts one catch-up classifies, to cap cost.
 	catchUpLimit = 20
+	// classifyMaxBackoff is the longest the catch-up waits to try again to
+	// classify a Thought it failed on.
+	classifyMaxBackoff = 24 * time.Hour
+	// classifyRetrySlack comes off every wait, so that scheduler jitter never
+	// puts a Thought due at one catch-up off to the next.
+	classifyRetrySlack = 30 * time.Second
 )
 
 // catchUpEveryInterval calls CatchUp at once and then every catchUpInterval,
@@ -39,14 +45,11 @@ func (b *Bot) catchUpEveryInterval(ctx context.Context) {
 // CatchUp finishes what a crash, the classifier or Telegram left undone. It
 // brings every out-of-date Acknowledgement up to date, sending the ones never
 // sent, then classifies up to catchUpLimit Thoughts that have no
-// Classification, oldest first, and edits their Acknowledgements to show it.
-// A Thought that fails is logged and left for the next call.
-//
-// ponytail: a Thought the classifier always fails on, such as one it
-// refuses, costs a paid call on every call of CatchUp, and catchUpLimit of
-// them would stall the rest; count attempts and give up on it if that ever
-// happens.
+// Classification and are due, oldest first, and edits their Acknowledgements
+// to show it. A Thought it fails to classify is logged and postponed, ever
+// longer, so that one the classifier always fails on costs few paid calls.
 func (b *Bot) CatchUp(ctx context.Context) error {
+	now := b.timeNow()
 	outOfDate, err := b.db.OutOfDateAckThoughts(ctx)
 	if err != nil {
 		return err
@@ -68,34 +71,70 @@ func (b *Bot) CatchUp(ctx context.Context) error {
 	// Under the lock no Capture is under way, so none of these Thoughts is
 	// being classified by one.
 	b.mu.Lock()
-	unclassified, err := b.db.UnclassifiedThoughts(ctx, catchUpLimit)
+	unclassified, err := b.db.UnclassifiedThoughts(ctx, now, catchUpLimit)
 	b.mu.Unlock()
 	if err != nil {
 		return err
 	}
 	for _, t := range unclassified {
-		if err := b.classifyLate(ctx, t); err != nil && ctx.Err() == nil {
-			slog.WarnContext(ctx, "classifying thought late", "thought_id", t.ID, "err", err)
+		// Unlocked, so that a slow classifier never holds up a Capture.
+		isSaved, err := b.classifyThought(ctx, t, catchUpClassifyTimeout)
+		if err != nil {
+			if ctx.Err() == nil { // a shutdown is no fault of the Thought's
+				b.postponeClassification(
+					ctx,
+					now,
+					t,
+					err,
+				)
+			}
+			continue
+		}
+		// With none saved there is nothing new to show: the Thought is gone,
+		// or whatever classified it shows that, or the next catch-up does.
+		if isSaved {
+			b.showLateClassification(ctx, t.ID)
 		}
 	}
 	return nil
 }
 
-// classifyLate gives a Thought that had no Classification when the catch-up
-// listed it one, waiting up to catchUpClassifyTimeout for the classifier, and
-// brings its Acknowledgement up to date to show it.
-func (b *Bot) classifyLate(ctx context.Context, t cermin.Thought) error {
-	// Unlocked, so that a slow classifier never holds up a Capture.
-	isSaved, err := b.classifyThought(ctx, t, catchUpClassifyTimeout)
-	if err != nil || !isSaved {
-		// With none saved there is nothing new to show: the Thought is gone,
-		// or whatever classified it shows that, or the next catch-up does.
-		return err
+// postponeClassification logs classifyErr, the catch-up's failure to classify
+// Thought t, and postpones t's next try: to 1, 2, 4 … minutes after now, the start of
+// the catch-up, doubling with each failure up to classifyMaxBackoff.
+func (b *Bot) postponeClassification(ctx context.Context, now time.Time, t cermin.Thought, classifyErr error) {
+	// Only the catch-up writes the count, so t's is still current.
+	failures := t.ClassifyFailures + 1
+	backoff := time.Minute
+	for range failures - 1 {
+		// Capped as it doubles, so that it never overflows.
+		backoff = min(2*backoff, classifyMaxBackoff)
 	}
-	slog.InfoContext(ctx, "thought classified late", "thought_id", t.ID)
+	retryAt := now.Add(backoff - classifyRetrySlack)
+	slog.WarnContext(ctx, "classifying thought late",
+		"thought_id", t.ID,
+		"retry_at", retryAt,
+		"err", classifyErr,
+	)
+	err := b.db.PostponeClassification(
+		ctx,
+		t.ID,
+		failures,
+		retryAt,
+	)
+	if err != nil {
+		slog.WarnContext(ctx, "postponing classification", "thought_id", t.ID, "err", err)
+	}
+}
 
-	// Saved, it is shown even during shutdown.
+// showLateClassification brings the Acknowledgement of Thought thoughtID up
+// to date to show the Classification the catch-up just saved, even during
+// shutdown. A failure is logged, and the next catch-up retries it.
+func (b *Bot) showLateClassification(ctx context.Context, thoughtID int64) {
+	slog.InfoContext(ctx, "thought classified late", "thought_id", thoughtID)
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.syncAck(context.WithoutCancel(ctx), t.ID)
+	if err := b.syncAck(context.WithoutCancel(ctx), thoughtID); err != nil {
+		slog.WarnContext(ctx, "updating acknowledgement", "thought_id", thoughtID, "err", err)
+	}
 }

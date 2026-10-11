@@ -97,7 +97,7 @@ flowchart TB
 | Telegram poller | 1 | Long-polls `getUpdates`, writes each raw update into the `telegram_updates` inbox, then confirms the offset. |
 | Update handler | 1 | Works through inbox rows in order: owner check, Capture, `/delete`, `/kind`, `/topics`, edge cases; later `/ask`, `/topic` and Reactions. |
 | Classifier | 1 | One Claude call per Thought with structured output: Kind, candidate Topics, stated confidences, language, `kind_suggestion`. |
-| Catch-up loop | 1 | Every minute: sends missing Acknowledgements and edits out-of-date ones, then classifies Thoughts that have no Classification and edits their Acknowledgements. From week 2 it also embeds. |
+| Catch-up loop | 1 | Every minute: sends missing Acknowledgements and edits out-of-date ones, then classifies Thoughts that have no Classification and edits their Acknowledgements. After each failure on a Thought it waits longer before trying it again: 1, 2, 4 … minutes, at most 24 hours, so a Thought the classifier always fails on costs 11 calls on its first day and one a day after that. From week 2 it also embeds. |
 | HTTP server | 1 | `/healthz` for Fly; `/mcp` from week 3. |
 | Embedder | 2 | Embeds Thoughts and queries; backfills when the embedding model changes. |
 | Resurfacer | 2 | Finds strong matches for a new Thought and sends at most 2 as an Insight with 👍/👎. |
@@ -198,6 +198,8 @@ erDiagram
         int ack_classification_id "the Classification the Acknowledgement shows"
         datetime thought_at "UTC"
         datetime received_at "UTC"
+        int classify_failures "the catch-up's failed classifications"
+        datetime classify_retry_at "when the catch-up next tries; NULL: at once"
     }
     KINDS {
         text name PK

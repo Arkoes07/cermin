@@ -209,6 +209,8 @@ func TestBot_CatchUp_RetriesFailedClassification(t *testing.T) {
 	running := []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}
 	classifier := &fakeClassifier{candidates: running, err: errors.New("classifier down")}
 	bot, db, api := newBot(t, classifier.classify)
+	now := thoughtTime
+	bot.SetTimeNow(func() time.Time { return now })
 	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
 	thought := captureQueued(t, bot, db)
 
@@ -229,9 +231,9 @@ func TestBot_CatchUp_RetriesFailedClassification(t *testing.T) {
 		t.Run(f.name, func(t *testing.T) {
 			ctx := t.Context()
 			classifier.err, classifier.kind, classifier.candidates = f.err, f.kind, f.candidates
-			if err := bot.CatchUp(ctx); err != nil {
-				t.Fatalf("CatchUp: %v", err)
-			}
+			// A day apart, so the Thought is due at each catch-up however
+			// long the one before postponed it.
+			catchUpEvery(t, bot, &now, 24*time.Hour, 1)
 			if classifications, err := db.Classifications(ctx, thought.ID); err != nil || len(classifications) != 0 {
 				t.Errorf("Classifications = %+v, %v; want none", classifications, err)
 			}
@@ -245,11 +247,7 @@ func TestBot_CatchUp_RetriesFailedClassification(t *testing.T) {
 	}
 
 	classifier.err, classifier.kind, classifier.candidates = nil, "", running
-	for range 2 {
-		if err := bot.CatchUp(ctx); err != nil {
-			t.Fatalf("CatchUp: %v", err)
-		}
-	}
+	catchUpEvery(t, bot, &now, 24*time.Hour, 2)
 	if classifications, err := db.Classifications(ctx, thought.ID); err != nil || len(classifications) != 1 {
 		t.Errorf("Classifications = %+v, %v; want 1", classifications, err)
 	}
@@ -287,6 +285,115 @@ func TestBot_CatchUp_ClassifiesAtMost20(t *testing.T) {
 	}
 	if calls := len(classifier.gotTopics); calls != 21 {
 		t.Errorf("classified %d Thoughts after two CatchUps, want all 21", calls)
+	}
+}
+
+func TestBot_CatchUp_BacksOffFromThoughtClassifierAlwaysFailsOn(t *testing.T) {
+	t.Parallel()
+	classifier := &fakeClassifier{err: errors.New("classifier refused")}
+	bot, db, api := newBot(t, classifier.classify)
+	now := thoughtTime
+	bot.SetTimeNow(func() time.Time { return now })
+	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
+	captureQueued(t, bot, db)
+
+	classifier.gotTopics = nil // Capture's call doesn't count
+	catchUpEvery(t, bot, &now, time.Minute, 24*60)
+	if calls := len(classifier.gotTopics); calls != 11 {
+		t.Errorf("classified %d times in the first 24 hours, want 11, waiting 1, 2, 4 … 512 minutes between them", calls)
+	}
+	catchUpEvery(t, bot, &now, time.Minute, 24*60)
+	if calls := len(classifier.gotTopics); calls != 12 {
+		t.Errorf("classified %d times in 48 hours, want 12, once in the second 24 hours", calls)
+	}
+	// Hourly from here, to cover days cheaply: the wait stops doubling at 24
+	// hours, where it would otherwise reach 34 hours, then 68.
+	catchUpEvery(t, bot, &now, time.Hour, 3*24)
+	if calls := len(classifier.gotTopics); calls != 15 {
+		t.Errorf("classified %d times in 5 days, want 15, once a day after the first 2", calls)
+	}
+}
+
+func TestBot_CatchUp_ClassifiesWithinAnHourOfOutageEnding(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	classifier := &fakeClassifier{
+		candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}},
+		err:        errors.New("classifier down"),
+	}
+	bot, db, api := newBot(t, classifier.classify)
+	now := thoughtTime
+	bot.SetTimeNow(func() time.Time { return now })
+
+	// The classifier is down for the first hour. Thoughts come in at its
+	// start, halfway through and in its last minute.
+	for minute := range 2*60 + 1 {
+		switch minute {
+		case 0, 30, 59:
+			api.queue(update(t, "message", ownerID, map[string]any{
+				"message_id": messageID + minute,
+				"text":       "Run " + strconv.Itoa(minute+1) + " km on Saturday.",
+			}))
+			processQueued(t, bot)
+		case 60:
+			classifier.err, classifier.gotTopics = nil, nil
+		}
+		catchUpEvery(t, bot, &now, time.Minute, 1)
+	}
+
+	thoughts, err := db.Thoughts(ctx)
+	if err != nil || len(thoughts) != 3 {
+		t.Fatalf("Thoughts = %+v, %v; want 3", thoughts, err)
+	}
+	for i, classifications := range classificationsOf(t, db, thoughts) {
+		if len(classifications) != 1 {
+			t.Errorf("Thought %d has %d Classifications an hour after the outage, want 1", thoughts[i].ID, len(classifications))
+		}
+	}
+	if calls := len(classifier.gotTopics); calls != 3 {
+		t.Errorf("classified %d times after the outage, want once per Thought", calls)
+	}
+}
+
+func TestBot_CatchUp_ClassifiesNewThoughtBehind20Failing(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	const newText = "Buy new running shoes."
+	classifier := &fakeClassifier{
+		candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}},
+		err:        errors.New("classifier down"),
+	}
+	// Once up, the classifier refuses every Thought but the new one.
+	classify := func(
+		ctx context.Context,
+		text string,
+		kinds []cermin.Kind,
+		topics []string,
+	) (cermin.Classification, error) {
+		if text != newText {
+			return cermin.Classification{}, errors.New("classifier refused")
+		}
+		return classifier.classify(ctx, text, kinds, topics)
+	}
+	bot, db, api := newBot(t, classify)
+	now := thoughtTime
+	bot.SetTimeNow(func() time.Time { return now })
+	for i := range 20 {
+		api.queue(update(t, "message", ownerID, map[string]any{
+			"message_id": messageID + i,
+			"text":       "Run " + strconv.Itoa(i+1) + " km on Saturday.",
+		}))
+	}
+	api.queue(update(t, "message", ownerID, map[string]any{
+		"message_id": messageID + 20,
+		"text":       newText,
+	}))
+	newThought := captureQueued(t, bot, db)
+
+	classifier.err = nil
+	catchUpEvery(t, bot, &now, time.Minute, 3)
+	if classifications, err := db.Classifications(ctx, newThought.ID); err != nil || len(classifications) != 1 {
+		t.Errorf("Classifications of the new Thought after 3 catch-ups = %+v, %v; want 1", classifications, err)
 	}
 }
 

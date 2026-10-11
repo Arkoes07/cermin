@@ -57,7 +57,8 @@ type Bot struct {
 	tg       *telegram.Client
 	ownerID  int64
 	classify ClassifyFunc
-	offset   int64 // the next update_id to ask Telegram for
+	offset   int64            // the next update_id to ask Telegram for
+	timeNow  func() time.Time // time.Now, unless a test sets another clock
 
 	// mu is held while a Thought is captured, corrected, deleted or caught up
 	// on, except while the catch-up waits for the classifier, so that two of
@@ -72,7 +73,13 @@ type Bot struct {
 // New returns a Bot that captures the Thoughts of the Telegram user ownerID,
 // ignoring everyone else, and classifies them with classify.
 func New(db *sqlite.DB, tg *telegram.Client, ownerID int64, classify ClassifyFunc) *Bot {
-	return &Bot{db: db, tg: tg, ownerID: ownerID, classify: classify}
+	return &Bot{
+		db:       db,
+		tg:       tg,
+		ownerID:  ownerID,
+		classify: classify,
+		timeNow:  time.Now,
+	}
 }
 
 // Run processes the inbox and polls Telegram for more, and catches up at
@@ -192,7 +199,7 @@ func (b *Bot) Process(ctx context.Context, in sqlite.InboxUpdate) error {
 		TGMessageID:        m.ID,
 		TGReplyToMessageID: m.ReplyToID(),
 		ThoughtAt:          time.Unix(m.Date, 0),
-		ReceivedAt:         time.Now(),
+		ReceivedAt:         b.timeNow(),
 	})
 	if err != nil {
 		return err
