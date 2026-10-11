@@ -137,7 +137,7 @@ func (b *Bot) Poll(ctx context.Context) error {
 // ponytail: an update that always fails stalls the ones behind it; skip and
 // alert on it if that ever happens.
 func (b *Bot) ProcessInbox(ctx context.Context) error {
-	updates, err := b.db.UnprocessedUpdates(ctx)
+	updates, err := b.db.GetUnprocessedUpdates(ctx)
 	if err != nil {
 		return err
 	}
@@ -159,6 +159,7 @@ func (b *Bot) Process(ctx context.Context, in sqlite.InboxUpdate) error {
 	if err := json.Unmarshal(in.Payload, &update); err != nil {
 		return fmt.Errorf("decoding: %w", err)
 	}
+
 	// Only the owner's messages in their private chat with the bot count: a
 	// message ID from another chat could clash with a captured Thought's.
 	// Their text is a Thought, unless it starts with /, which makes it a
@@ -171,26 +172,23 @@ func (b *Bot) Process(ctx context.Context, in sqlite.InboxUpdate) error {
 		slog.InfoContext(ctx, "update not captured", "update_id", in.ID)
 		return b.db.MarkProcessed(ctx, in.ID)
 	case update.EditedMessage != nil:
-		return b.replyAndMarkProcessed(
-			ctx,
-			in.ID,
-			m,
-			editReply,
-		)
+		return b.replyAndMarkProcessed(ctx, in.ID, m, editReply)
 	case strings.HasPrefix(m.Text, "/"):
 		return b.runCommand(ctx, in.ID, m)
 	case m.Text == "":
 		// ponytail: each photo of an album gets this reply, and so does a
 		// service message such as your pin of a message; reply once per
 		// media_group_id and skip service messages if it ever matters.
-		return b.replyAndMarkProcessed(
-			ctx,
-			in.ID,
-			m,
-			textOnlyReply,
-		)
+		return b.replyAndMarkProcessed(ctx, in.ID, m, textOnlyReply)
+	default:
+		return b.captureThought(ctx, in.ID, m)
 	}
+}
 
+// captureThought captures the owner's text message m, sent in update
+// updateID: it saves m as a Thought, classifies it and gives it an
+// Acknowledgement, then marks the update processed.
+func (b *Bot) captureThought(ctx context.Context, updateID int64, m *telegram.Message) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	thought, err := b.db.SaveThought(ctx, cermin.Thought{
@@ -204,6 +202,7 @@ func (b *Bot) Process(ctx context.Context, in sqlite.InboxUpdate) error {
 	if err != nil {
 		return err
 	}
+
 	// The Thought may already have its Acknowledgement if this update was
 	// processed before a crash, or the catch-up sent it since; the catch-up
 	// then classifies it if it isn't yet.
@@ -216,22 +215,14 @@ func (b *Bot) Process(ctx context.Context, in sqlite.InboxUpdate) error {
 			// Thought is saved and stays unclassified until the catch-up.
 			slog.WarnContext(ctx, "classifying thought", "thought_id", thought.ID, "err", err)
 		}
-		slog.InfoContext(ctx, "thought captured",
-			"thought_id", thought.ID,
-			"update_id", in.ID,
-		)
+		slog.InfoContext(ctx, "thought captured", "thought_id", thought.ID, "update_id", updateID)
 	}
-	return b.syncAckAndMarkProcessed(ctx, thought.ID, in.ID)
+	return b.syncAckAndMarkProcessed(ctx, thought.ID, updateID)
 }
 
 // reply sends text in reply to the owner's message m.
 func (b *Bot) reply(ctx context.Context, m *telegram.Message, text string) error {
-	_, err := b.tg.SendMessage(
-		ctx,
-		b.ownerID,
-		text,
-		m.ID,
-	)
+	_, err := b.tg.SendMessage(ctx, b.ownerID, text, m.ID)
 	return err
 }
 
@@ -268,23 +259,20 @@ func (b *Bot) classifyThought(ctx context.Context, t cermin.Thought, timeout tim
 	// A Thought processed again after a crash, before its Acknowledgement
 	// was sent, keeps the Classification it has, and so does one the
 	// catch-up reaches minutes after listing it.
-	_, isClassified, err := b.db.CurrentClassification(ctx, t.ID)
+	_, isClassified, err := b.db.GetCurrentClassificationByThoughtID(ctx, t.ID)
 	if err != nil || isClassified {
 		return false, err
 	}
-	topics, err := b.db.TopicNames(ctx)
+
+	topics, err := b.db.GetTopicNames(ctx)
 	if err != nil {
 		return false, err
 	}
-	c, err := b.classify(
-		ctx,
-		t.Text,
-		b.db.Kinds(),
-		topics,
-	)
+	c, err := b.classify(ctx, t.Text, b.db.Kinds(), topics)
 	if err != nil {
 		return false, err
 	}
+
 	c.ThoughtID = t.ID
 	c.Source = cermin.SourceCermin
 	c.Topics = cermin.KeepTopics(c.Topics)
@@ -318,14 +306,15 @@ func (b *Bot) classifyThought(ctx context.Context, t cermin.Thought, timeout tim
 // it; only SQLite errors are returned. A crash between sending and recording
 // still sends a second one.
 func (b *Bot) syncAck(ctx context.Context, thoughtID int64) error {
-	t, isFound, err := b.db.Thought(ctx, thoughtID)
+	t, isFound, err := b.db.GetThoughtByID(ctx, thoughtID)
 	if err != nil || !isFound {
 		return err
 	}
 	if t.TGMessageID == 0 {
 		return nil // from WhatsApp, with no message to reply to
 	}
-	current, isClassified, err := b.db.CurrentClassification(ctx, thoughtID)
+
+	current, isClassified, err := b.db.GetCurrentClassificationByThoughtID(ctx, thoughtID)
 	if err != nil {
 		return err
 	}
@@ -334,9 +323,10 @@ func (b *Bot) syncAck(ctx context.Context, thoughtID int64) error {
 	if t.AckMessageID != 0 && t.AckClassificationID == current.ID {
 		return nil
 	}
+
 	text := savedAck
 	if isClassified {
-		if text, err = b.ackText(current); err != nil {
+		if text, err = b.renderAck(current); err != nil {
 			// Logged and not returned, so that it never stalls the inbox.
 			slog.WarnContext(ctx, "rendering acknowledgement",
 				"thought_id", t.ID,
@@ -347,28 +337,8 @@ func (b *Bot) syncAck(ctx context.Context, thoughtID int64) error {
 		}
 	}
 
-	ackID := t.AckMessageID
-	if ackID == 0 {
-		var ack telegram.Message
-		ack, err = b.tg.SendMessage(
-			ctx,
-			b.ownerID,
-			text,
-			t.TGMessageID,
-		)
-		ackID = ack.ID
-	} else {
-		err = b.tg.EditMessageText(
-			ctx,
-			b.ownerID,
-			ackID,
-			text,
-		)
-	}
-	// An Acknowledgement you deleted stays deleted: it counts as shown, so
-	// its edit isn't retried and no message is sent to replace it.
-	isDeleted := errors.Is(err, telegram.ErrMessageNotFound)
-	if err != nil && !isDeleted {
+	ackID, isDeleted, err := b.showAck(ctx, t, text)
+	if err != nil {
 		slog.WarnContext(ctx, "showing acknowledgement",
 			"thought_id", t.ID,
 			"classification_id", current.ID,
@@ -376,33 +346,43 @@ func (b *Bot) syncAck(ctx context.Context, thoughtID int64) error {
 		)
 		return nil
 	}
+
 	// Once shown, it is recorded even during shutdown, or a restart would
 	// show it again.
-	err = b.db.SetAck(
-		context.WithoutCancel(ctx),
-		t.ID,
-		ackID,
-		current.ID,
-	)
-	if err != nil {
+	if err := b.db.SetAck(context.WithoutCancel(ctx), t.ID, ackID, current.ID); err != nil {
 		return err
 	}
 	msg := "acknowledgement shown"
 	if isDeleted {
 		msg = "acknowledgement deleted, left as it is"
 	}
-	slog.InfoContext(ctx, msg,
-		"thought_id", t.ID,
-		"ack_message_id", ackID,
-		"classification_id", current.ID,
-	)
+	slog.InfoContext(ctx, msg, "thought_id", t.ID, "ack_message_id", ackID, "classification_id", current.ID)
 	return nil
 }
 
-// ackText is the Acknowledgement of a Thought classified as c, such as
+// showAck shows text as the Acknowledgement of Thought t: it sends it in
+// reply to t's message if t has no Acknowledgement, or edits t's
+// Acknowledgement to read it. It returns the Acknowledgement's message ID.
+// An Acknowledgement you deleted stays deleted: it counts as shown, so its
+// edit isn't retried and no message is sent to replace it, and isDeleted
+// reports it.
+func (b *Bot) showAck(ctx context.Context, t cermin.Thought, text string) (ackID int64, isDeleted bool, err error) {
+	if t.AckMessageID == 0 {
+		var ack telegram.Message
+		ack, err = b.tg.SendMessage(ctx, b.ownerID, text, t.TGMessageID)
+		return ack.ID, false, err
+	}
+	err = b.tg.EditMessageText(ctx, b.ownerID, t.AckMessageID, text)
+	if errors.Is(err, telegram.ErrMessageNotFound) {
+		return t.AckMessageID, true, nil
+	}
+	return t.AckMessageID, false, err
+}
+
+// renderAck returns the Acknowledgement of a Thought classified as c, such as
 // "💡 idea · business, retail": the Kind and the kept Topics, best first,
 // marked ✏️ if c is a Correction.
-func (b *Bot) ackText(c cermin.Classification) (string, error) {
+func (b *Bot) renderAck(c cermin.Classification) (string, error) {
 	kinds := b.db.Kinds()
 	i := slices.IndexFunc(kinds, func(k cermin.Kind) bool { return k.Name == c.Kind })
 	if i < 0 {

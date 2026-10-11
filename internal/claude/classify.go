@@ -20,8 +20,8 @@ import (
 const DefaultModel = "claude-sonnet-5-5"
 
 const (
-	// promptVersion names the prompt systemPrompt writes. Change it with the
-	// prompt, or with the Kinds, so accuracy can be reported per version.
+	// promptVersion names the prompt buildSystemPrompt writes. Change it with
+	// the prompt, or with the Kinds, so accuracy can be reported per version.
 	promptVersion = "classify-v1"
 	// confidenceMethod is how the confidences are measured: Claude states them.
 	confidenceMethod = "verbalized-v1"
@@ -53,11 +53,11 @@ func (c *Classifier) Classify(
 	resp, err := c.client.Messages.New(ctx, anthropic.MessageNewParams{
 		Model:     c.model,
 		MaxTokens: maxTokens,
-		System:    []anthropic.TextBlockParam{{Text: systemPrompt(kinds, topics)}},
+		System:    []anthropic.TextBlockParam{{Text: buildSystemPrompt(kinds, topics)}},
 		Messages:  []anthropic.MessageParam{anthropic.NewUserMessage(anthropic.NewTextBlock(text))},
 		OutputConfig: anthropic.OutputConfigParam{
 			Effort: anthropic.OutputConfigEffortLow,
-			Format: anthropic.JSONOutputFormatParam{Schema: outputSchema(kinds)},
+			Format: anthropic.JSONOutputFormatParam{Schema: buildOutputSchema(kinds)},
 		},
 	})
 	if err != nil {
@@ -67,6 +67,7 @@ func (c *Classifier) Classify(
 	if resp.StopReason != anthropic.StopReasonEndTurn {
 		return cermin.Classification{}, fmt.Errorf("classify: model stopped with %s", resp.StopReason)
 	}
+
 	var raw string
 	for _, block := range resp.Content {
 		if tb, ok := block.AsAny().(anthropic.TextBlock); ok {
@@ -74,6 +75,7 @@ func (c *Classifier) Classify(
 			break
 		}
 	}
+
 	var out output
 	if err := json.Unmarshal([]byte(raw), &out); err != nil {
 		return cermin.Classification{}, fmt.Errorf("classify: decoding output: %w", err)
@@ -83,6 +85,7 @@ func (c *Classifier) Classify(
 	for _, t := range out.Topics {
 		candidates = append(candidates, cermin.TopicCandidate{Name: t.Name, Confidence: t.Confidence})
 	}
+
 	classification := cermin.Classification{
 		Kind:             out.Kind.Value,
 		KindConfidence:   out.Kind.Confidence,
@@ -96,7 +99,7 @@ func (c *Classifier) Classify(
 	return classification, nil
 }
 
-// output is the model's output, as outputSchema shapes it. Its
+// output is the model's output, as buildOutputSchema shapes it. Its
 // kind_suggestion stays in the raw output only.
 type output struct {
 	Language string `json:"language"`
@@ -110,9 +113,9 @@ type output struct {
 	} `json:"topics"`
 }
 
-// outputSchema is the JSON schema Claude's output must follow, with the Kind
-// limited to kinds.
-func outputSchema(kinds []cermin.Kind) map[string]any {
+// buildOutputSchema returns the JSON schema Claude's output must follow, with
+// the Kind limited to kinds.
+func buildOutputSchema(kinds []cermin.Kind) map[string]any {
 	names := make([]string, 0, len(kinds))
 	for _, k := range kinds {
 		names = append(names, k.Name)
@@ -150,9 +153,10 @@ func outputSchema(kinds []cermin.Kind) map[string]any {
 	}
 }
 
-// systemPrompt tells Claude how to classify a Thought, giving it the
-// definitions of kinds and the names of the existing topics.
-func systemPrompt(kinds []cermin.Kind, topics []string) string {
+// buildSystemPrompt writes the system prompt that tells Claude how to classify
+// a Thought, giving it the definitions of kinds and the names of the existing
+// topics.
+func buildSystemPrompt(kinds []cermin.Kind, topics []string) string {
 	var b strings.Builder
 	b.WriteString(`You classify a Thought: a short message someone sent to themselves, in English, Bahasa Indonesia or a mix of the two. The user message is the Thought. In the definitions below, "I" is the person who wrote it.
 

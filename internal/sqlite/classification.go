@@ -23,11 +23,10 @@ func scanKind(row scanner) (cermin.Kind, error) {
 	return k, err
 }
 
-// TopicNames returns the names of the Topics that aren't archived, in name
+// GetTopicNames returns the names of the Topics that aren't archived, in name
 // order.
-func (db *DB) TopicNames(ctx context.Context) ([]string, error) {
-	names, err := queryAll(ctx, db.pool, scanName,
-		`SELECT name FROM topics WHERE archived_at IS NULL ORDER BY name`)
+func (db *DB) GetTopicNames(ctx context.Context) ([]string, error) {
+	names, err := queryAll(ctx, db.pool, scanName, `SELECT name FROM topics WHERE archived_at IS NULL ORDER BY name`)
 	if err != nil {
 		return nil, fmt.Errorf("listing topics: %w", err)
 	}
@@ -86,82 +85,19 @@ func (db *DB) saveClassification(
 	}
 	defer tx.Rollback() //nolint:errcheck // after Commit it only returns sql.ErrTxDone
 
-	// A Correction is yours: it states no confidence, and a Topic it names
-	// first is your Topic.
-	isCorrection := c.Source == cermin.SourceCorrection
-	origin := "cermin"
-	if isCorrection {
-		origin = "you"
-	}
 	c.CreatedAt = time.Now().UTC().Truncate(time.Millisecond) // as stored
-	// isFirst's condition is checked in the INSERT itself, so that no other
-	// process can write between the check and the write. Checked in a read
-	// before it, another process's write would fail this transaction with
-	// SQLITE_BUSY_SNAPSHOT, which busy_timeout doesn't retry. No row back
-	// means not saved.
-	err = tx.QueryRowContext(ctx, `
-		INSERT INTO classifications (thought_id, source, kind, kind_confidence, model, prompt_version,
-			confidence_method, raw_output, language, tg_message_id, created_at)
-		SELECT ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, 0), ?
-		WHERE NOT ? OR (
-			EXISTS (SELECT 1 FROM thoughts WHERE id = ?)
-			AND NOT EXISTS (SELECT 1 FROM classifications WHERE thought_id = ?)
-		)
-		RETURNING id`,
-		c.ThoughtID,
-		c.Source,
-		c.Kind,
-		sql.Null[float64]{V: c.KindConfidence, Valid: !isCorrection},
-		c.Model,
-		c.PromptVersion,
-		c.ConfidenceMethod,
-		c.RawOutput,
-		c.Language,
-		c.TGMessageID,
-		formatTime(c.CreatedAt),
-		isFirst,
-		c.ThoughtID,
-		c.ThoughtID,
-	).Scan(&c.ID)
-	if isFirst && errors.Is(err, sql.ErrNoRows) {
-		return cermin.Classification{}, false, nil
-	}
-	if err != nil {
+	id, isSaved, err := insertClassification(ctx, tx, c, isFirst)
+	if err != nil || !isSaved {
 		return cermin.Classification{}, false, err
 	}
+	c.ID = id
 
-	topics := make([]cermin.TopicCandidate, 0, len(c.Topics))
-	for _, t := range c.Topics {
-		// ponytail: a kept name matching an archived Topic is assigned to it;
-		// skip archived Topics here once /topic archive exists.
-		if t.Kept {
-			_, err := tx.ExecContext(ctx, `
-				INSERT INTO topics (name, origin, created_at) VALUES (?, ?, ?)
-				ON CONFLICT (name) DO NOTHING`,
-				t.Name,
-				origin,
-				formatTime(c.CreatedAt),
-			)
-			if err != nil {
-				return cermin.Classification{}, false, err
-			}
-		}
-		err := tx.QueryRowContext(ctx, `
-			INSERT INTO classification_topics (classification_id, topic_name, confidence, kept)
-			VALUES (?, COALESCE((SELECT name FROM topics WHERE name = ?), ?), ?, ?)
-			RETURNING topic_name`,
-			c.ID,
-			t.Name,
-			t.Name,
-			sql.Null[float64]{V: t.Confidence, Valid: !isCorrection},
-			t.Kept,
-		).Scan(&t.Name)
-		if err != nil {
-			return cermin.Classification{}, false, err
-		}
-		topics = append(topics, t)
+	if err := insertTopics(ctx, tx, c); err != nil {
+		return cermin.Classification{}, false, err
 	}
-	c.Topics = topics
+	if c.Topics, err = insertTopicCandidates(ctx, tx, c); err != nil {
+		return cermin.Classification{}, false, err
+	}
 
 	if err := tx.Commit(); err != nil {
 		return cermin.Classification{}, false, err
@@ -169,9 +105,109 @@ func (db *DB) saveClassification(
 	return c, true, nil
 }
 
-// Classifications returns every Classification of the Thought thoughtID,
-// oldest first, so the last one is current.
-func (db *DB) Classifications(ctx context.Context, thoughtID int64) ([]cermin.Classification, error) {
+// insertClassification inserts c, without its candidate Topics, and returns
+// its ID. If isFirst, it inserts c only while its Thought exists and has no
+// Classification, and reports whether it did.
+func insertClassification(ctx context.Context, tx *sql.Tx, c cermin.Classification, isFirst bool) (int64, bool, error) {
+	// A Correction states no confidence.
+	isCorrection := c.Source == cermin.SourceCorrection
+	// isFirst's condition is checked in the INSERT itself, so that no other
+	// process can write between the check and the write. Checked in a read
+	// before it, another process's write would fail this transaction with
+	// SQLITE_BUSY_SNAPSHOT, which busy_timeout doesn't retry. No row back
+	// means not saved.
+	var id int64
+	err := tx.QueryRowContext(ctx, `
+		INSERT INTO classifications (thought_id, source, kind, kind_confidence, model, prompt_version,
+			confidence_method, raw_output, language, tg_message_id, created_at)
+		SELECT :thought_id, :source, :kind, :kind_confidence, NULLIF(:model, ''), NULLIF(:prompt_version, ''),
+			NULLIF(:confidence_method, ''), NULLIF(:raw_output, ''), NULLIF(:language, ''),
+			NULLIF(:tg_message_id, 0), :created_at
+		WHERE NOT :is_first OR (
+			EXISTS (SELECT 1 FROM thoughts WHERE id = :thought_id)
+			AND NOT EXISTS (SELECT 1 FROM classifications WHERE thought_id = :thought_id)
+		)
+		RETURNING id`,
+		sql.Named("thought_id", c.ThoughtID),
+		sql.Named("source", c.Source),
+		sql.Named("kind", c.Kind),
+		sql.Named("kind_confidence", sql.Null[float64]{V: c.KindConfidence, Valid: !isCorrection}),
+		sql.Named("model", c.Model),
+		sql.Named("prompt_version", c.PromptVersion),
+		sql.Named("confidence_method", c.ConfidenceMethod),
+		sql.Named("raw_output", c.RawOutput),
+		sql.Named("language", c.Language),
+		sql.Named("tg_message_id", c.TGMessageID),
+		sql.Named("created_at", formatTime(c.CreatedAt)),
+		sql.Named("is_first", isFirst),
+	).Scan(&id)
+	if isFirst && errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return id, true, nil
+}
+
+// insertTopics creates the Topics that c's kept candidates name and that
+// don't exist yet, with origin cermin, or you for a Correction.
+func insertTopics(ctx context.Context, tx *sql.Tx, c cermin.Classification) error {
+	// A Correction is yours, and so is a Topic it names first.
+	origin := "cermin"
+	if c.Source == cermin.SourceCorrection {
+		origin = "you"
+	}
+	for _, t := range c.Topics {
+		if !t.Kept {
+			continue
+		}
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO topics (name, origin, created_at) VALUES (:name, :origin, :created_at)
+			ON CONFLICT (name) DO NOTHING`,
+			sql.Named("name", t.Name),
+			sql.Named("origin", origin),
+			sql.Named("created_at", formatTime(c.CreatedAt)),
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// insertTopicCandidates stores c's candidate Topics as those of the
+// Classification c.ID and returns them as stored. A candidate naming an
+// existing Topic, in any case, takes that Topic's spelling.
+func insertTopicCandidates(ctx context.Context, tx *sql.Tx, c cermin.Classification) ([]cermin.TopicCandidate, error) {
+	// A Correction states no confidence.
+	isCorrection := c.Source == cermin.SourceCorrection
+	topics := make([]cermin.TopicCandidate, 0, len(c.Topics))
+	for _, t := range c.Topics {
+		// ponytail: a kept name matching an archived Topic is assigned to it;
+		// skip archived Topics here once /topic archive exists.
+		err := tx.QueryRowContext(ctx, `
+			INSERT INTO classification_topics (classification_id, topic_name, confidence, kept)
+			VALUES (
+				:classification_id, COALESCE((SELECT name FROM topics WHERE name = :name), :name), :confidence, :kept
+			)
+			RETURNING topic_name`,
+			sql.Named("classification_id", c.ID),
+			sql.Named("name", t.Name),
+			sql.Named("confidence", sql.Null[float64]{V: t.Confidence, Valid: !isCorrection}),
+			sql.Named("kept", t.Kept),
+		).Scan(&t.Name)
+		if err != nil {
+			return nil, err
+		}
+		topics = append(topics, t)
+	}
+	return topics, nil
+}
+
+// GetClassificationsByThoughtID returns every Classification of the Thought
+// thoughtID, oldest first, so the last one is current.
+func (db *DB) GetClassificationsByThoughtID(ctx context.Context, thoughtID int64) ([]cermin.Classification, error) {
 	classifications, err := queryAll(ctx, db.pool, scanClassification, `
 		SELECT `+classificationColumns+` FROM classifications
 		WHERE thought_id = ?
@@ -184,17 +220,20 @@ func (db *DB) Classifications(ctx context.Context, thoughtID int64) ([]cermin.Cl
 
 	// ponytail: one query per Classification, fine for the few a Thought has;
 	// join them if a caller ever lists many Thoughts' Classifications.
-	for i := range classifications {
-		if classifications[i].Topics, err = db.topicCandidates(ctx, classifications[i].ID); err != nil {
+	for i, c := range classifications {
+		if classifications[i].Topics, err = db.getTopicCandidatesByClassificationID(ctx, c.ID); err != nil {
 			return nil, err
 		}
 	}
 	return classifications, nil
 }
 
-// CurrentClassification returns the current Classification of the Thought
-// thoughtID, its latest, and false if it has none.
-func (db *DB) CurrentClassification(ctx context.Context, thoughtID int64) (cermin.Classification, bool, error) {
+// GetCurrentClassificationByThoughtID returns the current Classification of
+// the Thought thoughtID, its latest, and false if it has none.
+func (db *DB) GetCurrentClassificationByThoughtID(
+	ctx context.Context,
+	thoughtID int64,
+) (cermin.Classification, bool, error) {
 	row := db.pool.QueryRowContext(ctx, `
 		SELECT `+classificationColumns+` FROM classifications
 		WHERE thought_id = ?
@@ -213,7 +252,7 @@ func (db *DB) CurrentClassification(ctx context.Context, thoughtID int64) (cermi
 			err,
 		)
 	}
-	if c.Topics, err = db.topicCandidates(ctx, c.ID); err != nil {
+	if c.Topics, err = db.getTopicCandidatesByClassificationID(ctx, c.ID); err != nil {
 		return cermin.Classification{}, false, err
 	}
 	return c, true, nil
@@ -252,9 +291,12 @@ func scanClassification(row scanner) (cermin.Classification, error) {
 	return c, nil
 }
 
-// topicCandidates returns the candidate Topics of a Classification, in the
-// order they were stored.
-func (db *DB) topicCandidates(ctx context.Context, classificationID int64) ([]cermin.TopicCandidate, error) {
+// getTopicCandidatesByClassificationID returns the candidate Topics of the
+// Classification classificationID, in the order they were stored.
+func (db *DB) getTopicCandidatesByClassificationID(
+	ctx context.Context,
+	classificationID int64,
+) ([]cermin.TopicCandidate, error) {
 	topics, err := queryAll(ctx, db.pool, scanTopicCandidate, `
 		SELECT topic_name, COALESCE(confidence, 0), kept
 		FROM classification_topics

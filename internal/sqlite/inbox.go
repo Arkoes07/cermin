@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 )
@@ -20,13 +21,13 @@ type InboxUpdate struct {
 func (db *DB) SaveUpdate(ctx context.Context, u InboxUpdate) error {
 	_, err := db.pool.ExecContext(ctx, `
 		INSERT INTO telegram_updates (update_id, payload, message_id, reply_to_message_id, received_at)
-		VALUES (?, ?, NULLIF(?, 0), NULLIF(?, 0), ?)
+		VALUES (:update_id, :payload, NULLIF(:message_id, 0), NULLIF(:reply_to_message_id, 0), :received_at)
 		ON CONFLICT (update_id) DO NOTHING`,
-		u.ID,
-		string(u.Payload), // a string is stored as TEXT, a []byte as BLOB
-		u.MessageID,
-		u.ReplyToMessageID,
-		formatTime(time.Now()),
+		sql.Named("update_id", u.ID),
+		sql.Named("payload", string(u.Payload)), // a string is stored as TEXT, a []byte as BLOB
+		sql.Named("message_id", u.MessageID),
+		sql.Named("reply_to_message_id", u.ReplyToMessageID),
+		sql.Named("received_at", formatTime(time.Now())),
 	)
 	if err != nil {
 		return fmt.Errorf("saving update %d: %w", u.ID, err)
@@ -34,9 +35,9 @@ func (db *DB) SaveUpdate(ctx context.Context, u InboxUpdate) error {
 	return nil
 }
 
-// UnprocessedUpdates returns the inbox updates not yet marked processed,
+// GetUnprocessedUpdates returns the inbox updates not yet marked processed,
 // oldest first.
-func (db *DB) UnprocessedUpdates(ctx context.Context) ([]InboxUpdate, error) {
+func (db *DB) GetUnprocessedUpdates(ctx context.Context) ([]InboxUpdate, error) {
 	updates, err := queryAll(ctx, db.pool, scanUpdate, `
 		SELECT update_id, payload, COALESCE(message_id, 0), COALESCE(reply_to_message_id, 0)
 		FROM telegram_updates
@@ -57,9 +58,9 @@ func scanUpdate(row scanner) (InboxUpdate, error) {
 // MarkProcessed records that an update has been fully handled.
 func (db *DB) MarkProcessed(ctx context.Context, updateID int64) error {
 	_, err := db.pool.ExecContext(ctx,
-		`UPDATE telegram_updates SET processed_at = ? WHERE update_id = ?`,
-		formatTime(time.Now()),
-		updateID,
+		`UPDATE telegram_updates SET processed_at = :processed_at WHERE update_id = :update_id`,
+		sql.Named("processed_at", formatTime(time.Now())),
+		sql.Named("update_id", updateID),
 	)
 	if err != nil {
 		return fmt.Errorf("marking update %d processed: %w", updateID, err)

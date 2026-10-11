@@ -16,14 +16,14 @@ import (
 func (db *DB) SaveThought(ctx context.Context, t cermin.Thought) (cermin.Thought, error) {
 	_, err := db.pool.ExecContext(ctx, `
 		INSERT INTO thoughts (text, source, tg_message_id, tg_reply_to_message_id, thought_at, received_at)
-		VALUES (?, ?, ?, NULLIF(?, 0), ?, ?)
+		VALUES (:text, :source, :tg_message_id, NULLIF(:tg_reply_to_message_id, 0), :thought_at, :received_at)
 		ON CONFLICT (tg_message_id) DO NOTHING`,
-		t.Text,
-		t.Source,
-		t.TGMessageID,
-		t.TGReplyToMessageID,
-		formatTime(t.ThoughtAt),
-		formatTime(t.ReceivedAt),
+		sql.Named("text", t.Text),
+		sql.Named("source", t.Source),
+		sql.Named("tg_message_id", t.TGMessageID),
+		sql.Named("tg_reply_to_message_id", t.TGReplyToMessageID),
+		sql.Named("thought_at", formatTime(t.ThoughtAt)),
+		sql.Named("received_at", formatTime(t.ReceivedAt)),
 	)
 	if err != nil {
 		return cermin.Thought{}, fmt.Errorf("saving thought from message %d: %w", t.TGMessageID, err)
@@ -42,11 +42,12 @@ func (db *DB) SaveThought(ctx context.Context, t cermin.Thought) (cermin.Thought
 // SetAck records that message ackMessageID is a Thought's Acknowledgement and
 // shows Classification classificationID, or none if it is 0.
 func (db *DB) SetAck(ctx context.Context, thoughtID, ackMessageID, classificationID int64) error {
-	_, err := db.pool.ExecContext(ctx,
-		`UPDATE thoughts SET ack_message_id = ?, ack_classification_id = NULLIF(?, 0) WHERE id = ?`,
-		ackMessageID,
-		classificationID,
-		thoughtID,
+	_, err := db.pool.ExecContext(ctx, `
+		UPDATE thoughts SET ack_message_id = :ack_message_id, ack_classification_id = NULLIF(:classification_id, 0)
+		WHERE id = :thought_id`,
+		sql.Named("ack_message_id", ackMessageID),
+		sql.Named("classification_id", classificationID),
+		sql.Named("thought_id", thoughtID),
 	)
 	if err != nil {
 		return fmt.Errorf("setting acknowledgement of thought %d: %w", thoughtID, err)
@@ -58,10 +59,10 @@ func (db *DB) SetAck(ctx context.Context, thoughtID, ackMessageID, classificatio
 // Thought failures times, and is to try again once it is retryAt.
 func (db *DB) PostponeClassification(ctx context.Context, thoughtID int64, failures int, retryAt time.Time) error {
 	_, err := db.pool.ExecContext(ctx,
-		`UPDATE thoughts SET classify_failures = ?, classify_retry_at = ? WHERE id = ?`,
-		failures,
-		formatTime(retryAt),
-		thoughtID,
+		`UPDATE thoughts SET classify_failures = :failures, classify_retry_at = :retry_at WHERE id = :thought_id`,
+		sql.Named("failures", failures),
+		sql.Named("retry_at", formatTime(retryAt)),
+		sql.Named("thought_id", thoughtID),
 	)
 	if err != nil {
 		return fmt.Errorf("postponing classification of thought %d: %w", thoughtID, err)
@@ -69,8 +70,8 @@ func (db *DB) PostponeClassification(ctx context.Context, thoughtID int64, failu
 	return nil
 }
 
-// Thought returns the Thought id, and false if there is none.
-func (db *DB) Thought(ctx context.Context, id int64) (cermin.Thought, bool, error) {
+// GetThoughtByID returns the Thought id, and false if there is none.
+func (db *DB) GetThoughtByID(ctx context.Context, id int64) (cermin.Thought, bool, error) {
 	row := db.pool.QueryRowContext(ctx, `SELECT `+thoughtColumns+` FROM thoughts WHERE id = ?`, id)
 	t, err := scanThought(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -82,13 +83,12 @@ func (db *DB) Thought(ctx context.Context, id int64) (cermin.Thought, bool, erro
 	return t, true, nil
 }
 
-// ThoughtByMessage returns the Thought that Telegram message messageID
+// GetThoughtByMessageID returns the Thought that Telegram message messageID
 // carried or acknowledged, and false if there is none.
-func (db *DB) ThoughtByMessage(ctx context.Context, messageID int64) (cermin.Thought, bool, error) {
+func (db *DB) GetThoughtByMessageID(ctx context.Context, messageID int64) (cermin.Thought, bool, error) {
 	row := db.pool.QueryRowContext(ctx,
-		`SELECT `+thoughtColumns+` FROM thoughts WHERE tg_message_id = ? OR ack_message_id = ?`,
-		messageID,
-		messageID,
+		`SELECT `+thoughtColumns+` FROM thoughts WHERE tg_message_id = :message_id OR ack_message_id = :message_id`,
+		sql.Named("message_id", messageID),
 	)
 	t, err := scanThought(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -138,17 +138,17 @@ func (db *DB) deleteThought(ctx context.Context, id int64) error {
 	return tx.Commit()
 }
 
-// Thoughts returns every Thought, oldest first.
-func (db *DB) Thoughts(ctx context.Context) ([]cermin.Thought, error) {
+// GetThoughts returns every Thought, oldest first.
+func (db *DB) GetThoughts(ctx context.Context) ([]cermin.Thought, error) {
 	return db.queryThoughts(ctx, `SELECT `+thoughtColumns+` FROM thoughts ORDER BY id`)
 }
 
-// OutOfDateAckThoughts returns the Thoughts from Telegram whose
+// GetThoughtsWithOutOfDateAck returns the Thoughts from Telegram whose
 // Acknowledgement is out of date, oldest first: those that have none, and
 // those whose Acknowledgement shows a Classification other than their current
 // one. An Acknowledgement that shows none is up to date until the Thought is
 // classified.
-func (db *DB) OutOfDateAckThoughts(ctx context.Context) ([]cermin.Thought, error) {
+func (db *DB) GetThoughtsWithOutOfDateAck(ctx context.Context) ([]cermin.Thought, error) {
 	// The join reads classifications once, where a subquery in WHERE would
 	// read it once per Thought. IS NOT takes NULL as equal to NULL.
 	return db.queryThoughts(ctx, `
@@ -162,20 +162,20 @@ func (db *DB) OutOfDateAckThoughts(ctx context.Context) ([]cermin.Thought, error
 	)
 }
 
-// UnclassifiedThoughts returns up to limit Thoughts that have no
+// GetThoughtsDueForClassification returns up to limit Thoughts that have no
 // Classification and are due at now, oldest first: those the catch-up has
 // never failed to classify, and those it is to try again at now or earlier.
-func (db *DB) UnclassifiedThoughts(ctx context.Context, now time.Time, limit int) ([]cermin.Thought, error) {
+func (db *DB) GetThoughtsDueForClassification(ctx context.Context, now time.Time, limit int) ([]cermin.Thought, error) {
 	// NOT IN reads classifications once, where NOT EXISTS would read it once
 	// per Thought. Times are stored so that text order is time order.
 	return db.queryThoughts(ctx, `
 		SELECT `+thoughtColumns+` FROM thoughts
 		WHERE id NOT IN (SELECT thought_id FROM classifications)
-			AND (classify_retry_at IS NULL OR classify_retry_at <= ?)
+			AND (classify_retry_at IS NULL OR classify_retry_at <= :now)
 		ORDER BY id
-		LIMIT ?`,
-		formatTime(now),
-		limit,
+		LIMIT :limit`,
+		sql.Named("now", formatTime(now)),
+		sql.Named("limit", limit),
 	)
 }
 

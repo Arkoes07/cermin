@@ -50,7 +50,17 @@ func (b *Bot) catchUpEveryInterval(ctx context.Context) {
 // longer, so that one the classifier always fails on costs few paid calls.
 func (b *Bot) CatchUp(ctx context.Context) error {
 	now := b.timeNow()
-	outOfDate, err := b.db.OutOfDateAckThoughts(ctx)
+	if err := b.syncOutOfDateAcks(ctx); err != nil {
+		return err
+	}
+	return b.classifyDueThoughts(ctx, now)
+}
+
+// syncOutOfDateAcks brings every out-of-date Acknowledgement up to date,
+// sending the ones never sent. A failure is logged, and the next catch-up
+// retries it.
+func (b *Bot) syncOutOfDateAcks(ctx context.Context) error {
+	outOfDate, err := b.db.GetThoughtsWithOutOfDateAck(ctx)
 	if err != nil {
 		return err
 	}
@@ -67,26 +77,28 @@ func (b *Bot) CatchUp(ctx context.Context) error {
 			slog.WarnContext(ctx, "updating acknowledgement", "thought_id", t.ID, "err", err)
 		}
 	}
+	return nil
+}
 
+// classifyDueThoughts classifies up to catchUpLimit Thoughts that have no
+// Classification and are due at now, the start of the catch-up, oldest
+// first, and edits their Acknowledgements to show it. A Thought it fails to
+// classify is logged and postponed.
+func (b *Bot) classifyDueThoughts(ctx context.Context, now time.Time) error {
 	// Under the lock no Capture is under way, so none of these Thoughts is
 	// being classified by one.
 	b.mu.Lock()
-	unclassified, err := b.db.UnclassifiedThoughts(ctx, now, catchUpLimit)
+	due, err := b.db.GetThoughtsDueForClassification(ctx, now, catchUpLimit)
 	b.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	for _, t := range unclassified {
+	for _, t := range due {
 		// Unlocked, so that a slow classifier never holds up a Capture.
 		isSaved, err := b.classifyThought(ctx, t, catchUpClassifyTimeout)
 		if err != nil {
 			if ctx.Err() == nil { // a shutdown is no fault of the Thought's
-				b.postponeClassification(
-					ctx,
-					now,
-					t,
-					err,
-				)
+				b.postponeClassification(ctx, now, t, err)
 			}
 			continue
 		}
@@ -111,18 +123,8 @@ func (b *Bot) postponeClassification(ctx context.Context, now time.Time, t cermi
 		backoff = min(2*backoff, classifyMaxBackoff)
 	}
 	retryAt := now.Add(backoff - classifyRetrySlack)
-	slog.WarnContext(ctx, "classifying thought late",
-		"thought_id", t.ID,
-		"retry_at", retryAt,
-		"err", classifyErr,
-	)
-	err := b.db.PostponeClassification(
-		ctx,
-		t.ID,
-		failures,
-		retryAt,
-	)
-	if err != nil {
+	slog.WarnContext(ctx, "classifying thought late", "thought_id", t.ID, "retry_at", retryAt, "err", classifyErr)
+	if err := b.db.PostponeClassification(ctx, t.ID, failures, retryAt); err != nil {
 		slog.WarnContext(ctx, "postponing classification", "thought_id", t.ID, "err", err)
 	}
 }

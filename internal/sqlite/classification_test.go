@@ -37,9 +37,8 @@ func TestDB_SaveClassification_StoresCorrection(t *testing.T) {
 	// A Topic whose stored name isn't lowercase, as a Declared Topic's may be.
 	now := formatTime(time.Now())
 	_, err = db.pool.ExecContext(ctx,
-		`INSERT INTO topics (name, origin, created_at, declared_at) VALUES ('Cermin', 'declared', ?, ?)`,
-		now,
-		now,
+		`INSERT INTO topics (name, origin, created_at, declared_at) VALUES ('Cermin', 'declared', :now, :now)`,
+		sql.Named("now", now),
 	)
 	if err != nil {
 		t.Fatalf("declaring a topic: %v", err)
@@ -194,29 +193,34 @@ func TestDB_SaveFirstClassification(t *testing.T) {
 				t.Errorf("SaveFirstClassification returned %+v unsaved, want none", stored)
 			}
 
-			if got, err := db.Classifications(ctx, thought.ID); err != nil || !reflect.DeepEqual(got, want) {
-				t.Errorf("Classifications = %+v, %v; want %+v", got, err, want)
+			got, err := db.GetClassificationsByThoughtID(ctx, thought.ID)
+			if err != nil || !reflect.DeepEqual(got, want) {
+				t.Errorf("GetClassificationsByThoughtID = %+v, %v; want %+v", got, err, want)
 			}
-			topics, err := db.TopicNames(ctx)
+			topics, err := db.GetTopicNames(ctx)
 			if err != nil {
-				t.Fatalf("TopicNames: %v", err)
+				t.Fatalf("GetTopicNames: %v", err)
 			}
 			if hasErrands := slices.Contains(topics, "errands"); hasErrands != tt.wantSaved {
-				t.Errorf("TopicNames = %q, want errands only if saved", topics)
+				t.Errorf("GetTopicNames = %q, want errands only if saved", topics)
 			}
 		})
 	}
 }
 
-func TestDB_CurrentClassification(t *testing.T) {
+func TestDB_GetCurrentClassificationByThoughtID(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
 	db := openDB(t)
 	thought := saveThought(t, db)
 
-	_, isClassified, err := db.CurrentClassification(ctx, thought.ID)
+	_, isClassified, err := db.GetCurrentClassificationByThoughtID(ctx, thought.ID)
 	if err != nil || isClassified {
-		t.Fatalf("CurrentClassification of an unclassified Thought: %t, %v; want false", isClassified, err)
+		t.Fatalf(
+			"GetCurrentClassificationByThoughtID of an unclassified Thought: %t, %v; want false",
+			isClassified,
+			err,
+		)
 	}
 
 	// Each one saved is current, with its own candidate Topics.
@@ -256,9 +260,16 @@ func TestDB_CurrentClassification(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SaveClassification %d: %v", i, err)
 		}
-		got, isClassified, err := db.CurrentClassification(ctx, thought.ID)
+		got, isClassified, err := db.GetCurrentClassificationByThoughtID(ctx, thought.ID)
 		if err != nil || !isClassified || !reflect.DeepEqual(got, want) {
-			t.Errorf("after saving %d, CurrentClassification = %+v, %t, %v; want %+v", i, got, isClassified, err, want)
+			t.Errorf(
+				"after saving %d, GetCurrentClassificationByThoughtID = %+v, %t, %v; want %+v",
+				i,
+				got,
+				isClassified,
+				err,
+				want,
+			)
 		}
 	}
 }

@@ -60,12 +60,7 @@ func run(args []string) error {
 	}
 	slog.InfoContext(ctx, "capturing Thoughts", "db", dbPath, "classify_model", model)
 	classifier := claude.New(apiKey, model)
-	bot := capture.New(
-		db,
-		telegram.New(telegram.APIURL, token),
-		ownerID,
-		classifier.Classify,
-	)
+	bot := capture.New(db, telegram.New(telegram.APIURL, token), ownerID, classifier.Classify)
 	bot.Run(ctx)
 	slog.Info("stopped")
 	return db.Close()

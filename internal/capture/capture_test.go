@@ -31,9 +31,9 @@ func TestBot_ProcessInbox_CapturesOwnerText(t *testing.T) {
 	}
 	after := time.Now()
 
-	thoughts, err := db.Thoughts(ctx)
+	thoughts, err := db.GetThoughts(ctx)
 	if err != nil {
-		t.Fatalf("Thoughts: %v", err)
+		t.Fatalf("GetThoughts: %v", err)
 	}
 	if len(thoughts) != 1 {
 		t.Fatalf("got %d Thoughts, want 1", len(thoughts))
@@ -67,9 +67,9 @@ func TestBot_ProcessInbox_CapturesOwnerText(t *testing.T) {
 		t.Errorf("sent %+v, want %+v", sent, wantSent)
 	}
 
-	classifications, err := db.Classifications(ctx, got.ID)
+	classifications, err := db.GetClassificationsByThoughtID(ctx, got.ID)
 	if err != nil || len(classifications) != 1 {
-		t.Fatalf("Classifications = %+v, %v; want 1", classifications, err)
+		t.Fatalf("GetClassificationsByThoughtID = %+v, %v; want 1", classifications, err)
 	}
 	gotClassification := classifications[0]
 	if gotClassification.CreatedAt.Before(before) || gotClassification.CreatedAt.After(after) {
@@ -151,16 +151,16 @@ func TestBot_ProcessInbox_KeepsStrongTopics(t *testing.T) {
 	if sent := api.sentMessages(); !slices.Equal(sent, wantSent) {
 		t.Errorf("sent %+v, want %+v", sent, wantSent)
 	}
-	classifications, err := db.Classifications(ctx, thought.ID)
+	classifications, err := db.GetClassificationsByThoughtID(ctx, thought.ID)
 	if err != nil || len(classifications) != 1 {
-		t.Fatalf("Classifications = %+v, %v; want 1", classifications, err)
+		t.Fatalf("GetClassificationsByThoughtID = %+v, %v; want 1", classifications, err)
 	}
 	if got := classifications[0].Topics; !slices.Equal(got, wantStored) {
 		t.Errorf("stored candidates %+v, want %+v", got, wantStored)
 	}
 	wantTopics := slices.Sorted(slices.Values(kept))
-	if got, err := db.TopicNames(ctx); err != nil || !slices.Equal(got, wantTopics) {
-		t.Errorf("TopicNames = %q, %v; want %q", got, err, wantTopics)
+	if got, err := db.GetTopicNames(ctx); err != nil || !slices.Equal(got, wantTopics) {
+		t.Errorf("GetTopicNames = %q, %v; want %q", got, err, wantTopics)
 	}
 }
 
@@ -191,9 +191,9 @@ func TestBot_ProcessInbox_ReusesTopicIgnoringCase(t *testing.T) {
 	if sent := api.sentMessages(); len(sent) != 2 || sent[1].Text != "💡 idea · business, retail" {
 		t.Errorf("sent %+v, want a second Acknowledgement 💡 idea · business, retail", sent)
 	}
-	classifications, err := db.Classifications(ctx, thought.ID)
+	classifications, err := db.GetClassificationsByThoughtID(ctx, thought.ID)
 	if err != nil || len(classifications) != 1 {
-		t.Fatalf("Classifications = %+v, %v; want 1", classifications, err)
+		t.Fatalf("GetClassificationsByThoughtID = %+v, %v; want 1", classifications, err)
 	}
 	wantStored := []cermin.TopicCandidate{
 		{Name: "business", Confidence: 0.85, Kept: true},
@@ -202,8 +202,8 @@ func TestBot_ProcessInbox_ReusesTopicIgnoringCase(t *testing.T) {
 	if got := classifications[0].Topics; !slices.Equal(got, wantStored) {
 		t.Errorf("stored candidates %+v, want %+v", got, wantStored)
 	}
-	if got, err := db.TopicNames(ctx); err != nil || !slices.Equal(got, []string{"business", "retail"}) {
-		t.Errorf("TopicNames = %q, %v; want business, retail", got, err)
+	if got, err := db.GetTopicNames(ctx); err != nil || !slices.Equal(got, []string{"business", "retail"}) {
+		t.Errorf("GetTopicNames = %q, %v; want business, retail", got, err)
 	}
 }
 
@@ -226,10 +226,10 @@ func TestBot_ProcessInbox_SavesWhenClassificationTimesOut(t *testing.T) {
 	if sent := api.sentMessages(); !slices.Equal(sent, wantSent) {
 		t.Errorf("sent %+v, want %+v", sent, wantSent)
 	}
-	if classifications, err := db.Classifications(ctx, thought.ID); err != nil || len(classifications) != 0 {
-		t.Errorf("Classifications = %+v, %v; want none", classifications, err)
+	if got, err := db.GetClassificationsByThoughtID(ctx, thought.ID); err != nil || len(got) != 0 {
+		t.Errorf("GetClassificationsByThoughtID = %+v, %v; want none", got, err)
 	}
-	if updates, err := db.UnprocessedUpdates(ctx); err != nil || len(updates) != 0 {
+	if updates, err := db.GetUnprocessedUpdates(ctx); err != nil || len(updates) != 0 {
 		t.Errorf("unprocessed updates = %+v, %v; want none", updates, err)
 	}
 }
@@ -267,12 +267,12 @@ func TestBot_Process_SavesClassificationArrivingAsCaptureEnds(t *testing.T) {
 	if calls := len(classifier.gotTopics); calls != 1 {
 		t.Errorf("classified %d times, want once", calls)
 	}
-	thoughts, err := db.Thoughts(ctx)
+	thoughts, err := db.GetThoughts(ctx)
 	if err != nil || len(thoughts) != 1 {
-		t.Fatalf("Thoughts = %+v, %v; want 1", thoughts, err)
+		t.Fatalf("GetThoughts = %+v, %v; want 1", thoughts, err)
 	}
-	if classifications, err := db.Classifications(ctx, thoughts[0].ID); err != nil || len(classifications) != 1 {
-		t.Errorf("Classifications = %+v, %v; want 1", classifications, err)
+	if got, err := db.GetClassificationsByThoughtID(ctx, thoughts[0].ID); err != nil || len(got) != 1 {
+		t.Errorf("GetClassificationsByThoughtID = %+v, %v; want 1", got, err)
 	}
 	wantSent := []sentMessage{{ChatID: ownerID, Text: "💡 idea · running", ReplyToID: messageID}}
 	if sent := api.sentMessages(); !slices.Equal(sent, wantSent) {
@@ -290,7 +290,7 @@ func TestBot_ProcessInbox_RetryKeepsClassification(t *testing.T) {
 	processQueued(t, bot)
 
 	// The failed Acknowledgement holds up no update behind it.
-	if updates, err := db.UnprocessedUpdates(ctx); err != nil || len(updates) != 0 {
+	if updates, err := db.GetUnprocessedUpdates(ctx); err != nil || len(updates) != 0 {
 		t.Errorf("unprocessed updates = %+v, %v; want none", updates, err)
 	}
 	if err := bot.CatchUp(ctx); err != nil {
@@ -300,12 +300,12 @@ func TestBot_ProcessInbox_RetryKeepsClassification(t *testing.T) {
 	if calls := len(classifier.gotTopics); calls != 1 {
 		t.Errorf("classified %d times, want once", calls)
 	}
-	thoughts, err := db.Thoughts(ctx)
+	thoughts, err := db.GetThoughts(ctx)
 	if err != nil || len(thoughts) != 1 {
-		t.Fatalf("Thoughts = %+v, %v; want 1", thoughts, err)
+		t.Fatalf("GetThoughts = %+v, %v; want 1", thoughts, err)
 	}
-	if classifications, err := db.Classifications(ctx, thoughts[0].ID); err != nil || len(classifications) != 1 {
-		t.Errorf("Classifications = %+v, %v; want 1", classifications, err)
+	if got, err := db.GetClassificationsByThoughtID(ctx, thoughts[0].ID); err != nil || len(got) != 1 {
+		t.Errorf("GetClassificationsByThoughtID = %+v, %v; want 1", got, err)
 	}
 	wantSent := []sentMessage{{ChatID: ownerID, Text: "💡 idea · running", ReplyToID: messageID}}
 	if sent := api.sentMessages(); !slices.Equal(sent, wantSent) {
@@ -365,8 +365,8 @@ func TestBot_ProcessInbox_IgnoresOtherChats(t *testing.T) {
 				t.Fatalf("ProcessInbox: %v", err)
 			}
 
-			if thoughts, err := db.Thoughts(ctx); err != nil || len(thoughts) != 0 {
-				t.Errorf("Thoughts = %+v, %v; want none", thoughts, err)
+			if thoughts, err := db.GetThoughts(ctx); err != nil || len(thoughts) != 0 {
+				t.Errorf("GetThoughts = %+v, %v; want none", thoughts, err)
 			}
 			if sent := api.sentMessages(); len(sent) != 0 {
 				t.Errorf("sent %+v, want nothing", sent)
@@ -374,7 +374,7 @@ func TestBot_ProcessInbox_IgnoresOtherChats(t *testing.T) {
 			if calls := len(classifier.gotTopics); calls != 0 {
 				t.Errorf("classified %d times, want never", calls)
 			}
-			if updates, err := db.UnprocessedUpdates(ctx); err != nil || len(updates) != 0 {
+			if updates, err := db.GetUnprocessedUpdates(ctx); err != nil || len(updates) != 0 {
 				t.Errorf("unprocessed updates = %+v, %v; want none", updates, err)
 			}
 		})
@@ -457,8 +457,8 @@ func TestBot_ProcessInbox_RepliesWithoutCapturing(t *testing.T) {
 			if len(sent) != 2 || sent[1] != wantReply {
 				t.Errorf("sent %+v, want the Acknowledgement and then %+v", sent, wantReply)
 			}
-			if got, err := db.Thoughts(ctx); err != nil || !reflect.DeepEqual(got, thoughts) {
-				t.Errorf("Thoughts = %+v, %v; want them unchanged: %+v", got, err, thoughts)
+			if got, err := db.GetThoughts(ctx); err != nil || !reflect.DeepEqual(got, thoughts) {
+				t.Errorf("GetThoughts = %+v, %v; want them unchanged: %+v", got, err, thoughts)
 			}
 			if calls := len(classifier.gotTopics); calls != 1 {
 				t.Errorf("classified %d times, want once, for the Thought", calls)
@@ -467,7 +467,7 @@ func TestBot_ProcessInbox_RepliesWithoutCapturing(t *testing.T) {
 			if got := updateIDs(t, file); !slices.Equal(got, []int64{messageID, commandID}) {
 				t.Errorf("inbox updates = %v, want %v", got, []int64{messageID, commandID})
 			}
-			if updates, err := db.UnprocessedUpdates(ctx); err != nil || len(updates) != 0 {
+			if updates, err := db.GetUnprocessedUpdates(ctx); err != nil || len(updates) != 0 {
 				t.Errorf("unprocessed updates = %+v, %v; want none", updates, err)
 			}
 		})
@@ -490,8 +490,8 @@ func TestBot_Process_SafeToRepeat(t *testing.T) {
 		}
 	}
 
-	if thoughts, err := db.Thoughts(ctx); err != nil || len(thoughts) != 1 {
-		t.Errorf("Thoughts = %+v, %v; want 1", thoughts, err)
+	if thoughts, err := db.GetThoughts(ctx); err != nil || len(thoughts) != 1 {
+		t.Errorf("GetThoughts = %+v, %v; want 1", thoughts, err)
 	}
 	if sent := api.sentMessages(); len(sent) != 1 {
 		t.Errorf("sent %+v, want 1 Acknowledgement", sent)

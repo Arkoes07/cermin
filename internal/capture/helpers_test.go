@@ -56,12 +56,7 @@ func newBotAt(t *testing.T, classify capture.ClassifyFunc, path string) (*captur
 		}
 	})
 
-	bot := capture.New(
-		db,
-		telegram.New(srv.URL, botToken),
-		ownerID,
-		classify,
-	)
+	bot := capture.New(db, telegram.New(srv.URL, botToken), ownerID, classify)
 	return bot, db, api
 }
 
@@ -70,9 +65,9 @@ func newBotAt(t *testing.T, classify capture.ClassifyFunc, path string) (*captur
 func captureQueued(t *testing.T, bot *capture.Bot, db *sqlite.DB) cermin.Thought {
 	t.Helper()
 	processQueued(t, bot)
-	thoughts, err := db.Thoughts(t.Context())
+	thoughts, err := db.GetThoughts(t.Context())
 	if err != nil || len(thoughts) == 0 {
-		t.Fatalf("Thoughts = %+v, %v; want some", thoughts, err)
+		t.Fatalf("GetThoughts = %+v, %v; want some", thoughts, err)
 	}
 	return thoughts[len(thoughts)-1]
 }
@@ -95,7 +90,7 @@ func pollUpdate(t *testing.T, bot *capture.Bot, db *sqlite.DB) sqlite.InboxUpdat
 	if err := bot.Poll(t.Context()); err != nil {
 		t.Fatalf("Poll: %v", err)
 	}
-	updates, err := db.UnprocessedUpdates(t.Context())
+	updates, err := db.GetUnprocessedUpdates(t.Context())
 	if err != nil || len(updates) != 1 {
 		t.Fatalf("unprocessed updates = %+v, %v; want 1", updates, err)
 	}
@@ -120,9 +115,9 @@ func classificationsOf(t *testing.T, db *sqlite.DB, thoughts []cermin.Thought) [
 	t.Helper()
 	all := make([][]cermin.Classification, 0, len(thoughts))
 	for _, thought := range thoughts {
-		classifications, err := db.Classifications(t.Context(), thought.ID)
+		classifications, err := db.GetClassificationsByThoughtID(t.Context(), thought.ID)
 		if err != nil {
-			t.Fatalf("Classifications: %v", err)
+			t.Fatalf("GetClassificationsByThoughtID: %v", err)
 		}
 		all = append(all, classifications)
 	}

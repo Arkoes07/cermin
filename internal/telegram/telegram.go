@@ -36,7 +36,10 @@ func New(apiURL, token string) *Client {
 	return &Client{apiURL: apiURL, token: token}
 }
 
-// Update is an incoming update.
+// Update is one event the Bot API reports, with its own update_id. Cermin
+// doesn't ask for particular kinds, so it gets the default set: a new
+// message, an edit of one, and other kinds that it only marks processed,
+// such as my_chat_member when you block the bot.
 type Update struct {
 	ID            int64           `json:"update_id"`
 	Message       *Message        `json:"message"`        // nil for other kinds of update, such as edits
@@ -165,12 +168,12 @@ func (c *Client) call(ctx context.Context, method string, params, result any) er
 	endpoint := c.apiURL + "/bot" + c.token + "/" + method
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("telegram: %s: %w", method, withoutURL(err))
+		return fmt.Errorf("telegram: %s: %w", method, stripURL(err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("telegram: %s: %w", method, withoutURL(err))
+		return fmt.Errorf("telegram: %s: %w", method, stripURL(err))
 	}
 	defer resp.Body.Close()
 
@@ -202,9 +205,9 @@ func (e *apiError) Error() string {
 	return fmt.Sprintf("telegram: %s: status %d: %s", e.method, e.status, e.description)
 }
 
-// withoutURL drops the request URL from err, because the URL carries the bot
+// stripURL drops the request URL from err, because the URL carries the bot
 // token.
-func withoutURL(err error) error {
+func stripURL(err error) error {
 	if urlErr, ok := errors.AsType[*url.Error](err); ok {
 		return urlErr.Err
 	}

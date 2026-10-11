@@ -44,9 +44,9 @@ func TestBot_CatchUp_ClassifiesOnceClassifierRecovers(t *testing.T) {
 	if gotTimeout <= 8*time.Second || gotTimeout > 60*time.Second {
 		t.Errorf("classified with %v left, want more than Capture's 8s and at most 60s", gotTimeout)
 	}
-	classifications, err := db.Classifications(ctx, thought.ID)
+	classifications, err := db.GetClassificationsByThoughtID(ctx, thought.ID)
 	if err != nil || len(classifications) != 1 {
-		t.Fatalf("Classifications = %+v, %v; want 1", classifications, err)
+		t.Fatalf("GetClassificationsByThoughtID = %+v, %v; want 1", classifications, err)
 	}
 	wantSent := []sentMessage{{ChatID: ownerID, Text: "✓ saved", ReplyToID: messageID}}
 	if sent := api.sentMessages(); !slices.Equal(sent, wantSent) {
@@ -85,8 +85,8 @@ func TestBot_CatchUp_RetriesLateClassificationEdit(t *testing.T) {
 	if edits := api.editedMessages(); !slices.Equal(edits, wantEdits) {
 		t.Errorf("edited %+v, want %+v", edits, wantEdits)
 	}
-	if classifications, err := db.Classifications(ctx, thought.ID); err != nil || len(classifications) != 1 {
-		t.Errorf("Classifications = %+v, %v; want 1", classifications, err)
+	if got, err := db.GetClassificationsByThoughtID(ctx, thought.ID); err != nil || len(got) != 1 {
+		t.Errorf("GetClassificationsByThoughtID = %+v, %v; want 1", got, err)
 	}
 	if calls := len(classifier.gotTopics); calls != 2 {
 		t.Errorf("classified %d times, want twice: at Capture and by the first CatchUp", calls)
@@ -117,9 +117,13 @@ func TestBot_CatchUp_LeavesDeletedAcknowledgementDeleted(t *testing.T) {
 	if sent := api.sentMessages(); len(sent) != 1 {
 		t.Errorf("sent %+v, want only the Acknowledgement, and none to replace it", sent)
 	}
-	classifications, err := db.Classifications(ctx, thought.ID)
+	classifications, err := db.GetClassificationsByThoughtID(ctx, thought.ID)
 	if err != nil || len(classifications) != 2 || classifications[1].Kind != "plan" {
-		t.Errorf("Classifications = %+v, %v; want Cermin's and the Correction to plan", classifications, err)
+		t.Errorf(
+			"GetClassificationsByThoughtID = %+v, %v; want Cermin's and the Correction to plan",
+			classifications,
+			err,
+		)
 	}
 }
 
@@ -234,11 +238,11 @@ func TestBot_CatchUp_RetriesFailedClassification(t *testing.T) {
 			// A day apart, so the Thought is due at each catch-up however
 			// long the one before postponed it.
 			catchUpEvery(t, bot, &now, 24*time.Hour, 1)
-			if classifications, err := db.Classifications(ctx, thought.ID); err != nil || len(classifications) != 0 {
-				t.Errorf("Classifications = %+v, %v; want none", classifications, err)
+			if got, err := db.GetClassificationsByThoughtID(ctx, thought.ID); err != nil || len(got) != 0 {
+				t.Errorf("GetClassificationsByThoughtID = %+v, %v; want none", got, err)
 			}
-			if topics, err := db.TopicNames(ctx); err != nil || len(topics) != 0 {
-				t.Errorf("TopicNames = %q, %v; want none", topics, err)
+			if topics, err := db.GetTopicNames(ctx); err != nil || len(topics) != 0 {
+				t.Errorf("GetTopicNames = %q, %v; want none", topics, err)
 			}
 			if edits := api.editedMessages(); len(edits) != 0 {
 				t.Errorf("edited %+v, want nothing", edits)
@@ -248,8 +252,8 @@ func TestBot_CatchUp_RetriesFailedClassification(t *testing.T) {
 
 	classifier.err, classifier.kind, classifier.candidates = nil, "", running
 	catchUpEvery(t, bot, &now, 24*time.Hour, 2)
-	if classifications, err := db.Classifications(ctx, thought.ID); err != nil || len(classifications) != 1 {
-		t.Errorf("Classifications = %+v, %v; want 1", classifications, err)
+	if got, err := db.GetClassificationsByThoughtID(ctx, thought.ID); err != nil || len(got) != 1 {
+		t.Errorf("GetClassificationsByThoughtID = %+v, %v; want 1", got, err)
 	}
 	wantEdits := []editedMessage{{ChatID: ownerID, MessageID: 1001, Text: "💡 idea · running"}}
 	if edits := api.editedMessages(); !slices.Equal(edits, wantEdits) {
@@ -300,7 +304,10 @@ func TestBot_CatchUp_BacksOffFromThoughtClassifierAlwaysFailsOn(t *testing.T) {
 	classifier.gotTopics = nil // Capture's call doesn't count
 	catchUpEvery(t, bot, &now, time.Minute, 24*60)
 	if calls := len(classifier.gotTopics); calls != 11 {
-		t.Errorf("classified %d times in the first 24 hours, want 11, waiting 1, 2, 4 … 512 minutes between them", calls)
+		t.Errorf(
+			"classified %d times in the first 24 hours, want 11, waiting 1, 2, 4 … 512 minutes between them",
+			calls,
+		)
 	}
 	catchUpEvery(t, bot, &now, time.Minute, 24*60)
 	if calls := len(classifier.gotTopics); calls != 12 {
@@ -341,13 +348,17 @@ func TestBot_CatchUp_ClassifiesWithinAnHourOfOutageEnding(t *testing.T) {
 		catchUpEvery(t, bot, &now, time.Minute, 1)
 	}
 
-	thoughts, err := db.Thoughts(ctx)
+	thoughts, err := db.GetThoughts(ctx)
 	if err != nil || len(thoughts) != 3 {
-		t.Fatalf("Thoughts = %+v, %v; want 3", thoughts, err)
+		t.Fatalf("GetThoughts = %+v, %v; want 3", thoughts, err)
 	}
 	for i, classifications := range classificationsOf(t, db, thoughts) {
 		if len(classifications) != 1 {
-			t.Errorf("Thought %d has %d Classifications an hour after the outage, want 1", thoughts[i].ID, len(classifications))
+			t.Errorf(
+				"Thought %d has %d Classifications an hour after the outage, want 1",
+				thoughts[i].ID,
+				len(classifications),
+			)
 		}
 	}
 	if calls := len(classifier.gotTopics); calls != 3 {
@@ -384,16 +395,13 @@ func TestBot_CatchUp_ClassifiesNewThoughtBehind20Failing(t *testing.T) {
 			"text":       "Run " + strconv.Itoa(i+1) + " km on Saturday.",
 		}))
 	}
-	api.queue(update(t, "message", ownerID, map[string]any{
-		"message_id": messageID + 20,
-		"text":       newText,
-	}))
+	api.queue(update(t, "message", ownerID, map[string]any{"message_id": messageID + 20, "text": newText}))
 	newThought := captureQueued(t, bot, db)
 
 	classifier.err = nil
 	catchUpEvery(t, bot, &now, time.Minute, 3)
-	if classifications, err := db.Classifications(ctx, newThought.ID); err != nil || len(classifications) != 1 {
-		t.Errorf("Classifications of the new Thought after 3 catch-ups = %+v, %v; want 1", classifications, err)
+	if got, err := db.GetClassificationsByThoughtID(ctx, newThought.ID); err != nil || len(got) != 1 {
+		t.Errorf("GetClassificationsByThoughtID of the new Thought after 3 catch-ups = %+v, %v; want 1", got, err)
 	}
 }
 
@@ -445,20 +453,20 @@ func TestBot_CatchUp_KeepsClassificationMadeMeanwhile(t *testing.T) {
 		t.Fatalf("CatchUp: %v", err)
 	}
 
-	thoughts, err := db.Thoughts(ctx)
+	thoughts, err := db.GetThoughts(ctx)
 	if err != nil || len(thoughts) != 1 {
-		t.Fatalf("Thoughts = %+v, %v; want 1", thoughts, err)
+		t.Fatalf("GetThoughts = %+v, %v; want 1", thoughts, err)
 	}
-	classifications, err := db.Classifications(ctx, thoughts[0].ID)
+	classifications, err := db.GetClassificationsByThoughtID(ctx, thoughts[0].ID)
 	if err != nil || len(classifications) != 1 {
-		t.Fatalf("Classifications = %+v, %v; want 1", classifications, err)
+		t.Fatalf("GetClassificationsByThoughtID = %+v, %v; want 1", classifications, err)
 	}
 	wantTopics := []cermin.TopicCandidate{{Name: "running", Confidence: 0.9, Kept: true}}
 	if got := classifications[0].Topics; !slices.Equal(got, wantTopics) {
 		t.Errorf("kept the Classification with Topics %+v, want the Capture's %+v", got, wantTopics)
 	}
-	if topics, err := db.TopicNames(ctx); err != nil || !slices.Equal(topics, []string{"running"}) {
-		t.Errorf("TopicNames = %q, %v; want running only", topics, err)
+	if topics, err := db.GetTopicNames(ctx); err != nil || !slices.Equal(topics, []string{"running"}) {
+		t.Errorf("GetTopicNames = %q, %v; want running only", topics, err)
 	}
 	wantSent := []sentMessage{{ChatID: ownerID, Text: "💡 idea · running", ReplyToID: messageID}}
 	if sent := api.sentMessages(); !slices.Equal(sent, wantSent) {
@@ -555,9 +563,9 @@ func TestBot_CatchUp_DropsClassificationOfThoughtDeletedMeanwhile(t *testing.T) 
 		t.Fatalf("CatchUp: %v", err)
 	}
 
-	thoughts, err := db.Thoughts(ctx)
+	thoughts, err := db.GetThoughts(ctx)
 	if err != nil || len(thoughts) != 1 {
-		t.Fatalf("Thoughts = %+v, %v; want only the new one", thoughts, err)
+		t.Fatalf("GetThoughts = %+v, %v; want only the new one", thoughts, err)
 	}
 	// Were the deleted Thought's ID reused, the catch-up would find the new
 	// Thought under it, unclassified, and give it the deleted one's
@@ -565,11 +573,15 @@ func TestBot_CatchUp_DropsClassificationOfThoughtDeletedMeanwhile(t *testing.T) 
 	if thoughts[0].ID == deleted.ID {
 		t.Errorf("new Thought has the deleted Thought's ID %d, want a new one", deleted.ID)
 	}
-	if got, err := db.Classifications(ctx, thoughts[0].ID); err != nil || len(got) != 0 {
-		t.Errorf("Classifications of the new Thought = %+v, %v; want none, not the deleted Thought's", got, err)
+	if got, err := db.GetClassificationsByThoughtID(ctx, thoughts[0].ID); err != nil || len(got) != 0 {
+		t.Errorf(
+			"GetClassificationsByThoughtID of the new Thought = %+v, %v; want none, not the deleted Thought's",
+			got,
+			err,
+		)
 	}
-	if topics, err := db.TopicNames(ctx); err != nil || len(topics) != 0 {
-		t.Errorf("TopicNames = %q, %v; want none", topics, err)
+	if topics, err := db.GetTopicNames(ctx); err != nil || len(topics) != 0 {
+		t.Errorf("GetTopicNames = %q, %v; want none", topics, err)
 	}
 	wantEdits := []editedMessage{{ChatID: ownerID, MessageID: ackID, Text: "🗑 deleted"}}
 	if edits := api.editedMessages(); !slices.Equal(edits, wantEdits) {

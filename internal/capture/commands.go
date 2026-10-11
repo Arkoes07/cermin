@@ -42,38 +42,16 @@ func (b *Bot) runCommand(ctx context.Context, updateID int64, m *telegram.Messag
 		correctKind := func(c cermin.Classification) (cermin.Classification, bool) {
 			return c.CorrectKind(args, kinds)
 		}
-		return b.correct(
-			ctx,
-			updateID,
-			m,
-			kindUsage(kinds),
-			correctKind,
-		)
+		return b.correct(ctx, updateID, m, formatKindUsage(kinds), correctKind)
 	case "/topics":
 		correctTopics := func(c cermin.Classification) (cermin.Classification, bool) {
 			return c.CorrectTopics(strings.Split(args, ","))
 		}
-		return b.correct(
-			ctx,
-			updateID,
-			m,
-			topicsUsage,
-			correctTopics,
-		)
+		return b.correct(ctx, updateID, m, topicsUsage, correctTopics)
 	case "/start", "/help":
-		return b.replyAndMarkProcessed(
-			ctx,
-			updateID,
-			m,
-			helpReply,
-		)
+		return b.replyAndMarkProcessed(ctx, updateID, m, helpReply)
 	default:
-		return b.replyAndMarkProcessed(
-			ctx,
-			updateID,
-			m,
-			unknownCommandReply,
-		)
+		return b.replyAndMarkProcessed(ctx, updateID, m, unknownCommandReply)
 	}
 }
 
@@ -96,30 +74,22 @@ func (b *Bot) correct(
 	defer b.mu.Unlock()
 	// A message that isn't a reply has ReplyToID 0, which no Thought's messages
 	// have.
-	thought, isFound, err := b.db.ThoughtByMessage(ctx, m.ReplyToID())
+	thought, isFound, err := b.db.GetThoughtByMessageID(ctx, m.ReplyToID())
 	if err != nil {
 		return err
 	}
 	if !isFound {
-		return b.replyAndMarkProcessed(
-			ctx,
-			updateID,
-			m,
-			usage,
-		)
+		return b.replyAndMarkProcessed(ctx, updateID, m, usage)
 	}
-	current, isClassified, err := b.db.CurrentClassification(ctx, thought.ID)
+
+	current, isClassified, err := b.db.GetCurrentClassificationByThoughtID(ctx, thought.ID)
 	if err != nil {
 		return err
 	}
 	if !isClassified {
-		return b.replyAndMarkProcessed(
-			ctx,
-			updateID,
-			m,
-			notReadyReply,
-		)
+		return b.replyAndMarkProcessed(ctx, updateID, m, notReadyReply)
 	}
+
 	if current.TGMessageID == m.ID {
 		// Processed again after a crash, the Correction is current already.
 		return b.syncAckAndMarkProcessed(ctx, thought.ID, updateID)
@@ -127,12 +97,7 @@ func (b *Bot) correct(
 
 	correction, isValid := apply(current)
 	if !isValid {
-		return b.replyAndMarkProcessed(
-			ctx,
-			updateID,
-			m,
-			usage,
-		)
+		return b.replyAndMarkProcessed(ctx, updateID, m, usage)
 	}
 	correction.TGMessageID = m.ID
 	stored, err := b.db.SaveClassification(ctx, correction)
@@ -163,7 +128,7 @@ func (b *Bot) deleteThought(ctx context.Context, updateID int64, m *telegram.Mes
 	defer b.mu.Unlock()
 	// A message that isn't a reply has ReplyToID 0, which no Thought's messages
 	// have.
-	thought, isFound, err := b.db.ThoughtByMessage(ctx, m.ReplyToID())
+	thought, isFound, err := b.db.GetThoughtByMessageID(ctx, m.ReplyToID())
 	if err != nil {
 		return err
 	}
@@ -184,20 +149,16 @@ func (b *Bot) deleteThought(ctx context.Context, updateID int64, m *telegram.Mes
 	// ponytail: a failed edit, or a crash before it, leaves the
 	// Acknowledgement showing the deleted Thought's Kind and Topics; record
 	// the pending edit in the delete's transaction if that ever happens.
-	err = b.tg.EditMessageText(
-		context.WithoutCancel(ctx),
-		b.ownerID,
-		thought.AckMessageID,
-		deletedAck,
-	)
+	err = b.tg.EditMessageText(context.WithoutCancel(ctx), b.ownerID, thought.AckMessageID, deletedAck)
 	if err != nil {
 		slog.WarnContext(ctx, "showing deletion", "thought_id", thought.ID, "err", err)
 	}
 	return nil
 }
 
-// kindUsage is the reply to a /kind that can't be run, listing kinds.
-func kindUsage(kinds []cermin.Kind) string {
+// formatKindUsage returns the reply to a /kind that can't be run, listing
+// kinds.
+func formatKindUsage(kinds []cermin.Kind) string {
 	names := make([]string, 0, len(kinds))
 	for _, k := range kinds {
 		names = append(names, k.Name)

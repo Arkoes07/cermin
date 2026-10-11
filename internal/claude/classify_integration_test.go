@@ -38,12 +38,7 @@ func TestClassifier_Classify(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			start := time.Now()
-			c, err := classifier.Classify(
-				t.Context(),
-				tt.text,
-				kinds,
-				[]string{"business", "transport"},
-			)
+			c, err := classifier.Classify(t.Context(), tt.text, kinds, []string{"business", "transport"})
 			if err != nil {
 				t.Fatalf("Classify: %v", err)
 			}
@@ -106,12 +101,7 @@ func TestClassifier_TopicReuse(t *testing.T) {
 	table.WriteString("| # | Group | Thought | Kind | Kept | Dropped |\n|---|---|---|---|---|---|\n")
 	timesKept := map[string]int{} // by Topic name
 	for i, thought := range thoughts {
-		c, err := classifier.Classify(
-			t.Context(),
-			thought.text,
-			kinds,
-			slices.Sorted(maps.Keys(timesKept)),
-		)
+		c, err := classifier.Classify(t.Context(), thought.text, kinds, slices.Sorted(maps.Keys(timesKept)))
 		if err != nil {
 			t.Fatalf("Classify thought %d: %v", i+1, err)
 		}
