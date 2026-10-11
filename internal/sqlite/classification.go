@@ -8,6 +8,9 @@ import (
 	"slices"
 	"time"
 
+	sqlitedriver "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
+
 	"github.com/arkoes07/cermin/internal/cermin"
 )
 
@@ -40,12 +43,12 @@ func scanName(row scanner) (string, error) {
 }
 
 // SaveClassification stores c and returns it as stored. A kept candidate whose
-// Topic doesn't exist yet creates it, with origin cermin, or you for a
-// Correction. A candidate naming an existing Topic, in any case, takes that
-// Topic's spelling. A Correction's confidences are stored as NULL, since it
-// states none, and its language as NULL.
+// Topic doesn't exist yet creates it, with c.Source's Topic origin. A
+// candidate naming an existing Topic, in any case, takes that Topic's
+// spelling. The confidences are stored as NULL if c.Source states none, and
+// an empty language as NULL.
 func (db *DB) SaveClassification(ctx context.Context, c cermin.Classification) (cermin.Classification, error) {
-	stored, _, err := db.saveClassification(ctx, c, false)
+	stored, err := db.saveClassification(ctx, c)
 	if err != nil {
 		return cermin.Classification{}, fmt.Errorf("saving classification of thought %d: %w", c.ThoughtID, err)
 	}
@@ -54,14 +57,19 @@ func (db *DB) SaveClassification(ctx context.Context, c cermin.Classification) (
 
 // SaveFirstClassification stores Cermin's Classification c as
 // SaveClassification does, but only if its Thought exists and has no
-// Classification, and reports whether it did. So a Thought keeps the first
-// Classification Cermin gives it, even when two processes classify it at
-// once. It returns false and no error for a Thought deleted meanwhile.
+// Classification from Cermin, and reports whether it did. So a Thought keeps
+// the first Classification Cermin gives it, even when two processes classify
+// it at once. A Correction needs a Classification first, so until declared
+// Classifications arrive, a Thought with none from Cermin has none at all. It
+// returns false and no error for a Thought deleted meanwhile.
 func (db *DB) SaveFirstClassification(
 	ctx context.Context,
 	c cermin.Classification,
 ) (cermin.Classification, bool, error) {
-	stored, isSaved, err := db.saveClassification(ctx, c, true)
+	stored, err := db.saveClassification(ctx, c)
+	if isNotInserted(err) {
+		return cermin.Classification{}, false, nil
+	}
 	if err != nil {
 		return cermin.Classification{}, false, fmt.Errorf(
 			"saving first classification of thought %d: %w",
@@ -69,69 +77,64 @@ func (db *DB) SaveFirstClassification(
 			err,
 		)
 	}
-	return stored, isSaved, nil
+	return stored, true, nil
 }
 
-// saveClassification stores c, or if isFirst only while its Thought exists
-// and has no Classification, and reports whether it did.
-func (db *DB) saveClassification(
-	ctx context.Context,
-	c cermin.Classification,
-	isFirst bool,
-) (cermin.Classification, bool, error) {
+// isNotInserted reports whether err, from saveClassification, means its
+// Classification wasn't inserted: no row came back, since the Thought has
+// Cermin's Classification, or the insert failed a foreign key, since the
+// Thought is gone. No later step in saveClassification fails either way.
+func isNotInserted(err error) bool {
+	if errors.Is(err, sql.ErrNoRows) {
+		return true
+	}
+	sqliteErr, isSQLiteErr := errors.AsType[*sqlitedriver.Error](err)
+	return isSQLiteErr && sqliteErr.Code() == sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY
+}
+
+// saveClassification stores c and its candidate Topics in one transaction.
+func (db *DB) saveClassification(ctx context.Context, c cermin.Classification) (cermin.Classification, error) {
 	tx, err := db.pool.BeginTx(ctx, nil)
 	if err != nil {
-		return cermin.Classification{}, false, err
+		return cermin.Classification{}, err
 	}
 	defer tx.Rollback() //nolint:errcheck // after Commit it only returns sql.ErrTxDone
 
 	c.CreatedAt = time.Now().UTC().Truncate(time.Millisecond) // as stored
-	id, isSaved, err := insertClassification(ctx, tx, c, isFirst)
-	if err != nil || !isSaved {
-		return cermin.Classification{}, false, err
+	if c.ID, err = insertClassification(ctx, tx, c); err != nil {
+		return cermin.Classification{}, err
 	}
-	c.ID = id
 
 	if err := insertTopics(ctx, tx, c); err != nil {
-		return cermin.Classification{}, false, err
+		return cermin.Classification{}, err
 	}
 	if c.Topics, err = insertTopicCandidates(ctx, tx, c); err != nil {
-		return cermin.Classification{}, false, err
+		return cermin.Classification{}, err
 	}
 
 	if err := tx.Commit(); err != nil {
-		return cermin.Classification{}, false, err
+		return cermin.Classification{}, err
 	}
-	return c, true, nil
+	return c, nil
 }
 
 // insertClassification inserts c, without its candidate Topics, and returns
-// its ID. If isFirst, it inserts c only while its Thought exists and has no
-// Classification, and reports whether it did.
-func insertClassification(ctx context.Context, tx *sql.Tx, c cermin.Classification, isFirst bool) (int64, bool, error) {
-	// A Correction states no confidence.
-	isCorrection := c.Source == cermin.SourceCorrection
-	// isFirst's condition is checked in the INSERT itself, so that no other
-	// process can write between the check and the write. Checked in a read
-	// before it, another process's write would fail this transaction with
-	// SQLITE_BUSY_SNAPSHOT, which busy_timeout doesn't retry. No row back
-	// means not saved.
+// its ID. It returns sql.ErrNoRows, and inserts nothing, for Cermin's
+// Classification of a Thought that has one.
+func insertClassification(ctx context.Context, tx *sql.Tx, c cermin.Classification) (int64, error) {
 	var id int64
 	err := tx.QueryRowContext(ctx, `
 		INSERT INTO classifications (thought_id, source, kind, kind_confidence, model, prompt_version,
 			confidence_method, raw_output, language, tg_message_id, created_at)
-		SELECT :thought_id, :source, :kind, :kind_confidence, NULLIF(:model, ''), NULLIF(:prompt_version, ''),
+		VALUES (:thought_id, :source, :kind, :kind_confidence, NULLIF(:model, ''), NULLIF(:prompt_version, ''),
 			NULLIF(:confidence_method, ''), NULLIF(:raw_output, ''), NULLIF(:language, ''),
-			NULLIF(:tg_message_id, 0), :created_at
-		WHERE NOT :is_first OR (
-			EXISTS (SELECT 1 FROM thoughts WHERE id = :thought_id)
-			AND NOT EXISTS (SELECT 1 FROM classifications WHERE thought_id = :thought_id)
-		)
+			NULLIF(:tg_message_id, 0), :created_at)
+		ON CONFLICT DO NOTHING
 		RETURNING id`,
 		sql.Named("thought_id", c.ThoughtID),
 		sql.Named("source", c.Source),
 		sql.Named("kind", c.Kind),
-		sql.Named("kind_confidence", sql.Null[float64]{V: c.KindConfidence, Valid: !isCorrection}),
+		sql.Named("kind_confidence", sql.Null[float64]{V: c.KindConfidence, Valid: c.Source.HasConfidence()}),
 		sql.Named("model", c.Model),
 		sql.Named("prompt_version", c.PromptVersion),
 		sql.Named("confidence_method", c.ConfidenceMethod),
@@ -139,25 +142,13 @@ func insertClassification(ctx context.Context, tx *sql.Tx, c cermin.Classificati
 		sql.Named("language", c.Language),
 		sql.Named("tg_message_id", c.TGMessageID),
 		sql.Named("created_at", formatTime(c.CreatedAt)),
-		sql.Named("is_first", isFirst),
 	).Scan(&id)
-	if isFirst && errors.Is(err, sql.ErrNoRows) {
-		return 0, false, nil
-	}
-	if err != nil {
-		return 0, false, err
-	}
-	return id, true, nil
+	return id, err
 }
 
 // insertTopics creates the Topics that c's kept candidates name and that
-// don't exist yet, with origin cermin, or you for a Correction.
+// don't exist yet, with c.Source's Topic origin.
 func insertTopics(ctx context.Context, tx *sql.Tx, c cermin.Classification) error {
-	// A Correction is yours, and so is a Topic it names first.
-	origin := "cermin"
-	if c.Source == cermin.SourceCorrection {
-		origin = "you"
-	}
 	for _, t := range c.Topics {
 		if !t.Kept {
 			continue
@@ -166,7 +157,7 @@ func insertTopics(ctx context.Context, tx *sql.Tx, c cermin.Classification) erro
 			INSERT INTO topics (name, origin, created_at) VALUES (:name, :origin, :created_at)
 			ON CONFLICT (name) DO NOTHING`,
 			sql.Named("name", t.Name),
-			sql.Named("origin", origin),
+			sql.Named("origin", c.Source.TopicOrigin()),
 			sql.Named("created_at", formatTime(c.CreatedAt)),
 		)
 		if err != nil {
@@ -180,8 +171,6 @@ func insertTopics(ctx context.Context, tx *sql.Tx, c cermin.Classification) erro
 // Classification c.ID and returns them as stored. A candidate naming an
 // existing Topic, in any case, takes that Topic's spelling.
 func insertTopicCandidates(ctx context.Context, tx *sql.Tx, c cermin.Classification) ([]cermin.TopicCandidate, error) {
-	// A Correction states no confidence.
-	isCorrection := c.Source == cermin.SourceCorrection
 	topics := make([]cermin.TopicCandidate, 0, len(c.Topics))
 	for _, t := range c.Topics {
 		// ponytail: a kept name matching an archived Topic is assigned to it;
@@ -194,7 +183,7 @@ func insertTopicCandidates(ctx context.Context, tx *sql.Tx, c cermin.Classificat
 			RETURNING topic_name`,
 			sql.Named("classification_id", c.ID),
 			sql.Named("name", t.Name),
-			sql.Named("confidence", sql.Null[float64]{V: t.Confidence, Valid: !isCorrection}),
+			sql.Named("confidence", sql.Null[float64]{V: t.Confidence, Valid: c.Source.HasConfidence()}),
 			sql.Named("kept", t.Kept),
 		).Scan(&t.Name)
 		if err != nil {

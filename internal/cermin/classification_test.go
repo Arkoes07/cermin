@@ -8,6 +8,44 @@ import (
 	"github.com/arkoes07/cermin/internal/cermin"
 )
 
+func TestSource_TopicOrigin(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		source cermin.Source
+		want   cermin.TopicOrigin
+	}{
+		{source: cermin.SourceCermin, want: cermin.OriginCermin},
+		{source: cermin.SourceCorrection, want: cermin.OriginYou},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.source), func(t *testing.T) {
+			t.Parallel()
+			if got := tt.source.TopicOrigin(); got != tt.want {
+				t.Errorf("Source(%q).TopicOrigin() = %q, want %q", tt.source, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSource_HasConfidence(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		source cermin.Source
+		want   bool
+	}{
+		{source: cermin.SourceCermin, want: true},
+		{source: cermin.SourceCorrection, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.source), func(t *testing.T) {
+			t.Parallel()
+			if got := tt.source.HasConfidence(); got != tt.want {
+				t.Errorf("Source(%q).HasConfidence() = %t, want %t", tt.source, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestKeepTopics(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

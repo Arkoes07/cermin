@@ -49,6 +49,9 @@ CREATE TABLE classifications (
     ))
 );
 
+-- A Thought keeps the first Classification Cermin gives it (#15).
+CREATE UNIQUE INDEX classifications_one_cermin ON classifications (thought_id) WHERE source = 'cermin';
+
 -- Every candidate Topic of a Classification, in order, best first. Dropped
 -- candidates are kept here by name only and never get a topics row.
 CREATE TABLE classification_topics (

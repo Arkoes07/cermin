@@ -141,6 +141,7 @@ func TestDB_SaveFirstClassification(t *testing.T) {
 				Kind:   "plan",
 				Topics: []cermin.TopicCandidate{{Name: "running", Kept: true}},
 			},
+			wantSaved: true,
 		},
 		{
 			name:      "deleted",

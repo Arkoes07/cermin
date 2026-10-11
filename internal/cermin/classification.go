@@ -32,6 +32,31 @@ const (
 	SourceCorrection Source = "correction"
 )
 
+// TopicOrigin is who named a Topic first.
+type TopicOrigin string
+
+const (
+	// OriginCermin is a Topic that Cermin named first.
+	OriginCermin TopicOrigin = "cermin"
+	// OriginYou is a Topic that you named first, in a Correction.
+	OriginYou TopicOrigin = "you"
+)
+
+// TopicOrigin returns the origin of a Topic that a Classification from s
+// names first: a Correction is yours, and so is a Topic it names first.
+func (s Source) TopicOrigin() TopicOrigin {
+	if s == SourceCorrection {
+		return OriginYou
+	}
+	return OriginCermin
+}
+
+// HasConfidence reports whether a Classification from s states confidences
+// for its Kind and Topics. Only Cermin's does.
+func (s Source) HasConfidence() bool {
+	return s == SourceCermin
+}
+
 // Classification is the Kind and Topics a Thought was given at one moment, by
 // Cermin or in a Correction.
 type Classification struct {
