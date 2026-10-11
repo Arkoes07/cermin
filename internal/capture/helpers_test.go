@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -337,20 +338,22 @@ type editedMessage struct {
 type fakeBotAPI struct {
 	mu               sync.Mutex
 	updates          []string
+	heldPolls        chan struct{} // told of each getUpdates held for want of updates; nil if none is held
 	actions          []string
 	sent             []sentMessage
 	edits            []editedMessage
 	refused          []editedMessage // edits of deleted messages
 	deleted          []int64         // the IDs of the messages you deleted
-	isNextSendFailed bool
+	sendsToFail      int
 	isNextEditFailed bool
 }
 
-// failNextSend makes the next sendMessage fail, sending nothing.
+// failNextSend makes the next sendMessage that isn't failing yet fail,
+// sending nothing.
 func (f *fakeBotAPI) failNextSend() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.isNextSendFailed = true
+	f.sendsToFail++
 }
 
 // failNextEdit makes the next editMessageText fail, as on a Telegram outage,
@@ -367,6 +370,16 @@ func (f *fakeBotAPI) deleteMessage(id int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deleted = append(f.deleted, id)
+}
+
+// holdEmptyPolls makes each later getUpdates that finds no update queued
+// wait, as a long poll does, until its request ends. The channel it returns
+// is told of each such wait as it starts, unless it holds an earlier one.
+func (f *fakeBotAPI) holdEmptyPolls() <-chan struct{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.heldPolls = make(chan struct{}, 1)
+	return f.heldPolls
 }
 
 func (f *fakeBotAPI) queue(update string) {
@@ -401,11 +414,24 @@ func (f *fakeBotAPI) refusedEdits() []editedMessage {
 
 func (f *fakeBotAPI) handler(t *testing.T) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /bot"+botToken+"/getUpdates", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("POST /bot"+botToken+"/getUpdates", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		updates := f.updates
 		f.updates = nil
+		heldPolls := f.heldPolls
 		f.mu.Unlock()
+		if len(updates) == 0 && heldPolls != nil {
+			// Read to the end, so that the server notices the client leave.
+			if _, err := io.Copy(io.Discard, r.Body); err != nil {
+				t.Errorf("reading getUpdates: %v", err)
+			}
+			select {
+			case heldPolls <- struct{}{}:
+			default:
+			}
+			<-r.Context().Done()
+			return
+		}
 		writeResult(t, w, "["+strings.Join(updates, ",")+"]")
 	})
 	mux.HandleFunc("POST /bot"+botToken+"/sendChatAction", func(w http.ResponseWriter, r *http.Request) {
@@ -436,8 +462,8 @@ func (f *fakeBotAPI) handler(t *testing.T) http.Handler {
 			t.Errorf("sendMessage with parse_mode %q, want plain text", *req.ParseMode)
 		}
 		f.mu.Lock()
-		if f.isNextSendFailed {
-			f.isNextSendFailed = false
+		if f.sendsToFail > 0 {
+			f.sendsToFail--
 			f.mu.Unlock()
 			w.WriteHeader(http.StatusInternalServerError)
 			writeJSON(t, w, `{"ok":false,"error_code":500,"description":"Internal Server Error"}`)

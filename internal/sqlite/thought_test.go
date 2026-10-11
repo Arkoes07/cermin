@@ -25,7 +25,7 @@ func TestDB_DeleteThought_KeepsIDsUnused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SaveClassification: %v", err)
 	}
-	if err := db.DeleteThought(ctx, deletedThought.ID); err != nil {
+	if err := db.DeleteThought(ctx, deletedThought.ID, 0); err != nil {
 		t.Fatalf("DeleteThought: %v", err)
 	}
 

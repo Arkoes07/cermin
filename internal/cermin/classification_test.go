@@ -51,6 +51,7 @@ func TestKeepTopics(t *testing.T) {
 	tests := []struct {
 		name       string
 		candidates []cermin.TopicCandidate
+		archived   []string
 		want       []cermin.TopicCandidate
 	}{
 		{
@@ -104,6 +105,42 @@ func TestKeepTopics(t *testing.T) {
 			},
 		},
 		{
+			name: "archived never kept, next best kept in its place",
+			candidates: []cermin.TopicCandidate{
+				{Name: "a", Confidence: 0.95},
+				{Name: "b", Confidence: 0.9},
+				{Name: "c", Confidence: 0.8},
+				{Name: "d", Confidence: 0.75},
+				{Name: "e", Confidence: 0.7},
+			},
+			archived: []string{"A", "c"},
+			want: []cermin.TopicCandidate{
+				{Name: "a", Confidence: 0.95},
+				{Name: "b", Confidence: 0.9, Kept: true},
+				{Name: "c", Confidence: 0.8},
+				{Name: "d", Confidence: 0.75, Kept: true},
+				{Name: "e", Confidence: 0.7, Kept: true},
+			},
+		},
+		{
+			name: "best not archived kept below the threshold",
+			candidates: []cermin.TopicCandidate{
+				{Name: "retail", Confidence: 0.9},
+				{Name: "business", Confidence: 0.45},
+			},
+			archived: []string{"retail"},
+			want: []cermin.TopicCandidate{
+				{Name: "retail", Confidence: 0.9},
+				{Name: "business", Confidence: 0.45, Kept: true},
+			},
+		},
+		{
+			name:       "every candidate archived",
+			candidates: []cermin.TopicCandidate{{Name: "retail", Confidence: 0.9}},
+			archived:   []string{"retail"},
+			want:       []cermin.TopicCandidate{{Name: "retail", Confidence: 0.9}},
+		},
+		{
 			name:       "no candidates",
 			candidates: nil,
 			want:       nil,
@@ -113,9 +150,9 @@ func TestKeepTopics(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := cermin.KeepTopics(tt.candidates)
+			got := cermin.KeepTopics(tt.candidates, tt.archived)
 			if !slices.Equal(got, tt.want) {
-				t.Errorf("KeepTopics(%+v) = %+v, want %+v", tt.candidates, got, tt.want)
+				t.Errorf("KeepTopics(%+v, %q) = %+v, want %+v", tt.candidates, tt.archived, got, tt.want)
 			}
 		})
 	}

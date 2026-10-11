@@ -150,6 +150,33 @@ func TestBot_CatchUp_LeavesDeletedThoughtsAcknowledgement(t *testing.T) {
 	}
 }
 
+func TestBot_CatchUp_RetriesFailedDeletionEdit(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	bot, db, api := newBot(t, classifier.classify)
+	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
+	captureQueued(t, bot, db)
+
+	api.failNextEdit()
+	api.queue(commandUpdate(t, commandID, "/delete", messageID))
+	processQueued(t, bot)
+	if edits := api.editedMessages(); len(edits) != 0 {
+		t.Fatalf("edited %+v, want the edit failed", edits)
+	}
+
+	// The first catch-up makes the edit, and the second finds none to make.
+	for range 2 {
+		if err := bot.CatchUp(ctx); err != nil {
+			t.Fatalf("CatchUp: %v", err)
+		}
+	}
+	wantEdits := []editedMessage{{ChatID: ownerID, MessageID: ackID, Text: "🗑 deleted"}}
+	if edits := api.editedMessages(); !slices.Equal(edits, wantEdits) {
+		t.Errorf("edited %+v, want %+v", edits, wantEdits)
+	}
+}
+
 func TestBot_CatchUp_SendsMissingAcknowledgement(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -289,6 +316,34 @@ func TestBot_CatchUp_ClassifiesAtMost20(t *testing.T) {
 	}
 	if calls := len(classifier.gotTopics); calls != 21 {
 		t.Errorf("classified %d Thoughts after two CatchUps, want all 21", calls)
+	}
+}
+
+func TestBot_CatchUp_SyncsAtMost20Acknowledgements(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	bot, db, api := newBot(t, classifier.classify)
+	for i := range 21 {
+		api.failNextSend()
+		api.queue(update(t, "message", ownerID, map[string]any{
+			"message_id": messageID + i,
+			"text":       "Run " + strconv.Itoa(i+1) + " km on Saturday.",
+		}))
+	}
+	captureQueued(t, bot, db)
+
+	if err := bot.CatchUp(ctx); err != nil {
+		t.Fatalf("CatchUp: %v", err)
+	}
+	if sent := len(api.sentMessages()); sent != 20 {
+		t.Errorf("first CatchUp sent %d Acknowledgements, want 20", sent)
+	}
+	if err := bot.CatchUp(ctx); err != nil {
+		t.Fatalf("CatchUp again: %v", err)
+	}
+	if sent := len(api.sentMessages()); sent != 21 {
+		t.Errorf("sent %d Acknowledgements after two CatchUps, want all 21", sent)
 	}
 }
 

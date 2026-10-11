@@ -85,9 +85,11 @@ type TopicCandidate struct {
 
 // KeepTopics returns candidates best first, with the ones the Thought keeps
 // marked Kept: those at keepThreshold or above, at most maxKept of them, or
-// else the single best. Names are trimmed and lowercased first, and a blank or
-// repeated name is dropped, so no candidate names a Topic twice.
-func KeepTopics(candidates []TopicCandidate) []TopicCandidate {
+// else the single best. A candidate naming one of the archived Topics,
+// ignoring case, is never kept, and the others are kept as if it weren't
+// there. Names are trimmed and lowercased first, and a blank or repeated name
+// is dropped, so no candidate names a Topic twice.
+func KeepTopics(candidates []TopicCandidate, archived []string) []TopicCandidate {
 	sorted := make([]TopicCandidate, 0, len(candidates))
 	for _, c := range candidates {
 		c.Name = lowerName(c.Name)
@@ -99,17 +101,26 @@ func KeepTopics(candidates []TopicCandidate) []TopicCandidate {
 		return cmp.Compare(b.Confidence, a.Confidence)
 	})
 
+	isArchived := func(c TopicCandidate) bool {
+		return slices.ContainsFunc(archived, func(name string) bool { return lowerName(name) == c.Name })
+	}
 	unique := make([]TopicCandidate, 0, len(sorted))
+	kept := 0
 	for _, c := range sorted {
 		isRepeat := slices.ContainsFunc(unique, func(u TopicCandidate) bool { return u.Name == c.Name })
 		if isRepeat {
 			continue
 		}
-		c.Kept = len(unique) < maxKept && c.Confidence >= keepThreshold
+		c.Kept = kept < maxKept && c.Confidence >= keepThreshold && !isArchived(c)
+		if c.Kept {
+			kept++
+		}
 		unique = append(unique, c)
 	}
-	if len(unique) > 0 {
-		unique[0].Kept = true // the best is kept even below the threshold
+
+	// The best is kept even below the threshold.
+	if best := slices.IndexFunc(unique, func(c TopicCandidate) bool { return !isArchived(c) }); best >= 0 {
+		unique[best].Kept = true
 	}
 	return unique
 }

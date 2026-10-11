@@ -25,7 +25,8 @@ import (
 const (
 	// pollTimeout is how long one getUpdates call waits for an update.
 	pollTimeout = 50 * time.Second
-	// retryDelay is the pause after a failed poll.
+	// retryDelay is the pause after a failed poll, or a failure to process
+	// the inbox.
 	retryDelay = 5 * time.Second
 	// classifyTimeout is how long an Acknowledgement waits for the Thought's
 	// Classification before it goes out without one.
@@ -36,6 +37,11 @@ const (
 	textOnlyReply = "Text only for now."
 	// editReply is the reply to an edited message.
 	editReply = "Edits aren't saved. Send it as a new Thought."
+	// maxAttempts is how many times processing an update may begin before
+	// it is skipped.
+	maxAttempts = 5
+	// skippedReply tells the owner of an update skipped after maxAttempts.
+	skippedReply = "Couldn't process this message. It's kept for a replay."
 )
 
 // ClassifyFunc gives a Thought's text a Classification: one of kinds,
@@ -50,23 +56,28 @@ type ClassifyFunc func(
 
 // Bot moves Telegram updates into the inbox, captures the owner's Thoughts
 // and runs their Corrections and deletes from it, and catches up on the
-// Captures left unfinished. One goroutine at a time may call Poll, or Run,
-// which polls; the other methods are safe for concurrent use.
+// Captures left unfinished. One goroutine at a time may call Poll, and one may
+// call ProcessInbox or Process; Run does both. CatchUp is safe for concurrent
+// use.
 type Bot struct {
 	db       *sqlite.DB
 	tg       *telegram.Client
 	ownerID  int64
 	classify ClassifyFunc
-	offset   int64            // the next update_id to ask Telegram for
+	offset   int64            // the next update_id to ask Telegram for; only Poll uses it
 	timeNow  func() time.Time // time.Now, unless a test sets another clock
+
+	// repliedAlbumID is the media_group_id of the last album that got a
+	// reply. Only Process uses it, so it is lost on a restart.
+	repliedAlbumID string
 
 	// mu is held while a Thought is captured, corrected, deleted or caught up
 	// on, except while the catch-up waits for the classifier, so that two of
 	// them never act on the same Thought at once.
 	//
-	// ponytail: one lock for every Thought, held across Telegram calls, so a
-	// slow catch-up send or edit can delay a Capture by up to the send
-	// timeout; lock per Thought if Captures ever wait on it.
+	// ponytail: one lock for every Thought, so a Capture can wait for one
+	// catch-up Telegram call, up to 10s, before its classification starts;
+	// lock per Thought if that delay ever shows.
 	mu sync.Mutex
 }
 
@@ -82,27 +93,61 @@ func New(db *sqlite.DB, tg *telegram.Client, ownerID int64, classify ClassifyFun
 	}
 }
 
-// Run processes the inbox and polls Telegram for more, and catches up at
-// once and then every catchUpInterval in another goroutine, until ctx is
-// cancelled. Failures are logged and retried.
+// Run polls Telegram into the inbox in one goroutine, processes the inbox in
+// another, and catches up at once and then every catchUpInterval in a third,
+// until ctx is cancelled. So a backlog to process never holds up polling.
+// Failures are logged and retried.
 func (b *Bot) Run(ctx context.Context) {
 	var wg sync.WaitGroup
 	defer wg.Wait()
+	wake := make(chan struct{}, 1) // told of each poll that succeeds
+	wg.Go(func() { b.pollAndWake(ctx, wake) })
+	wg.Go(func() { b.processInboxOnWake(ctx, wake) })
 	wg.Go(func() { b.catchUpEveryInterval(ctx) })
+}
 
+// pollAndWake polls Telegram until ctx is cancelled, and wakes the processor
+// after each poll that succeeds. After a failure, it waits retryDelay.
+func (b *Bot) pollAndWake(ctx context.Context, wake chan<- struct{}) {
 	for ctx.Err() == nil {
-		// ponytail: polling waits while the inbox is processed; split them into
-		// two goroutines if processing gets slow enough to delay the inbox.
-		if err := b.ProcessInbox(ctx); err != nil && ctx.Err() == nil {
-			slog.ErrorContext(ctx, "processing inbox", "err", err)
-		}
-		if err := b.Poll(ctx); err != nil && ctx.Err() == nil {
-			slog.ErrorContext(ctx, "polling telegram", "err", err)
-			select {
-			case <-ctx.Done():
-			case <-time.After(retryDelay):
+		if err := b.Poll(ctx); err != nil {
+			if ctx.Err() == nil {
+				slog.ErrorContext(ctx, "polling telegram", "err", err)
 			}
+			waitOrCancel(ctx, retryDelay)
+			continue
 		}
+		select {
+		case wake <- struct{}{}:
+		default: // woken already, and yet to process
+		}
+	}
+}
+
+// processInboxOnWake processes the inbox at once and then each time it is
+// woken, until ctx is cancelled. After a failure, it tries again after
+// retryDelay.
+func (b *Bot) processInboxOnWake(ctx context.Context, wake <-chan struct{}) {
+	for ctx.Err() == nil {
+		if err := b.ProcessInbox(ctx); err != nil {
+			if ctx.Err() == nil {
+				slog.ErrorContext(ctx, "processing inbox", "err", err)
+			}
+			waitOrCancel(ctx, retryDelay)
+			continue
+		}
+		select {
+		case <-ctx.Done():
+		case <-wake:
+		}
+	}
+}
+
+// waitOrCancel returns once d has passed, or ctx is cancelled.
+func waitOrCancel(ctx context.Context, d time.Duration) {
+	select {
+	case <-ctx.Done():
+	case <-time.After(d):
 	}
 }
 
@@ -118,7 +163,6 @@ func (b *Bot) Poll(ctx context.Context) error {
 		// An edit carries the message's text too, so /delete must find it.
 		if m := cmp.Or(u.Message, u.EditedMessage); m != nil {
 			row.MessageID = m.ID
-			row.ReplyToMessageID = m.ReplyToID()
 		}
 		if err := b.db.SaveUpdate(ctx, row); err != nil {
 			return err
@@ -132,19 +176,50 @@ func (b *Bot) Poll(ctx context.Context) error {
 
 // ProcessInbox processes the unprocessed inbox updates in order. It stops at
 // the first failure, leaving that update and the ones after it for the next
-// call.
-//
-// ponytail: an update that always fails stalls the ones behind it; skip and
-// alert on it if that ever happens.
+// call. An update whose processing has begun maxAttempts times is skipped,
+// so that it never stalls the ones behind it.
 func (b *Bot) ProcessInbox(ctx context.Context) error {
 	updates, err := b.db.GetUnprocessedUpdates(ctx)
 	if err != nil {
 		return err
 	}
 	for _, in := range updates {
+		if in.Attempts >= maxAttempts {
+			if err := b.skipUpdate(ctx, in); err != nil {
+				return err
+			}
+			continue
+		}
+		// Counted first, so that a panic or a crash counts too.
+		if err := b.db.CountAttempt(ctx, in.ID); err != nil {
+			return err
+		}
 		if err := b.Process(ctx, in); err != nil {
 			return fmt.Errorf("processing update %d: %w", in.ID, err)
 		}
+	}
+	return nil
+}
+
+// skipUpdate marks update in failed, keeping it for a replay, logs an error,
+// and tells the owner, in reply to their message if in carries one. A failure
+// to tell them is logged.
+func (b *Bot) skipUpdate(ctx context.Context, in sqlite.InboxUpdate) error {
+	if err := b.db.MarkFailed(ctx, in.ID); err != nil {
+		return err
+	}
+	slog.ErrorContext(ctx, "update skipped", "update_id", in.ID, "attempts", in.Attempts)
+
+	// A payload that doesn't decode carries no message to reply to.
+	var replyToID int64
+	var update telegram.Update
+	if err := json.Unmarshal(in.Payload, &update); err == nil {
+		if m := b.findOwnerMessage(update); m != nil {
+			replyToID = m.ID
+		}
+	}
+	if _, err := b.tg.SendMessage(ctx, b.ownerID, skippedReply, replyToID); err != nil {
+		slog.WarnContext(ctx, "telling of skipped update", "update_id", in.ID, "err", err)
 	}
 	return nil
 }
@@ -153,36 +228,43 @@ func (b *Bot) ProcessInbox(ctx context.Context) error {
 // Thought, which is classified and gets an Acknowledgement, the owner's /kind
 // or /topics corrects one, and their /delete deletes one. The owner's edits,
 // messages with no text and other commands get a reply saying what Cermin
-// takes. Everyone else's updates are only marked processed.
+// takes, except service messages and an album's later photos. Those, and
+// everyone else's updates, are only marked processed.
 func (b *Bot) Process(ctx context.Context, in sqlite.InboxUpdate) error {
 	var update telegram.Update
 	if err := json.Unmarshal(in.Payload, &update); err != nil {
 		return fmt.Errorf("decoding: %w", err)
 	}
 
-	// Only the owner's messages in their private chat with the bot count: a
-	// message ID from another chat could clash with a captured Thought's.
-	// Their text is a Thought, unless it starts with /, which makes it a
+	// The owner's text is a Thought, unless it starts with /, which makes it a
 	// command. An edit changes nothing, not even a command.
-	m := cmp.Or(update.Message, update.EditedMessage)
-	isOwner := m != nil && m.From != nil && m.From.ID == b.ownerID
-	isPrivate := isOwner && m.Chat.ID == b.ownerID // a private chat's ID is the user's
+	m := b.findOwnerMessage(update)
 	switch {
-	case !isPrivate:
+	case m == nil:
 		slog.InfoContext(ctx, "update not captured", "update_id", in.ID)
 		return b.db.MarkProcessed(ctx, in.ID)
 	case update.EditedMessage != nil:
-		return b.replyAndMarkProcessed(ctx, in.ID, m, editReply)
+		return b.replyToEdit(ctx, in.ID, m)
 	case strings.HasPrefix(m.Text, "/"):
 		return b.runCommand(ctx, in.ID, m)
 	case m.Text == "":
-		// ponytail: each photo of an album gets this reply, and so does a
-		// service message such as your pin of a message; reply once per
-		// media_group_id and skip service messages if it ever matters.
-		return b.replyAndMarkProcessed(ctx, in.ID, m, textOnlyReply)
+		return b.replyToNonText(ctx, in.ID, m)
 	default:
 		return b.captureThought(ctx, in.ID, m)
 	}
+}
+
+// findOwnerMessage returns the message or edited message of update u if the
+// owner sent it in their private chat with the bot, and nil otherwise. Only
+// those count: a message ID from another chat could clash with a captured
+// Thought's.
+func (b *Bot) findOwnerMessage(u telegram.Update) *telegram.Message {
+	m := cmp.Or(u.Message, u.EditedMessage)
+	isOwner := m != nil && m.From != nil && m.From.ID == b.ownerID
+	if !isOwner || m.Chat.ID != b.ownerID { // a private chat's ID is the user's
+		return nil
+	}
+	return m
 }
 
 // captureThought captures the owner's text message m, sent in update
@@ -220,19 +302,50 @@ func (b *Bot) captureThought(ctx context.Context, updateID int64, m *telegram.Me
 	return b.syncAckAndMarkProcessed(ctx, thought.ID, updateID)
 }
 
-// reply sends text in reply to the owner's message m.
-func (b *Bot) reply(ctx context.Context, m *telegram.Message, text string) error {
-	_, err := b.tg.SendMessage(ctx, b.ownerID, text, m.ID)
-	return err
+// reply sends text in reply to the owner's message m, from update updateID. A
+// failure is logged and not retried, as a failed Acknowledgement is, so that
+// it never stalls the inbox.
+func (b *Bot) reply(ctx context.Context, updateID int64, m *telegram.Message, text string) {
+	if _, err := b.tg.SendMessage(ctx, b.ownerID, text, m.ID); err != nil {
+		slog.WarnContext(ctx, "replying", "update_id", updateID, "err", err)
+	}
 }
 
 // replyAndMarkProcessed sends text in reply to the owner's message m, and
 // marks update updateID, which carried it, processed.
 func (b *Bot) replyAndMarkProcessed(ctx context.Context, updateID int64, m *telegram.Message, text string) error {
-	if err := b.reply(ctx, m, text); err != nil {
+	b.reply(ctx, updateID, m, text)
+	return b.db.MarkProcessed(ctx, updateID)
+}
+
+// replyToEdit tells the owner, in reply to their edited message m, from
+// update updateID, that edits aren't saved. The update is kept, marked
+// processed, if m carries a Thought, and removed from the inbox otherwise: m
+// may have carried a Thought deleted since, and the edit holds its text.
+func (b *Bot) replyToEdit(ctx context.Context, updateID int64, m *telegram.Message) error {
+	_, isThought, err := b.db.GetThoughtByMessageID(ctx, m.ID)
+	if err != nil {
 		return err
 	}
-	return b.db.MarkProcessed(ctx, updateID)
+	if isThought {
+		return b.replyAndMarkProcessed(ctx, updateID, m, editReply)
+	}
+	b.reply(ctx, updateID, m, editReply)
+	return b.db.DeleteUpdate(ctx, updateID)
+}
+
+// replyToNonText tells the owner, in reply to their message m with no text,
+// from update updateID, that Cermin takes text only, and marks the update
+// processed. Of an album, only the first photo or video gets the reply, and a
+// service message, such as your pin of a message, gets none. An album split
+// by a restart gets a second reply.
+func (b *Bot) replyToNonText(ctx context.Context, updateID int64, m *telegram.Message) error {
+	isAlbumReplied := m.MediaGroupID != "" && m.MediaGroupID == b.repliedAlbumID
+	if m.IsService() || isAlbumReplied {
+		return b.db.MarkProcessed(ctx, updateID)
+	}
+	b.repliedAlbumID = m.MediaGroupID
+	return b.replyAndMarkProcessed(ctx, updateID, m, textOnlyReply)
 }
 
 // syncAckAndMarkProcessed brings the Acknowledgement of Thought thoughtID up
@@ -268,6 +381,10 @@ func (b *Bot) classifyThought(ctx context.Context, t cermin.Thought, timeout tim
 	if err != nil {
 		return false, err
 	}
+	archived, err := b.db.GetArchivedTopicNames(ctx)
+	if err != nil {
+		return false, err
+	}
 	c, err := b.classify(ctx, t.Text, b.db.Kinds(), topics)
 	if err != nil {
 		return false, err
@@ -275,8 +392,8 @@ func (b *Bot) classifyThought(ctx context.Context, t cermin.Thought, timeout tim
 
 	c.ThoughtID = t.ID
 	c.Source = cermin.SourceCermin
-	c.Topics = cermin.KeepTopics(c.Topics)
-	if len(c.Topics) == 0 {
+	c.Topics = cermin.KeepTopics(c.Topics, archived)
+	if len(c.KeptTopics()) == 0 {
 		return false, errors.New("classified with no topic")
 	}
 

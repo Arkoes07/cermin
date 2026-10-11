@@ -94,10 +94,10 @@ flowchart TB
 
 | Component | Week | Responsibility |
 |---|---|---|
-| Telegram poller | 1 | Long-polls `getUpdates`, writes each raw update into the `telegram_updates` inbox, then confirms the offset. |
-| Update handler | 1 | Works through inbox rows in order: owner check, Capture, `/delete`, `/kind`, `/topics`, edge cases; later `/ask`, `/topic` and Reactions. |
+| Telegram poller | 1 | In its own goroutine, long-polls `getUpdates`, writes each raw update into the `telegram_updates` inbox, then confirms the offset and wakes the update handler. It never waits for the handler, so a backlog can't hold up `getUpdates` past `/healthz`'s window ([8.4](#84-http)). |
+| Update handler | 1 | In its own goroutine, at startup and whenever the poller wakes it, works through inbox rows in order: owner check, Capture, `/delete`, `/kind`, `/topics`, edge cases; later `/ask`, `/topic` and Reactions. An update whose processing has begun 5 times is skipped: it is marked failed and kept for a replay, an error is logged, and you get a reply saying so. |
 | Classifier | 1 | One Claude call per Thought with structured output: Kind, candidate Topics, stated confidences, language, `kind_suggestion`. |
-| Catch-up loop | 1 | Every minute: sends missing Acknowledgements and edits out-of-date ones, then classifies Thoughts that have no Classification and edits their Acknowledgements. After each failure on a Thought it waits longer before trying it again: 1, 2, 4 … minutes, at most 24 hours, so a Thought the classifier always fails on costs 11 calls on its first day and one a day after that. From week 2 it also embeds. |
+| Catch-up loop | 1 | Every minute: sends missing Acknowledgements and edits out-of-date ones, and edits deleted Thoughts' Acknowledgements to `🗑 deleted` where `/delete` failed to, at most 20 of each, then classifies Thoughts that have no Classification and edits their Acknowledgements. After each failure on a Thought it waits longer before trying it again: 1, 2, 4 … minutes, at most 24 hours, so a Thought the classifier always fails on costs 11 calls on its first day and one a day after that. From week 2 it also embeds. |
 | HTTP server | 1 | `/healthz` for Fly; `/mcp` from week 3. |
 | Embedder | 2 | Embeds Thoughts and queries; backfills when the embedding model changes. |
 | Resurfacer | 2 | Finds strong matches for a new Thought and sends at most 2 as an Insight with 👍/👎. |
@@ -182,11 +182,15 @@ Values that only change with a deploy are constants in code: the WIB timezone (`
 erDiagram
     TELEGRAM_UPDATES {
         int update_id PK
-        text payload "raw Telegram JSON"
+        text payload "Telegram JSON, copies of other messages cut down"
         int message_id
-        int reply_to_message_id
         datetime received_at
         datetime processed_at
+        int attempts "times its processing has begun"
+        datetime failed_at "skipped after 5 attempts"
+    }
+    DELETED_ACKS {
+        int ack_message_id PK "a deleted Thought's Acknowledgement, still to edit"
     }
     THOUGHTS {
         int id PK
@@ -276,7 +280,7 @@ erDiagram
 ```
 
 Each table is created in the week that first needs it:
-- **Week 1:** `telegram_updates`, `thoughts`, `kinds`, `topics`, `classifications`, `classification_topics`.
+- **Week 1:** `telegram_updates`, `thoughts`, `deleted_acks`, `kinds`, `topics`, `classifications`, `classification_topics`.
 - **Week 2:** `embeddings`, `insights`, `insight_citations`, `reactions`.
 
 ### 6.1 Where each glossary term lives
@@ -299,9 +303,9 @@ Each table is created in the week that first needs it:
 | Corpus | all `thoughts` rows |
 
 `telegram_updates` is the one table with no glossary term, because it is plumbing:
-- **The inbox.** Every update Telegram sends (a new message, an edit, a button press) is written there as raw JSON before anything else happens. The handler works through the rows in order. If Cermin crashes mid-way, the row stays unprocessed and is retried on restart.
-- **The raw log.** If parsing gets something wrong, the original is still there to replay.
-- **Delete support.** The `message_id` and `reply_to_message_id` columns exist so `/delete` can find and scrub every row that carries the deleted text.
+- **The inbox.** Every update Telegram sends (a new message, an edit, a button press) is written there as raw JSON, with the copies of other messages cut down to their IDs ([6.4](#64-recorded-from-day-1)), before anything else happens. The handler works through the rows in order. If Cermin crashes mid-way, the row stays unprocessed and is retried on restart.
+- **The raw log.** If parsing gets something wrong, the update is still there to replay.
+- **Delete support.** The `message_id` column exists so `/delete` can find and scrub the rows that carry the deleted Thought's message: the message and its edits. No other row holds its text ([6.4](#64-recorded-from-day-1)).
 
 ### 6.2 Rules
 
@@ -319,7 +323,7 @@ Each table is created in the week that first needs it:
   - Declaring a name that already exists turns that same row into a Declared Topic, so its Thoughts come with it.
 - **Embeddings are keyed by (Thought, model).** Two models can sit side by side for comparison, and switching models is a backfill that costs cents.
 - **Routing replies.** `thoughts.ack_message_id` maps a reply to an Acknowledgement back to its Thought, and `insights.tg_message_id` maps a 👍/👎 back to its Insight.
-- **Delete is a hard delete.** Deleting a Thought cascades to its Classifications, embeddings and citations. The `telegram_updates` rows whose `message_id` or `reply_to_message_id` point at the Thought or its Acknowledgement are deleted too, because a reply carries the text of the message it replies to. Insights keep their body as sent, and backups age out within 7 days.
+- **Delete is a hard delete.** Deleting a Thought cascades to its Classifications, embeddings and citations. The `telegram_updates` rows whose `message_id` is the Thought's, its message and its edits, are deleted too, with the `/delete` itself. No other row holds its text, since a stored update keeps only the ID of a message it replies to or pins ([6.4](#64-recorded-from-day-1)), and an edit that arrives after the delete is deleted from the inbox once it gets its reply. Until the Acknowledgement shows `🗑 deleted`, its message ID waits in `deleted_acks`, with no text. Insights keep their body as sent, and backups age out within 7 days.
 
 ### 6.3 Topic lifecycle
 
@@ -333,7 +337,7 @@ Each table is created in the week that first needs it:
 
 These can't be reconstructed later, so week 1 records them:
 
-1. **Raw inbound updates.** Every Telegram update as raw JSON in `telegram_updates`. Parsing bugs can be replayed, and edits are logged.
+1. **Raw inbound updates.** Every Telegram update as raw JSON in `telegram_updates`, except for the copies of other messages, which are cut down to their IDs: `reply_to_message` and `pinned_message` keep only `message_id`, and a reply's `quote` is dropped. Parsing bugs can be replayed, and edits are logged.
 2. **The Thought.** Its verbatim text, Thought time, arrival time and Telegram message ID, the message it replied to, and the Acknowledgement's message ID.
 3. **Every Classification Cermin makes.**
    - the model, prompt version and confidence method;
@@ -391,8 +395,8 @@ Every step is idempotent. The Thought is unique on its Telegram message ID, and 
 ### 7.3 Delete (week 1)
 
 1. You reply `/delete` to a Thought or its Acknowledgement.
-2. In one transaction, the handler deletes the Thought and scrubs its `telegram_updates` rows ([6.2](#62-rules)), including the `/delete` update itself.
-3. It edits the Acknowledgement to `🗑 deleted`.
+2. In one transaction, the handler deletes the Thought and scrubs its `telegram_updates` rows ([6.2](#62-rules)), including the `/delete` update itself, and adds the Acknowledgement's message ID to `deleted_acks`.
+3. It edits the Acknowledgement to `🗑 deleted` and removes the `deleted_acks` row, as it does if you deleted the Acknowledgement. If the edit fails, the catch-up loop retries it.
 
 ### 7.4 Later weeks (outline)
 

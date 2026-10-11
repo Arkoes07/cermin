@@ -39,12 +39,14 @@ func Open(ctx context.Context, path string) (*DB, error) {
 	}
 	// The driver runs these pragmas on every new connection.
 	const pragmas = "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)"
-	// ponytail: the connection pool is left unbounded because one goroutine
-	// uses it; bound it with SetMaxOpenConns once MCP readers share it.
 	pool, err := sql.Open("sqlite", path+pragmas)
 	if err != nil {
 		return nil, fmt.Errorf("opening database: %w", err)
 	}
+	// The poller, the processor and the catch-up each use one connection at a
+	// time; week 3's MCP revisits the number. A fifth query waits for a free
+	// connection, and never fails for lack of one.
+	pool.SetMaxOpenConns(4)
 	if err := migrate(ctx, pool); err != nil {
 		return nil, errors.Join(err, pool.Close())
 	}

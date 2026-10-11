@@ -2,6 +2,7 @@ package capture_test
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -9,8 +10,193 @@ import (
 	"testing"
 	"time"
 
+	"github.com/arkoes07/cermin/internal/capture"
 	"github.com/arkoes07/cermin/internal/cermin"
 )
+
+func TestBot_Run_ProcessesWhileNextPollWaits(t *testing.T) {
+	t.Parallel()
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	var heldPolls <-chan struct{}
+	classify := func(
+		ctx context.Context,
+		text string,
+		kinds []cermin.Kind,
+		topics []string,
+	) (cermin.Classification, error) {
+		select {
+		case <-heldPolls:
+		case <-time.After(5 * time.Second):
+			t.Error("classifying with no poll waiting, want the next poll under way")
+		}
+		return classifier.classify(ctx, text, kinds, topics)
+	}
+	bot, _, api := newBot(t, classify)
+	heldPolls = api.holdEmptyPolls()
+	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	stopped := make(chan struct{})
+	go func() {
+		bot.Run(ctx)
+		close(stopped)
+	}()
+	defer func() {
+		cancel()
+		<-stopped
+	}()
+
+	wantSent := []sentMessage{{ChatID: ownerID, Text: "💡 idea · running", ReplyToID: messageID}}
+	deadline := time.Now().Add(10 * time.Second)
+	for !slices.Equal(api.sentMessages(), wantSent) {
+		if time.Now().After(deadline) {
+			t.Fatalf("sent %+v, want %+v", api.sentMessages(), wantSent)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestBot_Poll_CutsCopiesOfOtherMessages(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	bot, db, api := newBot(t, classifier.classify)
+	api.queue(textUpdate(t, ownerID, repliedText, 0))
+	captureQueued(t, bot, db)
+
+	// A Correction quoting part of the Thought it replies to.
+	api.queue(update(t, "message", ownerID, map[string]any{
+		"message_id":       commandID,
+		"text":             "/kind plan",
+		"reply_to_message": repliedMessage(ownerID, messageID),
+		"quote":            map[string]any{"text": "packed at 8am", "position": 18},
+	}))
+	in := pollUpdate(t, bot, db)
+
+	var stored struct {
+		Message map[string]json.RawMessage `json:"message"`
+	}
+	if err := json.Unmarshal(in.Payload, &stored); err != nil {
+		t.Fatalf("decoding stored update: %v", err)
+	}
+	if got, want := string(stored.Message["reply_to_message"]), `{"message_id":7}`; got != want {
+		t.Errorf("stored reply_to_message = %s, want %s", got, want)
+	}
+	if quote, isStored := stored.Message["quote"]; isStored {
+		t.Errorf("stored quote %s, want none", quote)
+	}
+	if err := bot.Process(ctx, in); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	wantEdits := []editedMessage{{ChatID: ownerID, MessageID: ackID, Text: "✏️ 📋 plan · running"}}
+	if edits := api.editedMessages(); !slices.Equal(edits, wantEdits) {
+		t.Errorf("edited %+v, want %+v", edits, wantEdits)
+	}
+}
+
+func TestBot_ProcessInbox_SkipsUpdateThatKeepsFailing(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	const bugText = "Run 5 km on Saturday."
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	classify := func(
+		ctx context.Context,
+		text string,
+		kinds []cermin.Kind,
+		topics []string,
+	) (cermin.Classification, error) {
+		if text == bugText {
+			panic("a bug in the classifier")
+		}
+		return classifier.classify(ctx, text, kinds, topics)
+	}
+	bot, db, api := newBot(t, classify)
+	api.queue(textUpdate(t, ownerID, bugText, 0))
+	api.queue(update(t, "message", ownerID, map[string]any{
+		"message_id": messageID + 1,
+		"text":       "Buy new running shoes.",
+	}))
+	if err := bot.Poll(ctx); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+
+	// The bug crashes Cermin, and the first update with it, at each restart.
+	for attempt := 1; attempt <= 5; attempt++ {
+		processInboxPanicking(t, bot)
+		updates, err := db.GetUnprocessedUpdates(ctx)
+		if err != nil || len(updates) != 2 {
+			t.Fatalf("after attempt %d, %d unprocessed updates, %v; want both", attempt, len(updates), err)
+		}
+		if got := updates[0].Attempts; got != attempt {
+			t.Fatalf("after attempt %d, the first update has %d attempts, want %d", attempt, got, attempt)
+		}
+	}
+	if err := bot.ProcessInbox(ctx); err != nil {
+		t.Fatalf("ProcessInbox after 5 attempts: %v", err)
+	}
+
+	wantSent := []sentMessage{
+		{ChatID: ownerID, Text: "Couldn't process this message. It's kept for a replay.", ReplyToID: messageID},
+		{ChatID: ownerID, Text: "💡 idea · running", ReplyToID: messageID + 1},
+	}
+	if sent := api.sentMessages(); !slices.Equal(sent, wantSent) {
+		t.Errorf("sent %+v, want %+v", sent, wantSent)
+	}
+	if updates, err := db.GetUnprocessedUpdates(ctx); err != nil || len(updates) != 0 {
+		t.Errorf("unprocessed updates = %+v, %v; want none", updates, err)
+	}
+}
+
+// processInboxPanicking calls ProcessInbox, which is to panic as a bug that
+// crashes Cermin does, and recovers.
+func processInboxPanicking(t *testing.T, bot *capture.Bot) {
+	t.Helper()
+	defer func() {
+		if recover() == nil {
+			t.Fatal("ProcessInbox didn't panic")
+		}
+	}()
+	if err := bot.ProcessInbox(t.Context()); err != nil {
+		t.Errorf("ProcessInbox: %v", err)
+	}
+}
+
+func TestBot_ProcessInbox_MarksReplyProcessedWhenSendFails(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		update string
+	}{
+		{name: "help", update: commandUpdate(t, commandID, "/help", 0)},
+		{name: "delete not a reply", update: commandUpdate(t, commandID, "/delete", 0)},
+		{
+			name: "edit of a message that isn't a thought",
+			update: withUpdateID(t, update(t, "edited_message", ownerID, map[string]any{
+				"text":      "Start running on Sundays.",
+				"edit_date": thoughtTime.Unix() + 60,
+			}), commandID),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			classifier := &fakeClassifier{}
+			bot, db, api := newBot(t, classifier.classify)
+			api.failNextSend()
+			api.queue(tt.update)
+
+			processQueued(t, bot)
+
+			if sent := api.sentMessages(); len(sent) != 0 {
+				t.Errorf("sent %+v, want the reply failed", sent)
+			}
+			if updates, err := db.GetUnprocessedUpdates(ctx); err != nil || len(updates) != 0 {
+				t.Errorf("unprocessed updates = %+v, %v; want none", updates, err)
+			}
+		})
+	}
+}
 
 func TestBot_ProcessInbox_CapturesOwnerText(t *testing.T) {
 	t.Parallel()
@@ -138,7 +324,7 @@ func TestBot_ProcessInbox_KeepsStrongTopics(t *testing.T) {
 		{Name: "data", Confidence: 0.8},
 		{Name: "buses", Confidence: 0.9},
 	}
-	wantStored := cermin.KeepTopics(candidates)
+	wantStored := cermin.KeepTopics(candidates, nil)
 	kept := cermin.Classification{Topics: wantStored}.KeptTopics()
 	classifier := &fakeClassifier{candidates: candidates}
 	bot, db, api := newBot(t, classifier.classify)
@@ -204,6 +390,48 @@ func TestBot_ProcessInbox_ReusesTopicIgnoringCase(t *testing.T) {
 	}
 	if got, err := db.GetTopicNames(ctx); err != nil || !slices.Equal(got, []string{"business", "retail"}) {
 		t.Errorf("GetTopicNames = %q, %v; want business, retail", got, err)
+	}
+}
+
+func TestBot_ProcessInbox_NeverKeepsArchivedTopic(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	path := filepath.Join(t.TempDir(), "cermin.db")
+	bot, db, api := newBotAt(t, classifier.classify, path)
+	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
+	captureQueued(t, bot, db)
+	// Archived directly, since /topic archive arrives in week 3.
+	_, err := openFile(t, path).ExecContext(ctx, `UPDATE topics SET archived_at = created_at WHERE name = 'running'`)
+	if err != nil {
+		t.Fatalf("archiving running: %v", err)
+	}
+
+	classifier.candidates = []cermin.TopicCandidate{
+		{Name: "Running", Confidence: 0.95},
+		{Name: "health", Confidence: 0.4},
+	}
+	api.queue(update(t, "message", ownerID, map[string]any{
+		"message_id": messageID + 1,
+		"text":       "Running shoes wear out after 800 km.",
+	}))
+	thought := captureQueued(t, bot, db)
+
+	// The archived Topic is still stored as a candidate, and the best of the
+	// others is kept in its place, even below the threshold.
+	if sent := api.sentMessages(); len(sent) != 2 || sent[1].Text != "💡 idea · health" {
+		t.Errorf("sent %+v, want a second Acknowledgement 💡 idea · health", sent)
+	}
+	classifications, err := db.GetClassificationsByThoughtID(ctx, thought.ID)
+	if err != nil || len(classifications) != 1 {
+		t.Fatalf("GetClassificationsByThoughtID = %+v, %v; want 1", classifications, err)
+	}
+	wantStored := []cermin.TopicCandidate{
+		{Name: "running", Confidence: 0.95},
+		{Name: "health", Confidence: 0.4, Kept: true},
+	}
+	if got := classifications[0].Topics; !slices.Equal(got, wantStored) {
+		t.Errorf("stored candidates %+v, want %+v", got, wantStored)
 	}
 }
 
@@ -471,6 +699,43 @@ func TestBot_ProcessInbox_RepliesWithoutCapturing(t *testing.T) {
 				t.Errorf("unprocessed updates = %+v, %v; want none", updates, err)
 			}
 		})
+	}
+}
+
+func TestBot_ProcessInbox_RepliesOncePerAlbumAndNeverToServiceMessages(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	bot, db, api := newBot(t, classifier.classify)
+	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
+	captureQueued(t, bot, db)
+
+	photo := []map[string]any{{"file_id": "a", "file_unique_id": "b", "width": 90, "height": 90}}
+	for i := range 2 {
+		api.queue(update(t, "message", ownerID, map[string]any{
+			"message_id":     commandID + i,
+			"media_group_id": "13",
+			"photo":          photo,
+		}))
+	}
+	// Service messages you can cause in a private chat with a bot.
+	services := []map[string]any{
+		{"pinned_message": repliedMessage(ownerID, messageID)},
+		{"message_auto_delete_timer_changed": map[string]any{"message_auto_delete_time": 86400}},
+		{"chat_background_set": map[string]any{"type": map[string]any{"type": "chat_theme", "theme_name": "🌷"}}},
+	}
+	for i, fields := range services {
+		fields["message_id"] = commandID + 2 + i
+		api.queue(update(t, "message", ownerID, fields))
+	}
+	processQueued(t, bot)
+
+	wantReply := sentMessage{ChatID: ownerID, Text: "Text only for now.", ReplyToID: commandID}
+	if sent := api.sentMessages(); len(sent) != 2 || sent[1] != wantReply {
+		t.Errorf("sent %+v, want the Acknowledgement and then only %+v", sent, wantReply)
+	}
+	if updates, err := db.GetUnprocessedUpdates(ctx); err != nil || len(updates) != 0 {
+		t.Errorf("unprocessed updates = %+v, %v; want none", updates, err)
 	}
 }
 

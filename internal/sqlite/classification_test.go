@@ -165,7 +165,7 @@ func TestDB_SaveFirstClassification(t *testing.T) {
 				want = append(want, stored)
 			}
 			if tt.isDeleted {
-				if err := db.DeleteThought(ctx, thought.ID); err != nil {
+				if err := db.DeleteThought(ctx, thought.ID, 0); err != nil {
 					t.Fatalf("DeleteThought: %v", err)
 				}
 			}

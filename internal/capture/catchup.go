@@ -15,7 +15,10 @@ const (
 	// Thought's Classification. No Acknowledgement waits on it, so a slow
 	// classifier gets time to finish.
 	catchUpClassifyTimeout = 60 * time.Second
-	// catchUpLimit is the most Thoughts one catch-up classifies, to cap cost.
+	// catchUpLimit is the most Thoughts one catch-up classifies, to cap cost,
+	// and the most Acknowledgements it brings up to date, and edits to show a
+	// deletion, to stay under Telegram's rate limits. The rest wait for the
+	// next catch-up.
 	catchUpLimit = 20
 	// classifyMaxBackoff is the longest the catch-up waits to try again to
 	// classify a Thought it failed on.
@@ -43,29 +46,32 @@ func (b *Bot) catchUpEveryInterval(ctx context.Context) {
 }
 
 // CatchUp finishes what a crash, the classifier or Telegram left undone. It
-// brings every out-of-date Acknowledgement up to date, sending the ones never
-// sent, then classifies up to catchUpLimit Thoughts that have no
-// Classification and are due, oldest first, and edits their Acknowledgements
-// to show it. A Thought it fails to classify is logged and postponed, ever
-// longer, so that one the classifier always fails on costs few paid calls.
+// brings up to catchUpLimit out-of-date Acknowledgements up to date, sending
+// the ones never sent, and edits up to catchUpLimit deleted Thoughts'
+// Acknowledgements to 🗑 deleted where that failed. Then it classifies up to
+// catchUpLimit Thoughts that have no Classification and are due, oldest
+// first, and edits their Acknowledgements to show it. A Thought it fails to
+// classify is logged and postponed, ever longer, so that one the classifier
+// always fails on costs few paid calls.
 func (b *Bot) CatchUp(ctx context.Context) error {
 	now := b.timeNow()
 	if err := b.syncOutOfDateAcks(ctx); err != nil {
 		return err
 	}
+	if err := b.showDeletions(ctx); err != nil {
+		return err
+	}
 	return b.classifyDueThoughts(ctx, now)
 }
 
-// syncOutOfDateAcks brings every out-of-date Acknowledgement up to date,
-// sending the ones never sent. A failure is logged, and the next catch-up
-// retries it.
+// syncOutOfDateAcks brings up to catchUpLimit out-of-date Acknowledgements up
+// to date, oldest first, sending the ones never sent. A failure is logged,
+// and the next catch-up retries it.
 func (b *Bot) syncOutOfDateAcks(ctx context.Context) error {
-	outOfDate, err := b.db.GetThoughtsWithOutOfDateAck(ctx)
+	outOfDate, err := b.db.GetThoughtsWithOutOfDateAck(ctx, catchUpLimit)
 	if err != nil {
 		return err
 	}
-	// ponytail: unbounded; cap it at catchUpLimit if a Declared Topic
-	// backfill hits Telegram's 429s.
 	for _, t := range outOfDate {
 		// Locked per Thought, so that this delays a Capture by one send or
 		// edit at most. syncAck reads the Thought again under the lock, in
@@ -76,6 +82,20 @@ func (b *Bot) syncOutOfDateAcks(ctx context.Context) error {
 		if err != nil && ctx.Err() == nil {
 			slog.WarnContext(ctx, "updating acknowledgement", "thought_id", t.ID, "err", err)
 		}
+	}
+	return nil
+}
+
+// showDeletions edits up to catchUpLimit deleted Thoughts' Acknowledgements
+// to 🗑 deleted, where /delete failed to. It takes no lock: should a /delete
+// make the same edit meanwhile, the second edit changes nothing.
+func (b *Bot) showDeletions(ctx context.Context) error {
+	ackIDs, err := b.db.GetDeletedAckIDs(ctx, catchUpLimit)
+	if err != nil {
+		return err
+	}
+	for _, id := range ackIDs {
+		b.showDeletion(ctx, id)
 	}
 	return nil
 }

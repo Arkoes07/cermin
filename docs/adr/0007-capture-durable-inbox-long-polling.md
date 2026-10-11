@@ -5,7 +5,7 @@ Every Telegram update is written as raw JSON to the `telegram_updates` table bef
 2. It asks the AI to classify it.
 3. It replies once classification finishes, or after 8 seconds, whichever comes first. A late reply is just `✓ saved`, edited once the Kind and Topics arrive.
 
-A catch-up loop finishes whatever the AI couldn't. This is how the PRD's "Capture never fails because the AI is slow or down" holds: a crash, an AI outage or a deploy leaves a row to retry, never a lost Thought.
+A catch-up loop finishes whatever the AI couldn't. This is how the PRD's "Capture never fails because the AI is slow or down" holds: a crash, an AI outage or a deploy leaves a row to retry, never a lost Thought. An update whose processing fails 5 times is skipped, with an alert to you, and kept in the inbox for a replay, so it never stalls the ones behind it.
 
 Updates arrive by long polling: `getUpdates` with a timeout. For one bot this is as immediate as a webhook, because Telegram answers the held request the moment a message arrives. It also needs no inbound route.
 
@@ -18,4 +18,4 @@ Updates arrive by long polling: `getUpdates` with a timeout. For one bot this is
 ## Consequences
 
 - Two Telegram bots: one for production and one for development, because two pollers can't share a token.
-- The inbox keeps raw text, including the text of any message a reply points to. `/delete` must therefore scrub matching inbox rows as well as the Thought.
+- The inbox keeps raw text, but cuts a reply's or a pin's copy of another message down to its ID. `/delete` must therefore scrub the Thought's own inbox rows, its message and its edits, as well as the Thought.

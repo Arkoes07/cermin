@@ -6,7 +6,7 @@ Week 3 has to measure accuracy and calibration. That depends on data that can't 
 - **Every candidate Topic is stored** with its stated confidence and whether it was kept. The strong-Topic threshold can then be tuned on history without re-running the model. Dropped candidates are stored by name only; a `topics` row appears only once a Topic is kept or given in a Correction. That way a name Cermin considered and dropped never enters the Topic list the classifier sees.
 - **Each Classification records** the model, prompt version, confidence method and raw model output. The raw output includes the `kind_suggestion` the model gives when no Kind fits.
 - **Raw input and timing are kept:**
-  - every Telegram update, as raw JSON ([ADR-0007](0007-capture-durable-inbox-long-polling.md));
+  - every Telegram update, as raw JSON with the copies of other messages cut down to their IDs ([ADR-0007](0007-capture-durable-inbox-long-polling.md));
   - each Thought's Thought time and arrival time, separately;
   - the Telegram message IDs of the Thought, of the message it replied to, and of its Acknowledgement.
 - **Kinds live in a `kinds` table**, seeded and changed only by migrations, and `classifications.kind` references it. **Topics live in a `topics` table** that grows as Cermin and you use new names.

@@ -36,6 +36,17 @@ func (db *DB) GetTopicNames(ctx context.Context) ([]string, error) {
 	return names, nil
 }
 
+// GetArchivedTopicNames returns the names of the archived Topics, in name
+// order.
+func (db *DB) GetArchivedTopicNames(ctx context.Context) ([]string, error) {
+	names, err := queryAll(ctx, db.pool, scanName,
+		`SELECT name FROM topics WHERE archived_at IS NOT NULL ORDER BY name`)
+	if err != nil {
+		return nil, fmt.Errorf("listing archived topics: %w", err)
+	}
+	return names, nil
+}
+
 func scanName(row scanner) (string, error) {
 	var name string
 	err := row.Scan(&name)
@@ -173,8 +184,6 @@ func insertTopics(ctx context.Context, tx *sql.Tx, c cermin.Classification) erro
 func insertTopicCandidates(ctx context.Context, tx *sql.Tx, c cermin.Classification) ([]cermin.TopicCandidate, error) {
 	topics := make([]cermin.TopicCandidate, 0, len(c.Topics))
 	for _, t := range c.Topics {
-		// ponytail: a kept name matching an archived Topic is assigned to it;
-		// skip archived Topics here once /topic archive exists.
 		err := tx.QueryRowContext(ctx, `
 			INSERT INTO classification_topics (classification_id, topic_name, confidence, kept)
 			VALUES (
@@ -207,14 +216,43 @@ func (db *DB) GetClassificationsByThoughtID(ctx context.Context, thoughtID int64
 		return nil, fmt.Errorf("listing classifications of thought %d: %w", thoughtID, err)
 	}
 
-	// ponytail: one query per Classification, fine for the few a Thought has;
-	// join them if a caller ever lists many Thoughts' Classifications.
-	for i, c := range classifications {
-		if classifications[i].Topics, err = db.getTopicCandidatesByClassificationID(ctx, c.ID); err != nil {
-			return nil, err
+	candidates, err := queryAll(ctx, db.pool, scanClassificationTopic, `
+		SELECT classification_id, topic_name, COALESCE(confidence, 0), kept
+		FROM classification_topics
+		WHERE classification_id IN (SELECT id FROM classifications WHERE thought_id = ?)
+		ORDER BY rowid`,
+		thoughtID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing topics of thought %d: %w", thoughtID, err)
+	}
+
+	byID := make(map[int64]*cermin.Classification, len(classifications))
+	for i := range classifications {
+		classifications[i].Topics = []cermin.TopicCandidate{}
+		byID[classifications[i].ID] = &classifications[i]
+	}
+	for _, ct := range candidates {
+		// A Correction saved between the two queries is left out, with its
+		// candidates.
+		if c, isListed := byID[ct.classificationID]; isListed {
+			c.Topics = append(c.Topics, ct.topic)
 		}
 	}
 	return classifications, nil
+}
+
+// classificationTopic is a candidate Topic of the Classification
+// classificationID.
+type classificationTopic struct {
+	classificationID int64
+	topic            cermin.TopicCandidate
+}
+
+func scanClassificationTopic(row scanner) (classificationTopic, error) {
+	var ct classificationTopic
+	err := row.Scan(&ct.classificationID, &ct.topic.Name, &ct.topic.Confidence, &ct.topic.Kept)
+	return ct, err
 }
 
 // GetCurrentClassificationByThoughtID returns the current Classification of

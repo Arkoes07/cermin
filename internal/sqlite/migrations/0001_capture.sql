@@ -2,12 +2,15 @@
 -- Times are UTC text, 2006-01-02T15:04:05.000Z.
 
 CREATE TABLE telegram_updates (
-    update_id           INTEGER PRIMARY KEY,
-    payload             TEXT    NOT NULL, -- the update's raw JSON
-    message_id          INTEGER,
-    reply_to_message_id INTEGER,
-    received_at         TEXT    NOT NULL,
-    processed_at        TEXT
+    update_id    INTEGER PRIMARY KEY,
+    payload      TEXT    NOT NULL, -- the update's JSON, copies of other messages cut down
+    message_id   INTEGER,
+    received_at  TEXT    NOT NULL,
+    processed_at TEXT,
+    -- How many times processing it has begun, and when it was skipped after
+    -- failing too often; kept, with its payload, for a replay.
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    failed_at    TEXT
 );
 
 -- AUTOINCREMENT, so that a deleted Thought's ID never goes to a new one.
@@ -27,4 +30,10 @@ CREATE TABLE thoughts (
     -- catch-up next tries; NULL: at once.
     classify_failures      INTEGER NOT NULL DEFAULT 0,
     classify_retry_at      TEXT
+);
+
+-- The Acknowledgements of deleted Thoughts still to be edited to 🗑 deleted.
+-- They keep no text.
+CREATE TABLE deleted_acks (
+    ack_message_id INTEGER PRIMARY KEY
 );

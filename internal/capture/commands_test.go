@@ -299,9 +299,10 @@ func TestBot_ProcessInbox_DeletesThought(t *testing.T) {
 				"message_id": messageID + 1,
 				"text":       "Cafés near the office are full at 3pm.",
 			}))
-			// A reply to the Thought, which is a Thought of its own, and your
-			// edit of the Thought's message carry its text. A Correction
-			// replies to its Acknowledgement.
+			// As Telegram sends them, a reply to the Thought, which is a
+			// Thought of its own, and a Correction, which replies to its
+			// Acknowledgement, carry a copy of the message they reply to, and
+			// your edit of the Thought's message carries its text.
 			api.queue(update(t, "message", ownerID, map[string]any{
 				"message_id":       messageID + 2,
 				"text":             "Maybe leave at 7am instead.",
@@ -349,10 +350,11 @@ func TestBot_ProcessInbox_DeletesThought(t *testing.T) {
 			if got := classificationsOf(t, db, others); !reflect.DeepEqual(got, othersClassifications) {
 				t.Errorf("Classifications of the others = %+v, want them unchanged: %+v", got, othersClassifications)
 			}
-			// The reply's update goes too, since it carries the deleted
-			// Thought's text, but the Thought it carried stays.
-			if got, want := updateIDs(t, file), []int64{messageID + 1}; !slices.Equal(got, want) {
-				t.Errorf("inbox updates = %v, want only the other Thought's: %v", got, want)
+			// The reply's and the Correction's updates stay, keeping only the
+			// ID of the message they reply to.
+			want := []int64{messageID + 1, messageID + 2, commandID}
+			if got := updateIDs(t, file); !slices.Equal(got, want) {
+				t.Errorf("inbox updates = %v, want the other Thoughts' and the Correction's: %v", got, want)
 			}
 			wantEdits := []editedMessage{
 				{ChatID: ownerID, MessageID: ackID, Text: "✏️ 👀 observation · transport"},
@@ -365,6 +367,46 @@ func TestBot_ProcessInbox_DeletesThought(t *testing.T) {
 				t.Errorf("sent %+v, want only the 3 Acknowledgements and the reply to the edit", sent)
 			}
 		})
+	}
+}
+
+func TestBot_ProcessInbox_KeepsDeletedThoughtsTextOut(t *testing.T) {
+	t.Parallel()
+	const editReply = "Edits aren't saved. Send it as a new Thought."
+	ctx := t.Context()
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "transport", Confidence: 0.9}}}
+	path := filepath.Join(t.TempDir(), "cermin.db")
+	bot, db, api := newBotAt(t, classifier.classify, path)
+	file := openFile(t, path)
+	api.queue(textUpdate(t, ownerID, repliedText, 0))
+	captureQueued(t, bot, db)
+	// Your pin of the Thought's message carries a copy of it.
+	api.queue(update(t, "message", ownerID, map[string]any{
+		"message_id":     messageID + 1,
+		"pinned_message": repliedMessage(ownerID, messageID),
+	}))
+	api.queue(commandUpdate(t, commandID, "/delete", messageID))
+	processQueued(t, bot)
+
+	// After the /delete, a reply to the deleted Thought carries a copy of it,
+	// and your edit of its message carries its text.
+	api.queue(commandUpdate(t, commandID+1, "/kind plan", messageID))
+	edit := update(t, "edited_message", ownerID, map[string]any{
+		"text":      repliedText + " Even on Fridays.",
+		"edit_date": thoughtTime.Unix() + 60,
+	})
+	api.queue(withUpdateID(t, edit, commandID+2))
+	processQueued(t, bot)
+
+	if got := columnsContaining(t, file, repliedText); len(got) != 0 {
+		t.Errorf("the deleted Thought's text is in %q, want nowhere", got)
+	}
+	wantReply := sentMessage{ChatID: ownerID, Text: editReply, ReplyToID: messageID}
+	if sent := api.sentMessages(); len(sent) == 0 || sent[len(sent)-1] != wantReply {
+		t.Errorf("sent %+v, want the last to be %+v", sent, wantReply)
+	}
+	if updates, err := db.GetUnprocessedUpdates(ctx); err != nil || len(updates) != 0 {
+		t.Errorf("unprocessed updates = %+v, %v; want none", updates, err)
 	}
 }
 
@@ -412,10 +454,13 @@ func TestBot_ProcessInbox_RejectsDelete(t *testing.T) {
 			if got, err := db.GetThoughts(ctx); err != nil || !reflect.DeepEqual(got, thoughts) {
 				t.Errorf("GetThoughts = %+v, %v; want them unchanged: %+v", got, err, thoughts)
 			}
-			// The /delete's own update goes too: one that replies to a deleted
-			// Thought carries its text.
-			if got := updateIDs(t, file); !slices.Equal(got, updates) {
-				t.Errorf("inbox updates = %v, want %v as before", got, updates)
+			// The /delete's own update stays, processed: it keeps only the ID
+			// of the message it replies to.
+			if got, want := updateIDs(t, file), append(updates, commandID+1); !slices.Equal(got, want) {
+				t.Errorf("inbox updates = %v, want %v", got, want)
+			}
+			if unprocessed, err := db.GetUnprocessedUpdates(ctx); err != nil || len(unprocessed) != 0 {
+				t.Errorf("unprocessed updates = %+v, %v; want none", unprocessed, err)
 			}
 			if got := api.editedMessages(); !slices.Equal(got, edits) {
 				t.Errorf("edited %+v, want %+v as before", got, edits)

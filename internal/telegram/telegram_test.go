@@ -7,9 +7,52 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/arkoes07/cermin/internal/telegram"
 )
+
+func TestClient_GetUpdates_KeepsRawAsSent(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		update  string
+		wantRaw string
+	}{
+		{
+			name:    "nothing to cut",
+			update:  `{"update_id":1,"message":{"text":"Tom & Jerry <3","message_id":7}}`,
+			wantRaw: `{"update_id":1,"message":{"text":"Tom & Jerry <3","message_id":7}}`,
+		},
+		{
+			name: "reply quoting another message",
+			update: `{"update_id":2,"message":{"message_id":8,"text":"Tom & Jerry <3",` +
+				`"reply_to_message":{"message_id":7,"text":"Cats & dogs"},"quote":{"text":"dogs","position":7}}}`,
+			wantRaw: `{"message":{"message_id":8,"reply_to_message":{"message_id":7},"text":"Tom & Jerry <3"},` +
+				`"update_id":2}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if _, err := w.Write([]byte(`{"ok":true,"result":[` + tt.update + `]}`)); err != nil {
+					t.Errorf("writing response: %v", err)
+				}
+			}))
+			t.Cleanup(srv.Close)
+
+			updates, err := telegram.New(srv.URL, "123456:test-token").GetUpdates(t.Context(), 0, time.Second)
+			if err != nil || len(updates) != 1 {
+				t.Fatalf("GetUpdates = %d updates, %v; want 1", len(updates), err)
+			}
+			if got := string(updates[0].Raw); got != tt.wantRaw {
+				t.Errorf("Raw = %s, want %s", got, tt.wantRaw)
+			}
+		})
+	}
+}
 
 func TestClient_SendMessage_ErrorOmitsToken(t *testing.T) {
 	t.Parallel()

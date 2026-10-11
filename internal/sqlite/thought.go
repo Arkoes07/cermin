@@ -100,19 +100,21 @@ func (db *DB) GetThoughtByMessageID(ctx context.Context, messageID int64) (cermi
 	return t, true, nil
 }
 
-// DeleteThought deletes the Thought id, with its Classifications, and the
-// inbox updates that carry its text or its Acknowledgement's, all in one
-// transaction. Those are the message that carried it, the edits of that
-// message, and every reply to it or to its Acknowledgement, since a reply
-// carries the text of the message it replies to.
-func (db *DB) DeleteThought(ctx context.Context, id int64) error {
-	if err := db.deleteThought(ctx, id); err != nil {
+// DeleteThought deletes the Thought id, with its Classifications, the inbox
+// updates that carry its message, which are the message and its edits, and
+// update updateID, which asked for the delete, all in one transaction. So a
+// crash can't leave that update to be processed again with its Thought gone.
+// Other updates keep no copy of the Thought's text: telegram.Update.Raw cuts
+// replies' copies down to the message ID. The Thought's Acknowledgement, if it
+// has one, is added to those GetDeletedAckIDs returns.
+func (db *DB) DeleteThought(ctx context.Context, id, updateID int64) error {
+	if err := db.deleteThought(ctx, id, updateID); err != nil {
 		return fmt.Errorf("deleting thought %d: %w", id, err)
 	}
 	return nil
 }
 
-func (db *DB) deleteThought(ctx context.Context, id int64) error {
+func (db *DB) deleteThought(ctx context.Context, id, updateID int64) error {
 	tx, err := db.pool.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -121,11 +123,16 @@ func (db *DB) deleteThought(ctx context.Context, id int64) error {
 
 	_, err = tx.ExecContext(ctx, `
 		DELETE FROM telegram_updates
-		WHERE EXISTS (
-			SELECT 1 FROM thoughts AS t
-			WHERE t.id = ?
-				AND (message_id = t.tg_message_id OR reply_to_message_id IN (t.tg_message_id, t.ack_message_id))
-		)`,
+		WHERE update_id = :update_id OR message_id = (SELECT tg_message_id FROM thoughts WHERE id = :thought_id)`,
+		sql.Named("update_id", updateID),
+		sql.Named("thought_id", id),
+	)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO deleted_acks (ack_message_id)
+		SELECT ack_message_id FROM thoughts WHERE id = ? AND ack_message_id IS NOT NULL`,
 		id,
 	)
 	if err != nil {
@@ -138,17 +145,47 @@ func (db *DB) deleteThought(ctx context.Context, id int64) error {
 	return tx.Commit()
 }
 
+// GetDeletedAckIDs returns the message IDs of up to limit Acknowledgements of
+// deleted Thoughts that are still to be edited to show the deletion, in
+// message order.
+func (db *DB) GetDeletedAckIDs(ctx context.Context, limit int) ([]int64, error) {
+	ids, err := queryAll(ctx, db.pool, scanID,
+		`SELECT ack_message_id FROM deleted_acks ORDER BY ack_message_id LIMIT ?`,
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing deleted acknowledgements: %w", err)
+	}
+	return ids, nil
+}
+
+func scanID(row scanner) (int64, error) {
+	var id int64
+	err := row.Scan(&id)
+	return id, err
+}
+
+// DeleteDeletedAck records that the Acknowledgement ackMessageID of a deleted
+// Thought needs no edit any more.
+func (db *DB) DeleteDeletedAck(ctx context.Context, ackMessageID int64) error {
+	_, err := db.pool.ExecContext(ctx, `DELETE FROM deleted_acks WHERE ack_message_id = ?`, ackMessageID)
+	if err != nil {
+		return fmt.Errorf("deleting deleted acknowledgement %d: %w", ackMessageID, err)
+	}
+	return nil
+}
+
 // GetThoughts returns every Thought, oldest first.
 func (db *DB) GetThoughts(ctx context.Context) ([]cermin.Thought, error) {
 	return db.queryThoughts(ctx, `SELECT `+thoughtColumns+` FROM thoughts ORDER BY id`)
 }
 
-// GetThoughtsWithOutOfDateAck returns the Thoughts from Telegram whose
-// Acknowledgement is out of date, oldest first: those that have none, and
-// those whose Acknowledgement shows a Classification other than their current
-// one. An Acknowledgement that shows none is up to date until the Thought is
-// classified.
-func (db *DB) GetThoughtsWithOutOfDateAck(ctx context.Context) ([]cermin.Thought, error) {
+// GetThoughtsWithOutOfDateAck returns up to limit Thoughts from Telegram
+// whose Acknowledgement is out of date, oldest first: those that have none,
+// and those whose Acknowledgement shows a Classification other than their
+// current one. An Acknowledgement that shows none is up to date until the
+// Thought is classified.
+func (db *DB) GetThoughtsWithOutOfDateAck(ctx context.Context, limit int) ([]cermin.Thought, error) {
 	// The join reads classifications once, where a subquery in WHERE would
 	// read it once per Thought. IS NOT takes NULL as equal to NULL.
 	return db.queryThoughts(ctx, `
@@ -158,7 +195,9 @@ func (db *DB) GetThoughtsWithOutOfDateAck(ctx context.Context) ([]cermin.Thought
 		) ON thought_id = thoughts.id
 		WHERE tg_message_id IS NOT NULL
 			AND (ack_message_id IS NULL OR ack_classification_id IS NOT current_id)
-		ORDER BY thoughts.id`,
+		ORDER BY thoughts.id
+		LIMIT ?`,
+		limit,
 	)
 }
 

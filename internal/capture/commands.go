@@ -2,6 +2,7 @@ package capture
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 
@@ -30,8 +31,8 @@ const (
 )
 
 // runCommand runs the owner's command, sent as message m in update updateID,
-// and marks the update processed, or removes it for /delete. /start, /help and
-// an unknown command get the command list.
+// and marks the update processed, or removes it for a /delete that deletes a
+// Thought. /start, /help and an unknown command get the command list.
 func (b *Bot) runCommand(ctx context.Context, updateID int64, m *telegram.Message) error {
 	command, args, _ := strings.Cut(m.Text, " ")
 	switch command {
@@ -114,15 +115,9 @@ func (b *Bot) correct(
 
 // deleteThought runs /delete, sent as message m in update updateID, in reply
 // to a Thought or its Acknowledgement. In one transaction it deletes the
-// Thought, its Classifications and every inbox update that carries its text,
-// including updateID, then edits the Acknowledgement to 🗑 deleted. A /delete
-// it can't run gets a reply saying how, and is removed from the inbox too,
-// since one that replies to a Thought deleted already still carries its text.
-//
-// ponytail: a later /kind, /topics or text reply to the deleted Thought's
-// message, or an edit of it, brings its text back into the inbox, and stays;
-// delete your message in Telegram after /delete to prevent that, or store
-// replies without the replied-to copy if it ever matters.
+// Thought, its Classifications, the inbox updates that carry its message and
+// updateID itself, then edits the Acknowledgement to 🗑 deleted. A /delete it
+// can't run gets a reply saying how, and is marked processed.
 func (b *Bot) deleteThought(ctx context.Context, updateID int64, m *telegram.Message) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -133,27 +128,35 @@ func (b *Bot) deleteThought(ctx context.Context, updateID int64, m *telegram.Mes
 		return err
 	}
 	if !isFound {
-		if err := b.reply(ctx, m, deleteUsage); err != nil {
-			return err
-		}
-		return b.db.DeleteUpdate(ctx, updateID)
+		return b.replyAndMarkProcessed(ctx, updateID, m, deleteUsage)
 	}
-	if err := b.db.DeleteThought(ctx, thought.ID); err != nil {
+	if err := b.db.DeleteThought(ctx, thought.ID, updateID); err != nil {
 		return err
 	}
-	slog.InfoContext(ctx, "thought deleted", "thought_id", thought.ID, "update_id", updateID)
+	slog.InfoContext(ctx, "thought deleted",
+		"thought_id", thought.ID,
+		"ack_message_id", thought.AckMessageID,
+		"update_id", updateID,
+	)
 
-	// The Thought is gone, so the edit can't be retried: it is made even
-	// during shutdown, and a failure is logged.
-	//
-	// ponytail: a failed edit, or a crash before it, leaves the
-	// Acknowledgement showing the deleted Thought's Kind and Topics; record
-	// the pending edit in the delete's transaction if that ever happens.
-	err = b.tg.EditMessageText(context.WithoutCancel(ctx), b.ownerID, thought.AckMessageID, deletedAck)
-	if err != nil {
-		slog.WarnContext(ctx, "showing deletion", "thought_id", thought.ID, "err", err)
+	if thought.AckMessageID != 0 {
+		b.showDeletion(ctx, thought.AckMessageID)
 	}
 	return nil
+}
+
+// showDeletion edits the Acknowledgement ackMessageID of a deleted Thought to
+// 🗑 deleted, then forgets it. One you deleted in Telegram is forgotten too. A
+// failure is logged, and the catch-up retries it.
+func (b *Bot) showDeletion(ctx context.Context, ackMessageID int64) {
+	err := b.tg.EditMessageText(ctx, b.ownerID, ackMessageID, deletedAck)
+	if err != nil && !errors.Is(err, telegram.ErrMessageNotFound) {
+		slog.WarnContext(ctx, "showing deletion", "ack_message_id", ackMessageID, "err", err)
+		return
+	}
+	if err := b.db.DeleteDeletedAck(ctx, ackMessageID); err != nil {
+		slog.WarnContext(ctx, "forgetting shown deletion", "ack_message_id", ackMessageID, "err", err)
+	}
 }
 
 // formatKindUsage returns the reply to a /kind that can't be run, listing
