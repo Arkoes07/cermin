@@ -37,7 +37,7 @@ The shape of a Thought, from a small set that changes only when you decide to. I
 _Avoid_: Type, category
 
 **Topic**:
-The subject of a Thought (coding, business, philosophy, ...). A Thought has 1 to 3 of them, and Cermin keeps strong matches only. Open-ended: Cermin assigns them, and new Topics emerge as the Corpus grows. Broad areas of life (work, job hunt, health) are Topics too.
+The subject of a Thought (coding, business, philosophy, ...). A Thought has 1 to 3 of them, and Cermin keeps those likely to be right. Open-ended: Cermin assigns them, and new Topics emerge as the Corpus grows. Broad areas of life (work, job hunt, health) are Topics too. Cermin's Topics are broad areas many Thoughts share; a narrow subject worth tracking is a Declared Topic.
 _Avoid_: Category, tag, label, activity category, area
 
 **Declared Topic**:

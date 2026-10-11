@@ -49,7 +49,7 @@ One user: me. Mostly English or Bahasa Indonesia, occasionally mixed. Capture ha
 ### Classification
 
 - Every Thought gets exactly one **Kind** (starting set: idea, question, observation, reflection, plan) and **1 to 3 Topics** (open-ended, emerging as the Corpus grows).
-- **Fewer correct Topics beat more guessed ones.** Cermin keeps only strong matches; if nothing is strong, it keeps the single best Topic. Cermin reuses an existing Topic rather than creating a near-duplicate.
+- **Every area a Thought is about, but no guesses.** Cermin keeps up to 3 Topics and drops only those unlikely to be right; if none is likely, it keeps the single best Topic. Cermin reuses an existing Topic rather than creating a near-duplicate.
 - Both are shown compactly in the acknowledgement, e.g. `💡 idea · business, retail`.
 - Cermin **stores** how confident it was in each assignment but **never shows** it in chat. Comparing stored confidence against my corrections shows whether "90% sure" really means right 90% of the time.
 - I can correct Kind or Topics by replying. Corrections feed the evaluation set used to measure accuracy.

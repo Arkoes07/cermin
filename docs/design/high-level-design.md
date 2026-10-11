@@ -174,7 +174,7 @@ Libraries:
 | `GEMINI_API_KEY` | 2 | Fly secret; `.env` | Embeddings |
 | `CERMIN_MCP_TOKEN` | 3 | Fly secret; MCP client config | MCP bearer token |
 
-Values that only change with a deploy are constants in code: the WIB timezone (`Asia/Jakarta`), the 8 s Acknowledgement wait, and the 0.7 placeholder keep threshold.
+Values that only change with a deploy are constants in code: the WIB timezone (`Asia/Jakarta`), the 8 s Acknowledgement wait, and the 0.5 placeholder keep threshold.
 
 ## 6. Data model
 
@@ -464,8 +464,8 @@ Confidence is never shown.
 - **`classify(text, kinds, topics)`** returns `{language, kind: {value, confidence}, topics: [{name, confidence}], kind_suggestion}`.
   - Structured output, at low effort.
   - Confidence is the model's own stated value from 0 to 1 (method `verbalized-v1`).
-  - `topics` lists up to 5 candidates, reusing existing names where one fits.
-  - Every candidate comes back unkept. Cermin then keeps those at or above 0.7, at most 3, or the single best if none pass (`cermin.KeepTopics`). Week 3 replaces the 0.7 placeholder (⏳).
+  - `topics` lists 3 to 5 candidates, reusing existing names where one fits.
+  - Every candidate comes back unkept. Cermin then keeps those at or above 0.5, at most 3, or the single best if none pass (`cermin.KeepTopics`). Week 3 replaces the 0.5 placeholder (⏳).
   - `kind_suggestion` is empty unless no Kind fits well.
 - **`embed(texts) → vectors`** (week 2).
 - **`answer(question, thoughts) → {text, cited_ids}`** (week 3).
@@ -483,7 +483,7 @@ Confidence is never shown.
 | Capture pipeline | Long polling into a durable inbox; save before classifying; reply after classification or 8 s. | [ADR-0007](../adr/0007-capture-durable-inbox-long-polling.md), PRD |
 | Data model | Append-only Classifications, every candidate Topic stored, Kinds table changed only by migration, hard delete with inbox scrubbing. | [ADR-0008](../adr/0008-append-only-classifications.md) |
 | Code layout | Domain types and rules in `internal/cermin`; imports point inward; no layer directories, and no interface until a second implementation or a test needs one. | [ADR-0009](../adr/0009-domain-package-and-inward-imports.md) |
-| Day-1 confidence | The model's stated confidence per Assignment (`verbalized-v1`); Topics kept at ≥ 0.7 as a placeholder. | ADR-0006 |
+| Day-1 confidence | The model's stated confidence per Assignment (`verbalized-v1`); Topics kept at ≥ 0.5 as a placeholder. | ADR-0006 |
 | Kind and Topic names | English, except Declared Topics; prose follows the Thought's language. | CONTEXT.md |
 | Corrections | Reply commands; `/topics` replaces the set; Cermin's Classifications are kept. | CONTEXT.md |
 | Kinds | Starting five, defined in the PRD; changed only by your decision. | PRD, ADR-0008 |

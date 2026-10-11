@@ -41,7 +41,7 @@ func New(apiKey, model string) *Classifier {
 }
 
 // Classify asks Claude for the Classification of a Thought's text: one of
-// kinds, up to 5 candidate Topics that reuse topics where one fits, and the
+// kinds, 3 to 5 candidate Topics that reuse topics where one fits, and the
 // Thought's language: en, id or mixed. The candidates come back as Claude
 // gave them, none of them kept; cermin.KeepTopics picks those.
 func (c *Classifier) Classify(
@@ -163,7 +163,9 @@ Kind: the shape of the Thought. Give exactly one, the closest fit:
 	}
 	b.WriteString(`If none fits well, still give the closest one, and put the Kind you would have named in kind_suggestion. Otherwise leave kind_suggestion empty.
 
-Topics: the subjects of the Thought. Give up to 5 candidates, best first. The existing Topics:
+Topics: the broad areas a Thought is about, which many Thoughts share. Examples of the right breadth, not a list to pick from: coding, business, philosophy, work, job hunt, health.
+A Topic never names the Thought's shape, its Kind: a "business idea" is Kind idea with Topic business.
+A Thought is often about more than one area. Give 3 to 5 candidates, best first, and judge each on its own: a second or third area the Thought is about is as right as the first. The existing Topics:
 `)
 	if len(topics) == 0 {
 		b.WriteString("(none yet)\n")
@@ -171,7 +173,7 @@ Topics: the subjects of the Thought. Give up to 5 candidates, best first. The ex
 	for _, t := range topics {
 		fmt.Fprintf(&b, "- %s\n", t)
 	}
-	b.WriteString(`Reuse an existing Topic whenever one fits, rather than creating a near-duplicate of it. A new Topic's name is short, English and lowercase, even when the Thought isn't in English.
+	b.WriteString(`Reuse an existing Topic whenever one fits, rather than creating a near-duplicate of it. A new Topic's name is short, one or two words, English and lowercase, even when the Thought isn't in English.
 
 Confidence: for the Kind and for each Topic, give your own estimate, from 0 to 1, of how likely it is to be right.
 

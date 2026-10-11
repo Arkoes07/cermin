@@ -20,12 +20,12 @@ func TestKeepTopics(t *testing.T) {
 			candidates: []cermin.TopicCandidate{
 				{Name: "cities", Confidence: 0.8},
 				{Name: "transport", Confidence: 0.95},
-				{Name: "design", Confidence: 0.5},
+				{Name: "design", Confidence: 0.4},
 			},
 			want: []cermin.TopicCandidate{
 				{Name: "transport", Confidence: 0.95, Kept: true},
 				{Name: "cities", Confidence: 0.8, Kept: true},
-				{Name: "design", Confidence: 0.5},
+				{Name: "design", Confidence: 0.4},
 			},
 		},
 		{
@@ -46,12 +46,12 @@ func TestKeepTopics(t *testing.T) {
 		{
 			name: "best kept below the threshold",
 			candidates: []cermin.TopicCandidate{
-				{Name: "retail", Confidence: 0.4},
-				{Name: "business", Confidence: 0.6},
+				{Name: "retail", Confidence: 0.3},
+				{Name: "business", Confidence: 0.45},
 			},
 			want: []cermin.TopicCandidate{
-				{Name: "business", Confidence: 0.6, Kept: true},
-				{Name: "retail", Confidence: 0.4},
+				{Name: "business", Confidence: 0.45, Kept: true},
+				{Name: "retail", Confidence: 0.3},
 			},
 		},
 		{

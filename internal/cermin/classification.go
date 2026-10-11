@@ -10,7 +10,7 @@ import (
 const (
 	// keepThreshold is the confidence a candidate Topic needs to be kept, a
 	// placeholder until week 3 measures calibration.
-	keepThreshold = 0.7
+	keepThreshold = 0.5
 	// maxKept is the most Topics a Thought keeps.
 	maxKept = 3
 )
