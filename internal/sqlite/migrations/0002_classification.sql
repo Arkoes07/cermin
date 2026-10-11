@@ -28,8 +28,9 @@ CREATE TABLE topics (
     archived_at TEXT
 );
 
+-- AUTOINCREMENT, so that a deleted Classification's ID never goes to a new one.
 CREATE TABLE classifications (
-    id                INTEGER PRIMARY KEY,
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
     thought_id        INTEGER NOT NULL REFERENCES thoughts (id) ON DELETE CASCADE,
     source            TEXT    NOT NULL CHECK (source IN ('cermin', 'correction', 'declared')),
     kind              TEXT    NOT NULL REFERENCES kinds (name),
