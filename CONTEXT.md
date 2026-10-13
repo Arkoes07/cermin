@@ -59,7 +59,7 @@ _Avoid_: Edit, fix, override
 ### Insights
 
 **Insight**:
-Anything Cermin tells you about the Corpus that no single Thought says on its own.
+Anything Cermin tells you about the Corpus that no single Thought says on its own, pointing to the Thoughts behind it. A count, such as how many Thoughts you captured this week, is not an Insight and takes no Reaction.
 _Avoid_: Analysis, report, summary
 
 **Resurfacing**:

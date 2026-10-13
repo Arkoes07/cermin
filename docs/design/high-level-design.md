@@ -27,6 +27,7 @@ This document describes the whole v1 solution, weeks 1 to 4. The choices that ar
 | Fly.io machine, shared-cpu-1x 256 MB, `iad` | $2.19 |
 | Fly volume, 1 GB | $0.15 |
 | Backups on Cloudflare R2 (free tier: 10 GB, free egress) | $0 |
+| Metrics on Fly's managed Prometheus and Grafana (no charge today; Fly gives notice before that changes) | $0 |
 | Classification on Claude Sonnet 5.5 ($2 / $10 per MTok), low effort: 150 × ~1.5k in, ~350 out | ~$1 to $1.50 |
 | Ask on Claude Sonnet 5.5: ~60 × 5k in, 500 out | ~$0.90 |
 | Digest on Sonnet 5.5: 4 runs | ~$0.20 |
@@ -44,7 +45,7 @@ The models for Ask, Digest and Portrait are upper bounds; each picks its own in 
 | Capture durability | A Thought that Telegram accepted is never lost. | The raw update is committed to SQLite before any AI call. Telegram keeps undelivered updates for 24 h. Litestream streams the database to R2, so at most ~1 s of data is at risk. |
 | Capture independent of AI | A slow or failing AI never blocks saving. | The Acknowledgement goes out once classification finishes or after 8 s, whichever comes first. A catch-up loop classifies the Thought later and edits the Acknowledgement. |
 | Latency | Acknowledgement ≤ 8 s (typically a few seconds). Resurfacing ≤ 10 s after Capture. `/ask` ≤ 30 s. MCP search ≤ 2 s. | One process, local SQLite, brute-force search in memory. |
-| Availability | Best effort on one machine. An outage of up to 24 h loses nothing. A deploy means a few seconds of downtime. | Telegram buffers updates; MCP clients retry; Fly restarts the machine when `/healthz` fails. |
+| Availability | Best effort on one machine. An outage of up to 24 h loses nothing. A deploy means a few seconds of downtime. | Telegram buffers updates; MCP clients retry; Fly restarts the process when it exits. A failing `/healthz` takes the machine out of routing but doesn't restart it ([5.4](#54-monitoring)). |
 | Recovery | Under 1 h to rebuild from backup. | `litestream restore` onto a fresh volume; restore drill in week 1. |
 | Privacy | The Corpus is never public. | Owner-only bot, by Telegram user ID. MCP behind a bearer token over TLS. Paid AI tiers only, which don't train on inputs. Thought text is never written to logs. `/delete` scrubs the database; backups age out after 7 days. |
 | Security | No secrets or real Thoughts in the repo or its issues. | Fly and GitHub secrets; test fixtures use made-up Thoughts. |
@@ -52,7 +53,7 @@ The models for Ask, Digest and Portrait are upper bounds; each picks its own in 
 | Portability | Someone else can run their own Cermin on other hosting or models. | Nothing in the code is host-specific: one binary, a SQLite file and environment variables, needing only a disk and outbound internet. Long polling needs no inbound URL. Each AI provider sits behind one function (`classify`, `embed`) with the model name in config, so another provider is one new implementation ([ADR-0006](../adr/0006-claude-classification-gemini-embeddings.md)). |
 | Evaluability | Everything week 3 needs to measure accuracy and calibration exists from day 1. | [Section 6.4](#64-recorded-from-day-1). |
 | Language | English, Bahasa Indonesia and mixed Thoughts are accepted. | Kind and Topic names are English, except a Declared Topic's; prose follows the Thought's language. |
-| Operability | One person can run it. | One binary; deploy on push to `main`; structured logs; schema migrations embedded in the binary. |
+| Operability | One person can run it. | One binary; deploy on push to `main`; structured logs; schema migrations embedded in the binary. Metrics on Fly's dashboard, saved SQL queries, and a Telegram message when backups fall behind ([5.4](#54-monitoring)). |
 
 ## 3. High-level diagram
 
@@ -85,9 +86,12 @@ flowchart TB
             asker --> retrieval
             resurfacer --> retrieval
             scheduler["Scheduler: Digest (wk 4)"]
+            metrics["Metrics endpoint: /metrics, internal port"]
+            watch["Backup watch, every minute"]
         end
         vol[("cermin.db")]
         ls -.-> vol
+        watch -.->|IPC socket| ls
         app <--> vol
     end
 ```
@@ -99,6 +103,8 @@ flowchart TB
 | Classifier | 1 | One Claude call per Thought with structured output: Kind, candidate Topics, stated confidences, language, `kind_suggestion`. |
 | Catch-up loop | 1 | Every minute: sends missing Acknowledgements and edits out-of-date ones, and edits deleted Thoughts' Acknowledgements to `🗑 deleted` where `/delete` failed to, at most 20 of each, then classifies Thoughts that have no Classification and edits their Acknowledgements. After each failure on a Thought it waits longer before trying it again: 1, 2, 4 … minutes, at most 24 hours, so a Thought the classifier always fails on costs 11 calls on its first day and one a day after that. From week 2 it also embeds. |
 | HTTP server | 1 | `/healthz` for Fly; `/mcp` from week 3. |
+| Metrics endpoint | 1 | `/metrics` for Fly's Prometheus, on its own internal port ([5.4](#54-monitoring)). |
+| Backup watch | 1 | Every minute, asks Litestream whether changes are waiting to reach R2. Tells you in Telegram once they have waited 1 h, and again when they catch up ([5.4](#54-monitoring)). |
 | Embedder | 2 | Embeds Thoughts and queries; backfills when the embedding model changes. |
 | Resurfacer | 2 | Finds strong matches for a new Thought and sends at most 2 as an Insight with 👍/👎. |
 | Retrieval | 2 to 3 | Brute-force cosine over in-memory vectors, filtered by Topic, Kind or time. Shared by Resurfacing, Ask and MCP. |
@@ -120,6 +126,7 @@ flowchart TB
 | Data model | [ADR-0008](../adr/0008-append-only-classifications.md) | Append-only Classifications; every candidate Topic stored; Kinds in a table changed only by migrations. |
 | Code layout | [ADR-0009](../adr/0009-domain-package-and-inward-imports.md) | Clean architecture's dependency rule without its layer directories: the domain in `internal/cermin`, use cases and adapters as sibling packages, wiring in `cmd/cermin`. See [5.2](#52-code-layout). |
 | Deploy | | GitHub Actions runs `go vet` and `go test` on every push, then `fly deploy` on `main` once they pass. The inbox makes this safe: a handler bug leaves updates unprocessed, not lost. |
+| Monitoring | | Metrics about running Cermin on Fly's managed Prometheus; numbers about your use from SQL; one alert, for backups. See [5.4](#54-monitoring). |
 
 ### 5.1 Environments
 
@@ -158,6 +165,7 @@ Libraries:
 - `modernc.org/sqlite`;
 - the official Anthropic Go SDK (`github.com/anthropics/anthropic-sdk-go`);
 - the official MCP Go SDK (`github.com/modelcontextprotocol/go-sdk`), from week 3;
+- the Prometheus Go client (`github.com/prometheus/client_golang`), for `/metrics`;
 - the standard library for everything else.
 
 ### 5.3 Configuration and secrets
@@ -171,10 +179,41 @@ Libraries:
 | `CERMIN_CLASSIFY_MODEL` | 1 | optional; default `claude-sonnet-5-5` | Classification model |
 | `R2_ENDPOINT`, `R2_BUCKET`, `LITESTREAM_ACCESS_KEY_ID`, `LITESTREAM_SECRET_ACCESS_KEY` | 1 | Fly secrets | Litestream replica on R2 |
 | `FLY_API_TOKEN` | 1 | GitHub Actions secret | Deploy on push to `main` |
+| `CERMIN_LITESTREAM_SOCKET` | 1 | `fly.toml`; unset locally | Litestream's IPC socket, read by the backup watch; unset turns the watch off |
 | `GEMINI_API_KEY` | 2 | Fly secret; `.env` | Embeddings |
 | `CERMIN_MCP_TOKEN` | 3 | Fly secret; MCP client config | MCP bearer token |
 
-Values that only change with a deploy are constants in code: the WIB timezone (`Asia/Jakarta`), the 8 s Acknowledgement wait, and the 0.5 placeholder keep threshold.
+Values that only change with a deploy are constants in code: the WIB timezone (`Asia/Jakarta`), the 8 s Acknowledgement wait, the 0.5 placeholder keep threshold, the metrics port (9091) and the backup watch's 1 h threshold.
+
+### 5.4 Monitoring
+
+Two kinds of number live in two places. Numbers about running Cermin go to Fly's managed Prometheus and are graphed in its Grafana at fly-metrics.net. Numbers about your use of Cermin are already in the database and come from SQL.
+
+| Where | What | How |
+|---|---|---|
+| fly-metrics.net | Claude calls by purpose, model and outcome; calls per Thought; call duration; tokens, turned into cost by the model's price in the panel's query; how long changes have waited to reach R2; Go runtime and machine metrics | Fly scrapes `/metrics` on port 9091. Only fly.toml's `[metrics]` section names that port, so it is never public: call counts by the hour would show when you think. Fly keeps about 15 days. The dashboard is built by hand, then exported to `docs/ops/dashboard.json` once it settles. |
+| SQL on the live database | Thoughts per day, the success checks, Corrections, Acknowledgements sent as `✓ saved` | `fly ssh console -C "sqlite3 -readonly -box /data/cermin.db"`, then a query from [`docs/ops/queries.sql`](../ops/queries.sql) |
+| `fly logs` | the `slog` lines | No log sink. |
+| Anthropic Console, monthly | the bill | Checks that the cost worked out from tokens matches it. |
+
+Metrics:
+- `cermin_claude_requests_total{purpose, model, outcome}`, `cermin_claude_request_duration_seconds{purpose, model}` and `cermin_claude_tokens_total{purpose, model, direction}`, recorded by `internal/claude`. `purpose` is `classify` until week 3 adds `answer`. Each AI adapter records its own calls, so adapters still import nothing else in this module ([5.2](#52-code-layout)).
+- `cermin_thoughts_captured_total`, recorded by `internal/capture`, turns calls into calls per Thought.
+- `cermin_backup_unsynced_seconds`, recorded by the backup watch.
+- Go runtime metrics, from the client's default registry.
+
+**One alert.** Every minute the backup watch asks Litestream, over its IPC socket, whether the database has changes not yet on R2, and remembers when it first saw them waiting. Once they have waited 1 h, the bot tells you in Telegram, and it tells you again when backups catch up. The state lives in memory, so a restart starts the count again. With `CERMIN_LITESTREAM_SOCKET` unset, as in development, the watch is off. The code is a `litestream` adapter for the socket and a `backup` use case for the watch.
+
+Nothing else alerts. A dead process shows as silence after your next Thought: at ~5 Thoughts a day you notice within a day, and Telegram keeps updates for 24 h. A failing classifier shows as an Acknowledgement stuck at `✓ saved`, and a skipped update gets a reply.
+
+**Health.** Fly doesn't restart a Machine whose health check fails. A failing `/healthz` takes it out of routing, which blocks `/mcp` from week 3, shows in `fly checks list`, and fails a deploy. No watchdog restarts it: every call the poller makes has a timeout and it retries forever, so a stale poller means trouble with Telegram, the network or the token, none of which a restart fixes. A crash exits the process, and Fly restarts that.
+
+Not built, and when to add it:
+- **`/stats` in the bot**, if you want the numbers away from a laptop.
+- **A table of AI calls**, if a question needs more than 15 days of history, or the cost of one Thought.
+- **Anthropic's Usage and Cost API**, if the cost worked out from tokens drifts from the bill. It needs an Admin key, which doesn't belong on the server, and reports by day only.
+- **An uptime monitor or other alerts**, if silence goes unnoticed for more than a day.
+- **A log sink**, when you need logs older than Fly keeps.
 
 ## 6. Data model
 
@@ -460,8 +499,9 @@ Confidence is never shown.
 
 | Path | Week | Purpose |
 |---|---|---|
-| `/healthz` | 1 | 200 while the last successful `getUpdates` finished under 2 minutes ago, else 503; Fly restarts the machine on failure. |
+| `/healthz` | 1 | 200 while the last successful `getUpdates` finished under 2 minutes ago, else 503. While it fails, Fly takes the machine out of routing and fails a deploy; it doesn't restart it ([5.4](#54-monitoring)). |
 | `/mcp` | 3 | MCP Streamable HTTP endpoint. |
+| `/metrics` | 1 | Prometheus metrics for Fly's scraper, on internal port 9091 only, never public ([5.4](#54-monitoring)). |
 
 ### 8.5 AI contracts
 
@@ -493,6 +533,7 @@ Confidence is never shown.
 | Kinds | Starting five, defined in the PRD; changed only by your decision. | PRD, ADR-0008 |
 | Time | UTC stored, read in WIB; no per-Thought timezone in v1. | |
 | Deploy | Tests on every push; deploy on `main` once they pass. | [5](#5-runtime-decisions) |
+| Monitoring | Metrics about running Cermin on Fly's managed Prometheus (about 15 days), on a port never public; numbers about your use from SQL; the only alert is a Telegram message when changes wait 1 h to reach R2; no watchdog, since a restart wouldn't fix what stalls the poller. | [5.4](#54-monitoring) |
 
 ## 10. Designed in their week
 
