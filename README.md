@@ -2,7 +2,7 @@
 
 Cermin (Indonesian for "mirror") turns the Thoughts I send to a Telegram bot into a Corpus that mirrors how I think. It classifies each Thought, resurfaces related past ones, points out Loops, and builds a Portrait of my thinking.
 
-**Status:** week 1 of 4 (12–18 Oct). Product docs and technical design are done; capture and classification run locally. Next: deploy to Fly.io (#3) so they go live in Telegram.
+**Status:** week 1 of 4 (12–18 Oct). Capture and classification are live in Telegram, deployed to Fly.io and backed up to Cloudflare R2. Next: the restore drill (#4), which real Thoughts wait for, then metrics (#23) and the backup watch (#24).
 
 - Product: [docs/product/PRD.md](docs/product/PRD.md)
 - Vocabulary: [CONTEXT.md](CONTEXT.md)
