@@ -146,8 +146,8 @@ Module `github.com/arkoes07/cermin`. Imports point inward, toward `internal/cerm
 | Path | Role | Holds |
 |---|---|---|
 | `internal/cermin/` | domain | the glossary types (Thought, Kind, Classification, candidate Topics) and the rules about them that need no I/O, such as the keep rule (`KeepTopics`) |
-| `internal/capture/` | use case | the inbox handler, commands, the catch-up loop |
-| `internal/sqlite/` | adapter | SQLite access; migrations embedded and tracked with `PRAGMA user_version`; `PRAGMA foreign_keys = ON` |
+| `internal/capture/` | use case | the inbox handler, commands, the catch-up loop, the poller's `/healthz` |
+| `internal/sqlite/` | adapter | SQLite access; migrations embedded and tracked with `PRAGMA user_version`; `PRAGMA foreign_keys = ON`; `PRAGMA secure_delete = ON`, so a deleted row leaves the file and, once retention passes, the backups |
 | `internal/claude/` | adapter | Claude API calls; today the classification call, with its prompt and output schema |
 | `internal/telegram/` | adapter | Bot API client over `net/http`: `getUpdates`, `sendMessage`, `editMessageText`, `sendChatAction` |
 | `cmd/cermin/` | wiring | `main` with subcommands: `serve` (wk 1), `import` (wk 2), `eval` (wk 3); reads the environment and builds every part with its constructor, without a dependency-injection library |
@@ -183,7 +183,7 @@ Libraries:
 | `GEMINI_API_KEY` | 2 | Fly secret; `.env` | Embeddings |
 | `CERMIN_MCP_TOKEN` | 3 | Fly secret; MCP client config | MCP bearer token |
 
-Values that only change with a deploy are constants in code: the WIB timezone (`Asia/Jakarta`), the 8 s Acknowledgement wait, the 0.5 placeholder keep threshold, the metrics port (9091) and the backup watch's 1 h threshold.
+Values that only change with a deploy are constants in code: the WIB timezone (`Asia/Jakarta`), the 8 s Acknowledgement wait, the 0.5 placeholder keep threshold, the HTTP port (8080), the metrics port (9091) and the backup watch's 1 h threshold.
 
 ### 5.4 Monitoring
 

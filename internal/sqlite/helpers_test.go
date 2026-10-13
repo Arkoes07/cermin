@@ -11,7 +11,13 @@ import (
 // openDB opens a new database in a temporary directory.
 func openDB(t *testing.T) *DB {
 	t.Helper()
-	db, err := Open(t.Context(), filepath.Join(t.TempDir(), "cermin.db"))
+	return openDBAt(t, filepath.Join(t.TempDir(), "cermin.db"))
+}
+
+// openDBAt is openDB with its database at path.
+func openDBAt(t *testing.T, path string) *DB {
+	t.Helper()
+	db, err := Open(t.Context(), path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

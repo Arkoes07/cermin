@@ -3,6 +3,8 @@ package capture_test
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -91,6 +93,39 @@ func TestBot_Poll_CutsCopiesOfOtherMessages(t *testing.T) {
 	wantEdits := []editedMessage{{ChatID: ownerID, MessageID: ackID, Text: "✏️ 📋 plan · running"}}
 	if edits := api.editedMessages(); !slices.Equal(edits, wantEdits) {
 		t.Errorf("edited %+v, want %+v", edits, wantEdits)
+	}
+}
+
+func TestBot_ServeHealth_FailsOncePollingStops(t *testing.T) {
+	t.Parallel()
+	bot, _, _ := newBot(t, nil) // polling never classifies
+	now := thoughtTime
+	bot.SetTimeNow(func() time.Time { return now })
+	checkHealth := func() int {
+		rec := httptest.NewRecorder()
+		bot.ServeHealth(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+		return rec.Code
+	}
+
+	if code := checkHealth(); code != http.StatusServiceUnavailable {
+		t.Errorf("before the first poll: status %d, want 503", code)
+	}
+	if err := bot.Poll(t.Context()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	now = now.Add(2*time.Minute - time.Second)
+	if code := checkHealth(); code != http.StatusOK {
+		t.Errorf("1m59s after a poll: status %d, want 200", code)
+	}
+	now = now.Add(time.Second)
+	if code := checkHealth(); code != http.StatusServiceUnavailable {
+		t.Errorf("2m after the last poll: status %d, want 503", code)
+	}
+	if err := bot.Poll(t.Context()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if code := checkHealth(); code != http.StatusOK {
+		t.Errorf("after a fresh poll: status %d, want 200", code)
 	}
 }
 

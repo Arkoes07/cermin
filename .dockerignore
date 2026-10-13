@@ -1,0 +1,6 @@
+# Secrets and real Thoughts never leave the laptop, not even for the builder.
+.env
+data
+**/*.db
+**/*.sqlite*
+.git

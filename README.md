@@ -18,7 +18,11 @@ set -a; . ./.env; set +a   # TELEGRAM_BOT_TOKEN, TELEGRAM_OWNER_ID, ANTHROPIC_AP
 go run ./cmd/cermin serve  # database at data/cermin.db unless CERMIN_DB_PATH is set
 ```
 
-Thoughts are classified by `claude-sonnet-5-5` unless `CERMIN_CLASSIFY_MODEL` names another model. `go test -tags integration ./internal/claude/` checks the classifier against the real API.
+Thoughts are classified by `claude-sonnet-5-5` unless `CERMIN_CLASSIFY_MODEL` names another model. `go test -tags integration ./internal/claude/` checks the classifier against the real API. `curl -i localhost:8080/healthz` answers 200 while the last poll of Telegram finished under 2 minutes ago, 503 otherwise.
+
+## Deploy
+
+Every push and pull request runs `go vet` and `go test` in GitHub Actions. A push to `main` that passes them then deploys: `flyctl deploy --remote-only --ha=false` builds the [Dockerfile](Dockerfile) on Fly's builder and replaces the one machine of the app in [fly.toml](fly.toml). Inside it, Litestream starts `cermin serve`, first restoring the database from R2 if the volume has none, and replicates every change to R2 ([litestream.yml](litestream.yml)). Secrets are Fly secrets ([design doc §5.3](docs/design/high-level-design.md#53-configuration-and-secrets)); none is in this repo.
 
 Built for one user, me. Outside pull requests are not accepted yet ([ADR-0001](docs/adr/0001-agpl-license.md)).
 

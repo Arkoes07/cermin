@@ -37,8 +37,10 @@ func Open(ctx context.Context, path string) (*DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("creating database directory: %w", err)
 	}
-	// The driver runs these pragmas on every new connection.
-	const pragmas = "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)"
+	// The driver runs these pragmas on every new connection. secure_delete
+	// zeroes deleted rows, so that backups made after a delete don't hold them.
+	const pragmas = "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)" +
+		"&_pragma=secure_delete(ON)"
 	pool, err := sql.Open("sqlite", path+pragmas)
 	if err != nil {
 		return nil, fmt.Errorf("opening database: %w", err)

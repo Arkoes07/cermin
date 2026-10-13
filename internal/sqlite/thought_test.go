@@ -1,6 +1,9 @@
 package sqlite
 
 import (
+	"bytes"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/arkoes07/cermin/internal/cermin"
@@ -41,5 +44,35 @@ func TestDB_DeleteThought_KeepsIDsUnused(t *testing.T) {
 	if newClassification.ID <= deletedClassification.ID {
 		t.Errorf("new Classification's ID = %d, want above the deleted one's, %d",
 			newClassification.ID, deletedClassification.ID)
+	}
+}
+
+// Litestream copies the file's pages to R2, and retention ages out only the
+// copies made before a delete, so the deleted text must leave the file's
+// pages too, not just the table.
+func TestDB_DeleteThought_ZeroesText(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	path := filepath.Join(t.TempDir(), "cermin.db")
+	db := openDBAt(t, path)
+
+	thought := saveThought(t, db)
+	if err := db.DeleteThought(ctx, thought.ID, 0); err != nil {
+		t.Fatalf("DeleteThought: %v", err)
+	}
+	// Moves every page into the file and empties the WAL.
+	var isBusy bool
+	var walPages, movedPages int
+	err := db.pool.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&isBusy, &walPages, &movedPages)
+	if err != nil || isBusy {
+		t.Fatalf("checkpoint: busy %t, %v", isBusy, err)
+	}
+
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading the file: %v", err)
+	}
+	if bytes.Contains(content, []byte(thought.Text)) {
+		t.Errorf("the file still holds the deleted Thought's text")
 	}
 }

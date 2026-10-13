@@ -12,9 +12,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/arkoes07/cermin/internal/cermin"
@@ -25,6 +27,9 @@ import (
 const (
 	// pollTimeout is how long one getUpdates call waits for an update.
 	pollTimeout = 50 * time.Second
+	// staleAfter is how long after the last successful getUpdates the Bot
+	// stops counting as healthy.
+	staleAfter = 2 * time.Minute
 	// retryDelay is the pause after a failed poll, or a failure to process
 	// the inbox.
 	retryDelay = 5 * time.Second
@@ -57,8 +62,8 @@ type ClassifyFunc func(
 // Bot moves Telegram updates into the inbox, captures the owner's Thoughts
 // and runs their Corrections and deletes from it, and catches up on the
 // Captures left unfinished. One goroutine at a time may call Poll, and one may
-// call ProcessInbox or Process; Run does both. CatchUp is safe for concurrent
-// use.
+// call ProcessInbox or Process; Run does both. CatchUp and ServeHealth are safe
+// for concurrent use.
 type Bot struct {
 	db       *sqlite.DB
 	tg       *telegram.Client
@@ -66,6 +71,7 @@ type Bot struct {
 	classify ClassifyFunc
 	offset   int64            // the next update_id to ask Telegram for; only Poll uses it
 	timeNow  func() time.Time // time.Now, unless a test sets another clock
+	polledAt atomic.Int64     // when the last successful getUpdates finished, in Unix nanoseconds; 0 before the first
 
 	// repliedAlbumID is the media_group_id of the last album that got a
 	// reply. Only Process uses it, so it is lost on a restart.
@@ -158,6 +164,7 @@ func (b *Bot) Poll(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	b.polledAt.Store(b.timeNow().UnixNano())
 	for _, u := range updates {
 		row := sqlite.InboxUpdate{ID: u.ID, Payload: u.Raw}
 		// An edit carries the message's text too, so /delete must find it.
@@ -172,6 +179,14 @@ func (b *Bot) Poll(ctx context.Context) error {
 		b.offset = u.ID + 1
 	}
 	return nil
+}
+
+// ServeHealth answers 200 while the last successful getUpdates finished under
+// staleAfter ago, and 503 otherwise.
+func (b *Bot) ServeHealth(w http.ResponseWriter, _ *http.Request) {
+	if b.timeNow().Sub(time.Unix(0, b.polledAt.Load())) >= staleAfter {
+		http.Error(w, "no successful getUpdates in "+staleAfter.String(), http.StatusServiceUnavailable)
+	}
 }
 
 // ProcessInbox processes the unprocessed inbox updates in order. It stops at

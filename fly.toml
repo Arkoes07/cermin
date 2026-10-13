@@ -1,0 +1,30 @@
+# One always-on machine with the database on a volume (ADR-0005). Secrets are
+# set with `fly secrets set`, never here.
+app = "cermin-arkoes"
+primary_region = "iad"
+
+[env]
+  CERMIN_DB_PATH = "/data/cermin.db"
+
+[mounts]
+  source = "cermin_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  min_machines_running = 1
+
+  # A failing check takes the machine out of routing and fails a deploy; Fly
+  # doesn't restart it. The first poll can take 50 s to return.
+  [[http_service.checks]]
+    grace_period = "60s"
+    interval = "30s"
+    timeout = "5s"
+    method = "GET"
+    path = "/healthz"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

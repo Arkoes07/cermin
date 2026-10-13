@@ -1,0 +1,16 @@
+# Litestream replicates the database to Cloudflare R2. It reads the R2 key
+# from LITESTREAM_ACCESS_KEY_ID and LITESTREAM_SECRET_ACCESS_KEY.
+snapshot:
+  interval: 24h
+  # A snapshot leaves R2, with the changes before it, at the first snapshot
+  # after it is older than this. So a Thought deleted just after a snapshot
+  # leaves R2 within retention + interval: 6 days.
+  retention: 120h
+
+dbs:
+  - path: ${CERMIN_DB_PATH} # /data/cermin.db, set in fly.toml
+    replica:
+      type: s3
+      endpoint: ${R2_ENDPOINT}
+      bucket: ${R2_BUCKET}
+      path: cermin.db
