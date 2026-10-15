@@ -1,6 +1,6 @@
 # Cermin: Product Requirements (v1)
 
-Status: accepted, 2026-10-03. Milestones moved one week later on 2026-10-09. Vocabulary: [CONTEXT.md](../../CONTEXT.md).
+Status: accepted, 2026-10-03. Milestones moved one week later on 2026-10-09. Cermin writes only English from 2026-10-15. Vocabulary: [CONTEXT.md](../../CONTEXT.md).
 
 ## Problem
 
@@ -78,12 +78,13 @@ A mood is a reflection, a quote or a "TIL" is an observation, and a decision is 
 ### Resurfacing
 
 - After a Thought is captured, Cermin replies within **about 10 seconds** with related past Thoughts, at most 2.
-- It does this **only when the match is strong**. Otherwise the acknowledgement is the whole reply. Showing a weak match every time would train me to ignore them.
+- It does this **only when the match is strong**: about the same specific subject, in any language, not merely sharing a Topic. Otherwise the acknowledgement is the whole reply. Showing a weak match every time would train me to ignore them.
+- Thoughts I still remember never come back: those from the last 24 hours, and the one I replied to.
 - A question and its later answer find each other this way. There is no open/closed tracking for questions.
 
 ### Reactions
 
-- Every Insight message offers 👍 (useful) or 👎 (noise). The 👍 rate measures whether Insights are worth anything and whether the Resurfacing threshold is right.
+- Every Insight message offers 👍 (useful) or 👎 (noise) as buttons under it. My latest tap counts, so a mis-tap can be fixed. The 👍 rate measures whether Insights are worth anything and whether the Resurfacing threshold is right.
 
 ### Ask
 
@@ -112,8 +113,7 @@ A mood is a reflection, a quote or a "TIL" is an observation, and a decision is 
 
 ## Language
 
-- Acknowledgements and Resurfacings reply in the language of the Thought.
-- The Digest and the Portrait are in English.
+- Cermin writes only English: Acknowledgements, Resurfacings, answers to an Ask, the Digest and the Portrait. Thoughts are quoted as written.
 - Thoughts that mix English and Indonesian are accepted and need no special handling.
 
 ## Constraints
@@ -166,9 +166,7 @@ Considered, deliberately left out of v1, and worth revisiting when the trigger a
 
 These aren't product decisions. They must satisfy the constraints above:
 
-- Which model(s) to use for classification, Resurfacing and Ask, and whether to combine them (for example, embeddings for similarity and an LLM for classification).
+- Which model answers an Ask.
 - How confidence is measured for Kind and Topic assignments (a language model's self-reported confidence is usually poorly calibrated), and the threshold for "strong" Topics.
 - How Declared Topics are matched to Thoughts from their name and description.
-- How a "strong match" for Resurfacing is defined and tuned.
 - How Loops are detected.
-- Hosting and storage.

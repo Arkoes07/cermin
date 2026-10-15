@@ -63,7 +63,7 @@ Anything Cermin tells you about the Corpus that no single Thought says on its ow
 _Avoid_: Analysis, report, summary
 
 **Resurfacing**:
-An Insight that brings back past Thoughts related to the one just captured.
+An Insight that brings back up to 2 past Thoughts strongly related to the one just captured: about the same specific subject, in any language, not merely sharing a Topic. Thoughts you still remember never come back: those from the last 24 hours, and the one the new Thought replies to.
 _Avoid_: Reminder, recommendation, match
 
 **Loop**:

@@ -2,7 +2,7 @@
 
 Status: **accepted**, 2026-10-09. Each week updates its own open questions ([section 10](#10-designed-in-their-week)). Product: [PRD](../product/PRD.md). Vocabulary: [CONTEXT.md](../../CONTEXT.md). Decisions: [docs/adr/](../adr/).
 
-This document describes the whole v1 solution, weeks 1 to 4. The choices that are hard to undo are settled here: runtime, storage, hosting, AI provider, capture pipeline, MCP transport and data model. Thresholds and algorithms are designed in their own week; [section 10](#10-designed-in-their-week) lists them. That covers strong Topic, strong Resurfacing match, Loops, Digest, Portrait and Declared Topic matching.
+This document describes the whole v1 solution, weeks 1 to 4. The choices that are hard to undo are settled here: runtime, storage, hosting, AI provider, capture pipeline, MCP transport and data model. Thresholds and algorithms are designed in their own week; [section 10](#10-designed-in-their-week) lists them. That covers strong Topic, Loops, Digest, Portrait and Declared Topic matching.
 
 ## 1. Capacity plan
 
@@ -52,7 +52,7 @@ The models for Ask, Digest and Portrait are upper bounds; each picks its own in 
 | Cost | ≤ $10/month for everything. | [Section 1](#monthly-cost). |
 | Portability | Someone else can run their own Cermin on other hosting or models. | Nothing in the code is host-specific: one binary, a SQLite file and environment variables, needing only a disk and outbound internet. Long polling needs no inbound URL. Each AI provider sits behind one function (`classify`, `embed`) with the model name in config, so another provider is one new implementation ([ADR-0006](../adr/0006-claude-classification-gemini-embeddings.md)). |
 | Evaluability | Everything week 3 needs to measure accuracy and calibration exists from day 1. | [Section 6.4](#64-recorded-from-day-1). |
-| Language | English, Bahasa Indonesia and mixed Thoughts are accepted. | Kind and Topic names are English, except a Declared Topic's; prose follows the Thought's language. |
+| Language | English, Bahasa Indonesia and mixed Thoughts are accepted. | Cermin writes only English, and quotes Thoughts as written. Kind and Topic names are English, except a Declared Topic's. |
 | Operability | One person can run it. | One binary; deploy on push to `main`; structured logs; schema migrations embedded in the binary. Metrics on Fly's dashboard, saved SQL queries, and a Telegram message when backups fall behind ([5.4](#54-monitoring)). |
 
 ## 3. High-level diagram
@@ -106,7 +106,7 @@ flowchart TB
 | Metrics endpoint | 1 | `/metrics` for Fly's Prometheus, on its own internal port ([5.4](#54-monitoring)). |
 | Backup watch | 1 | Every minute, asks Litestream whether changes are waiting to reach R2. Tells you in Telegram once they have waited 1 h, and again when they catch up ([5.4](#54-monitoring)). |
 | Embedder | 2 | Embeds Thoughts and queries; backfills when the embedding model changes. |
-| Resurfacer | 2 | Finds strong matches for a new Thought and sends at most 2 as an Insight with 👍/👎. |
+| Resurfacer | 2 | After the Acknowledgement, finds up to 2 strongly related past Thoughts and sends them as an Insight with 👍/👎 buttons ([ADR-0010](../adr/0010-resurfacing-raw-text-calibrated-cutoff.md)). |
 | Retrieval | 2 to 3 | Brute-force cosine over in-memory vectors, filtered by Topic, Kind or time. Shared by Resurfacing, Ask and MCP. |
 | Ask | 3 | `/ask`: retrieval, then Claude answers with citations. |
 | MCP handler | 3 | Read-only tools over Streamable HTTP. |
@@ -118,13 +118,14 @@ flowchart TB
 | Decision | Record | Summary |
 |---|---|---|
 | Language | | Go for all of v1. |
-| Process shape and storage | [ADR-0003](../adr/0003-one-process-embedded-sqlite.md) | One binary, one process: bot, workers, MCP endpoint and scheduler. SQLite in WAL mode with a pure-Go driver, replicated by Litestream. Subcommands handle one-off jobs: `serve`, `import` (wk 2), `eval` (wk 3). |
+| Process shape and storage | [ADR-0003](../adr/0003-one-process-embedded-sqlite.md) | One binary, one process: bot, workers, MCP endpoint and scheduler. SQLite in WAL mode with a pure-Go driver, replicated by Litestream. Subcommands handle one-off jobs: `serve`, `import` (wk 2), `pairs` (wk 2), `eval` (wk 3). |
 | MCP transport | [ADR-0004](../adr/0004-remote-mcp-bearer-token.md) | Streamable HTTP inside the same process, bearer token, no OAuth in v1. |
 | Hosting | [ADR-0005](../adr/0005-fly-single-machine-r2-backups.md) | Fly.io, one always-on machine in `iad`; Litestream backups on Cloudflare R2. |
 | AI provider | [ADR-0006](../adr/0006-claude-classification-gemini-embeddings.md) | Claude Sonnet 5.5 classifies from day 1; gemini-embedding-2 from week 2; paid tiers only. |
 | Capture pipeline | [ADR-0007](../adr/0007-capture-durable-inbox-long-polling.md) | Long polling into a database inbox; the Thought is saved before any AI call. |
 | Data model | [ADR-0008](../adr/0008-append-only-classifications.md) | Append-only Classifications; every candidate Topic stored; Kinds in a table changed only by migrations. |
 | Code layout | [ADR-0009](../adr/0009-domain-package-and-inward-imports.md) | Clean architecture's dependency rule without its layer directories: the domain in `internal/cermin`, use cases and adapters as sibling packages, wiring in `cmd/cermin`. See [5.2](#52-code-layout). |
+| Resurfacing | [ADR-0010](../adr/0010-resurfacing-raw-text-calibrated-cutoff.md) | Only the raw text is embedded. A strong relation is a cosine similarity at or above a cut-off calibrated on your labelled pairs. |
 | Deploy | | GitHub Actions runs `go vet` and `go test` on every push, then `fly deploy` on `main` once they pass. The inbox makes this safe: a handler bug leaves updates unprocessed, not lost. |
 | Monitoring | | Metrics about running Cermin on Fly's managed Prometheus; numbers about your use from SQL; one alert, for backups. See [5.4](#54-monitoring). |
 
@@ -150,7 +151,7 @@ Module `github.com/arkoes07/cermin`. Imports point inward, toward `internal/cerm
 | `internal/sqlite/` | adapter | SQLite access; migrations embedded and tracked with `PRAGMA user_version`; `PRAGMA foreign_keys = ON`; `PRAGMA secure_delete = ON`, so a deleted row leaves the file and, once retention passes, the backups |
 | `internal/claude/` | adapter | Claude API calls; today the classification call, with its prompt and output schema |
 | `internal/telegram/` | adapter | Bot API client over `net/http`: `getUpdates`, `sendMessage`, `editMessageText`, `sendChatAction` |
-| `cmd/cermin/` | wiring | `main` with subcommands: `serve` (wk 1), `import` (wk 2), `eval` (wk 3); reads the environment and builds every part with its constructor, without a dependency-injection library |
+| `cmd/cermin/` | wiring | `main` with subcommands: `serve` (wk 1), `import` (wk 2), `pairs` (wk 2), `eval` (wk 3); reads the environment and builds every part with its constructor, without a dependency-injection library |
 
 Later weeks add packages when they need them. New code goes in the first place that fits:
 
@@ -181,9 +182,10 @@ Libraries:
 | `FLY_API_TOKEN` | 1 | GitHub Actions secret | Deploy on push to `main` |
 | `CERMIN_LITESTREAM_SOCKET` | 1 | `fly.toml`; unset locally | Litestream's IPC socket, read by the backup watch; unset turns the watch off |
 | `GEMINI_API_KEY` | 2 | Fly secret; `.env` | Embeddings |
+| `CERMIN_EMBED_MODEL` | 2 | optional; default `gemini-embedding-2` | Embedding model |
 | `CERMIN_MCP_TOKEN` | 3 | Fly secret; MCP client config | MCP bearer token |
 
-Values that only change with a deploy are constants in code: the WIB timezone (`Asia/Jakarta`), the 8 s Acknowledgement wait, the 0.5 placeholder keep threshold, the HTTP port (8080), the metrics port (9091) and the backup watch's 1 h threshold.
+Values that only change with a deploy are constants in code: the WIB timezone (`Asia/Jakarta`), the 8 s Acknowledgement wait, the 0.5 placeholder keep threshold, the HTTP port (8080), the metrics port (9091), the backup watch's 1 h threshold, and the Resurfacing cut-off ([ADR-0010](../adr/0010-resurfacing-raw-text-calibrated-cutoff.md)) and 24 h window.
 
 ### 5.4 Monitoring
 
@@ -283,7 +285,7 @@ erDiagram
     EMBEDDINGS {
         int thought_id FK
         text model
-        blob vector "float32"
+        blob vector "float32, of the raw text"
         datetime created_at
     }
     INSIGHTS {
@@ -291,7 +293,7 @@ erDiagram
         text type "resurfacing, ask, digest or portrait"
         int thought_id FK "trigger, nullable"
         text question
-        text body
+        text body "a Resurfacing's holds no Thought text"
         text meta "model, threshold, version"
         int tg_message_id UK
         datetime created_at
@@ -304,7 +306,7 @@ erDiagram
     REACTIONS {
         int id PK
         int insight_id FK
-        int value "+1 or -1"
+        int value "+1 or -1; the latest tap counts"
         datetime created_at
     }
     THOUGHTS ||--o{ CLASSIFICATIONS : "classified by"
@@ -361,8 +363,9 @@ Each table is created in the week that first needs it:
   - Declared Topics keep your spelling.
   - Declaring a name that already exists turns that same row into a Declared Topic, so its Thoughts come with it.
 - **Embeddings are keyed by (Thought, model).** Two models can sit side by side for comparison, and switching models is a backfill that costs cents.
+- **Reactions are append-only.** Each tap adds a row, and an Insight's latest one is your verdict.
 - **Routing replies.** `thoughts.ack_message_id` maps a reply to an Acknowledgement back to its Thought, and `insights.tg_message_id` maps a 👍/👎 back to its Insight.
-- **Delete is a hard delete.** Deleting a Thought cascades to its Classifications, embeddings and citations. The `telegram_updates` rows whose `message_id` is the Thought's, its message and its edits, are deleted too, with the `/delete` itself. No other row holds its text, since a stored update keeps only the ID of a message it replies to or pins ([6.4](#64-recorded-from-day-1)), and an edit that arrives after the delete is deleted from the inbox once it gets its reply. Until the Acknowledgement shows `🗑 deleted`, its message ID waits in `deleted_acks`, with no text. Insights keep their body as sent, and backups age out within 7 days.
+- **Delete is a hard delete.** Deleting a Thought cascades to its Classifications, embeddings and citations. The `telegram_updates` rows whose `message_id` is the Thought's, its message and its edits, are deleted too, with the `/delete` itself. No other row holds its text, since a stored update keeps only the ID of a message it replies to or pins ([6.4](#64-recorded-from-day-1)), and an edit that arrives after the delete is deleted from the inbox once it gets its reply. Until the Acknowledgement shows `🗑 deleted`, its message ID waits in `deleted_acks`, with no text. A Resurfacing stores the IDs and scores of the Thoughts it cites, never their words, so its citations go with them. A Resurfacing that the deleted Thought triggered loses that link (`thought_id` becomes NULL) and keeps its Reactions. Other Insights keep their body as sent. Backups age out within 7 days.
 
 ### 6.3 Topic lifecycle
 
@@ -439,8 +442,6 @@ Every step is idempotent. The Thought is unique on its Telegram message ID, and 
 
 ### 7.4 Later weeks (outline)
 
-- **Resurfacing (wk 2).** After classification, Cermin embeds the Thought and scores it against every other Thought. If the best matches pass the threshold (⏳), it sends at most 2 as an Insight with 👍/👎 buttons. It stores the Insight, citations, scores and threshold.
-- **WhatsApp import (wk 2).** Cermin parses the chat export and creates Thoughts with `source = whatsapp` and the export's timestamps, deduped on time and text. The catch-up loop then classifies and embeds them. How the file reaches the server is decided in week 2 (⏳).
 - **Ask (wk 3).** `/ask <question>` embeds the question, retrieves the top Thoughts, and has Claude answer citing them. The answer is stored as an Insight.
 - **MCP (wk 3).** Claude Code or Desktop calls read-only retrieval tools, and the client's model writes the answer.
 - **Declared Topics (wk 3).** `/topic add` creates the Topic or takes it over. Cermin then backfills past Thoughts that match (⏳ matching), adding Classifications with source `declared`. Each one leaves its Thought's Acknowledgement out of date, so the catch-up loop edits it, silently, to show the Declared Topic. To keep past Acknowledgements as they are, make the step that brings an Acknowledgement up to date skip `declared` Classifications.
@@ -458,7 +459,7 @@ Every step is idempotent. The Thought is unique on its Telegram message ID, and 
 | `/kind <kind>` | reply | 1 | Correction of the Kind; only existing Kinds. |
 | `/topics <a>, <b>, <c>` | reply | 1 | Correction that replaces the whole Topic set (1 to 3). |
 | `/start`, `/help` | anywhere | 1 | Lists the commands. |
-| 👍 / 👎 | buttons on an Insight | 2 | Reaction. |
+| 👍 / 👎 | buttons on an Insight | 2 | Reaction; the latest tap counts, and the tapped button shows ✓. |
 | `/ask <question>` | anywhere | 3 | Ask. |
 | `/topic add <name> <description>` | anywhere | 3 | Declares a Topic, or updates its description. |
 | `/topic archive <name>` | anywhere | 3 | Archives a Declared Topic. |
@@ -476,15 +477,25 @@ Edge cases:
 
 All messages are sent as plain text, with no Markdown parse mode.
 
-### 8.2 Acknowledgement format
+### 8.2 Message formats
 
-The format is `<Kind emoji> <kind> · <topic>, <topic>`, for example `💡 idea · business, retail`.
+Cermin writes only English, and always quotes a Thought as written.
+
+**Acknowledgement:** `<Kind emoji> <kind> · <topic>, <topic>`, for example `💡 idea · business, retail`.
 - **Kind emoji:** 💡 idea, ❓ question, 👀 observation, 🪞 reflection, 📋 plan.
 - **Pending:** `✓ saved`, edited once the Classification arrives.
 - **Corrected:** prefixed with ✏️.
 - **Deleted:** `🗑 deleted`.
 
 Confidence is never shown.
+
+**Resurfacing:** a reply to the new Thought, with 👍 and 👎 buttons under it. Each past Thought shows the emoji of its current Kind, its Thought date (with the year if it isn't this year) and its text. The text is cut at about 280 characters with `…`, so two long Thoughts stay under Telegram's 4,096-character limit.
+
+```
+🔁 You've thought about this before
+💡 3 Oct · What if small shops could restock by chat?
+❓ 9 Oct · Kenapa warung nggak pakai sistem restock?
+```
 
 ### 8.3 MCP (week 3)
 
@@ -511,7 +522,7 @@ Confidence is never shown.
   - `topics` lists 3 to 5 candidates, reusing existing names where one fits.
   - Every candidate comes back unkept. Cermin then keeps those at or above 0.5, at most 3, or the single best if none pass (`cermin.KeepTopics`). Week 3 replaces the 0.5 placeholder (⏳).
   - `kind_suggestion` is empty unless no Kind fits well.
-- **`embed(texts) → vectors`** (week 2).
+- **`embed(texts) → vectors`** (week 2): gemini-embedding-2 at 3072 dimensions, on the raw text, with no task instruction ([ADR-0010](../adr/0010-resurfacing-raw-text-calibrated-cutoff.md)).
 - **`answer(question, thoughts) → {text, cited_ids}`** (week 3).
 
 ## 9. Decisions log
@@ -528,7 +539,10 @@ Confidence is never shown.
 | Data model | Append-only Classifications, every candidate Topic stored, Kinds table changed only by migration, hard delete with inbox scrubbing. | [ADR-0008](../adr/0008-append-only-classifications.md) |
 | Code layout | Domain types and rules in `internal/cermin`; imports point inward; no layer directories, and no interface until a second implementation or a test needs one. | [ADR-0009](../adr/0009-domain-package-and-inward-imports.md) |
 | Day-1 confidence | The model's stated confidence per Assignment (`verbalized-v1`); Topics kept at ≥ 0.5 as a placeholder. | ADR-0006 |
-| Kind and Topic names | English, except Declared Topics; prose follows the Thought's language. | CONTEXT.md |
+| Language | Cermin writes only English and quotes Thoughts as written. Kind and Topic names are English, except Declared Topics. | PRD, CONTEXT.md |
+| Resurfacing | Raw-text embeddings at 3072 dimensions. Strong means a cosine similarity at or above a cut-off calibrated on your labelled pairs. Up to 2 Thoughts, never from the last 24 h and never the one replied to. Sent once, during Capture, after the Acknowledgement. | [ADR-0010](../adr/0010-resurfacing-raw-text-calibrated-cutoff.md), [#28](https://github.com/Arkoes07/cermin/issues/28) |
+| Reactions | 👍/👎 buttons under each Insight; every tap is stored and the latest counts. | [#28](https://github.com/Arkoes07/cermin/issues/28) |
+| WhatsApp import | The hand-pruned iOS export goes over `fly ssh sftp`, then `cermin import`. Imported Thoughts get no Acknowledgement and trigger no Resurfacing. | [#25](https://github.com/Arkoes07/cermin/issues/25) |
 | Corrections | Reply commands; `/topics` replaces the set; Cermin's Classifications are kept. | CONTEXT.md |
 | Kinds | Starting five, defined in the PRD; changed only by your decision. | PRD, ADR-0008 |
 | Time | UTC stored, read in WIB; no per-Thought timezone in v1. | |
@@ -539,6 +553,5 @@ Confidence is never shown.
 
 | Week | Open question |
 |---|---|
-| 2 | Strong-match definition and threshold for Resurfacing; Embedding dimensions; Reaction mechanism: inline buttons vs native reactions; How the WhatsApp export reaches the server. |
 | 3 | Classifier comparison: Claude Haiku 5.5, Sonnet 5.5, Opus 5.5 and Jev on the labelled set, for accuracy and calibration. The outcome is the cheapest model that holds accuracy, or a cascade ([#10](https://github.com/Arkoes07/cermin/issues/10)). Confidence method beyond the day-1 one; The strong-Topic threshold; Whether `kind_suggestion` evidence justifies a new Kind; How the evaluation set is built, since Corrections alone contain only errors; Declared Topic matching; Merging two Topics that mean the same, such as `money` into `personal finance`, given that Classifications are append-only ([ADR-0008](../adr/0008-append-only-classifications.md)); Ask retrieval size and model; The final MCP tool list. |
 | 4 | Loop detection; Digest content and model; Portrait method, trigger and model. |
