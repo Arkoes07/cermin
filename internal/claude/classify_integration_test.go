@@ -106,7 +106,7 @@ func TestClassifier_TopicReuse(t *testing.T) {
 			t.Fatalf("Classify thought %d: %v", i+1, err)
 		}
 		kept, dropped := []string{}, []string{}
-		for _, topic := range cermin.KeepTopics(c.Topics) {
+		for _, topic := range cermin.KeepTopics(c.Topics, nil) {
 			name := fmt.Sprintf("%s %.2f", topic.Name, topic.Confidence)
 			if !topic.Kept {
 				dropped = append(dropped, name)

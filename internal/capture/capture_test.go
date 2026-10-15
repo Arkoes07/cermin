@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/arkoes07/cermin/internal/capture"
 	"github.com/arkoes07/cermin/internal/cermin"
 )
@@ -314,6 +316,25 @@ func TestBot_ProcessInbox_CapturesOwnerText(t *testing.T) {
 	}
 	if !reflect.DeepEqual(gotClassification, wantClassification) {
 		t.Errorf("Classification = %+v, want %+v", gotClassification, wantClassification)
+	}
+}
+
+func TestBot_Process_CountsThoughtOnce(t *testing.T) {
+	// Not parallel: the counter is global, and no parallel test runs while
+	// this one does.
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	bot, db, api := newBot(t, classifier.classify)
+	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
+	in := pollUpdate(t, bot, db)
+
+	before := testutil.ToFloat64(capture.ThoughtsCaptured)
+	for range 2 {
+		if err := bot.Process(t.Context(), in); err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+	}
+	if got := testutil.ToFloat64(capture.ThoughtsCaptured) - before; got != 1 {
+		t.Errorf("cermin_thoughts_captured_total rose by %v, want 1", got)
 	}
 }
 

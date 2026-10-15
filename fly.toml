@@ -25,6 +25,12 @@ primary_region = "iad"
     method = "GET"
     path = "/healthz"
 
+# Fly's Prometheus scrapes this over the private network. No service names
+# port 9091, so it is never public.
+[metrics]
+  port = 9091
+  path = "/metrics"
+
 [[vm]]
   size = "shared-cpu-1x"
   memory = "256mb"

@@ -8,9 +8,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/arkoes07/cermin/internal/cermin"
 )
@@ -27,6 +30,28 @@ const (
 	confidenceMethod = "verbalized-v1"
 	// maxTokens leaves room for the output and any thinking at low effort.
 	maxTokens = 4096
+	// purposeClassify labels the metrics of classification calls.
+	purposeClassify = "classify"
+)
+
+// Every Claude API call is recorded in these, by what it was for and the
+// model it asked. A call the SDK retries counts once, and its duration takes
+// in the retries.
+var (
+	requestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "cermin_claude_requests_total",
+		Help: "Claude API calls, by purpose, model and outcome: ok or error.",
+	}, []string{"purpose", "model", "outcome"})
+	// The buckets reach past the 8 s an Acknowledgement waits.
+	requestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "cermin_claude_request_duration_seconds",
+		Help:    "How long Claude API calls took, by purpose and model.",
+		Buckets: []float64{0.5, 1, 2, 4, 8, 16, 32},
+	}, []string{"purpose", "model"})
+	tokensTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "cermin_claude_tokens_total",
+		Help: "Tokens billed for Claude API calls, by purpose, model and direction: input or output.",
+	}, []string{"purpose", "model", "direction"})
 )
 
 // Classifier classifies Thoughts with a Claude model.
@@ -37,7 +62,20 @@ type Classifier struct {
 
 // New returns a Classifier that calls model with the Anthropic API key apiKey.
 func New(apiKey, model string) *Classifier {
+	initCallMetrics(purposeClassify, model)
 	return &Classifier{client: anthropic.NewClient(option.WithAPIKey(apiKey)), model: model}
+}
+
+// initCallMetrics creates the metrics of calls made for purpose to model at
+// 0, so that increase() counts the first call after a restart.
+func initCallMetrics(purpose, model string) {
+	requestDuration.WithLabelValues(purpose, model)
+	for _, outcome := range []string{"ok", "error"} {
+		requestsTotal.WithLabelValues(purpose, model, outcome)
+	}
+	for _, direction := range []string{"input", "output"} {
+		tokensTotal.WithLabelValues(purpose, model, direction)
+	}
 }
 
 // Classify asks Claude for the Classification of a Thought's text: one of
@@ -49,7 +87,8 @@ func (c *Classifier) Classify(
 	text string,
 	kinds []cermin.Kind,
 	topics []string,
-) (cermin.Classification, error) {
+) (_ cermin.Classification, err error) {
+	start := time.Now()
 	resp, err := c.client.Messages.New(ctx, anthropic.MessageNewParams{
 		Model:     c.model,
 		MaxTokens: maxTokens,
@@ -60,6 +99,10 @@ func (c *Classifier) Classify(
 			Format: anthropic.JSONOutputFormatParam{Schema: buildOutputSchema(kinds)},
 		},
 	})
+	elapsed := time.Since(start)
+	// Recorded as Classify returns, so that output that fails to parse counts
+	// as an error.
+	defer func() { c.recordCall(purposeClassify, elapsed, resp, err) }()
 	if err != nil {
 		return cermin.Classification{}, fmt.Errorf("classify: %w", err)
 	}
@@ -97,6 +140,22 @@ func (c *Classifier) Classify(
 		Language:         out.Language,
 	}
 	return classification, nil
+}
+
+// recordCall records a call made for purpose that took elapsed and ended in
+// err: its outcome, its duration and, if resp arrived, the tokens billed for
+// it.
+func (c *Classifier) recordCall(purpose string, elapsed time.Duration, resp *anthropic.Message, err error) {
+	outcome := "ok"
+	if err != nil {
+		outcome = "error"
+	}
+	requestsTotal.WithLabelValues(purpose, c.model, outcome).Inc()
+	requestDuration.WithLabelValues(purpose, c.model).Observe(elapsed.Seconds())
+	if resp != nil {
+		tokensTotal.WithLabelValues(purpose, c.model, "input").Add(float64(resp.Usage.InputTokens))
+		tokensTotal.WithLabelValues(purpose, c.model, "output").Add(float64(resp.Usage.OutputTokens))
+	}
 }
 
 // output is the model's output, as buildOutputSchema shapes it. Its

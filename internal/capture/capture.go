@@ -19,6 +19,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+
 	"github.com/arkoes07/cermin/internal/cermin"
 	"github.com/arkoes07/cermin/internal/sqlite"
 	"github.com/arkoes07/cermin/internal/telegram"
@@ -48,6 +51,13 @@ const (
 	// skippedReply tells the owner of an update skipped after maxAttempts.
 	skippedReply = "Couldn't process this message. It's kept for a replay."
 )
+
+// thoughtsCaptured counts the Thoughts saved, so that Claude calls can be
+// read per Thought.
+var thoughtsCaptured = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "cermin_thoughts_captured_total",
+	Help: "Thoughts captured.",
+})
 
 // ClassifyFunc gives a Thought's text a Classification: one of kinds,
 // candidate Topics that reuse the existing topics where one fits, and the
@@ -312,6 +322,11 @@ func (b *Bot) captureThought(ctx context.Context, updateID int64, m *telegram.Me
 			// Thought is saved and stays unclassified until the catch-up.
 			slog.WarnContext(ctx, "classifying thought", "thought_id", thought.ID, "err", err)
 		}
+		// ponytail: counted per Capture, not per new row, so an update
+		// processed again before its Acknowledgement is recorded counts its
+		// Thought twice, and one the catch-up acknowledges after a crash counts
+		// none; count new rows if calls per Thought looks off.
+		thoughtsCaptured.Inc()
 		slog.InfoContext(ctx, "thought captured", "thought_id", thought.ID, "update_id", updateID)
 	}
 	return b.syncAckAndMarkProcessed(ctx, thought.ID, updateID)
