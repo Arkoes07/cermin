@@ -1,5 +1,5 @@
 // Package sqlite keeps Cermin's data in one SQLite file: the Telegram inbox,
-// the Thoughts captured from it and their Classifications.
+// the Thoughts captured from it, their Classifications and their vectors.
 package sqlite
 
 import (

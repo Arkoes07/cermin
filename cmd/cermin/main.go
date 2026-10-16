@@ -2,19 +2,22 @@
 //
 //	cermin serve
 //
-// captures and classifies Thoughts sent to the Telegram bot until it is
-// interrupted, answers /healthz on port 8080 and serves Prometheus metrics at
-// /metrics on port 9091. It reads TELEGRAM_BOT_TOKEN, TELEGRAM_OWNER_ID,
-// ANTHROPIC_API_KEY and, optionally, CERMIN_DB_PATH (default data/cermin.db),
-// CERMIN_CLASSIFY_MODEL (default claude-sonnet-5-5) and
-// CERMIN_LITESTREAM_SOCKET from the environment. With CERMIN_LITESTREAM_SOCKET
-// set, it also watches the backups through Litestream's IPC socket there.
+// captures, classifies and embeds Thoughts sent to the Telegram bot until it
+// is interrupted, answers /healthz on port 8080 and serves Prometheus metrics
+// at /metrics on port 9091. It reads TELEGRAM_BOT_TOKEN, TELEGRAM_OWNER_ID,
+// ANTHROPIC_API_KEY, CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN and,
+// optionally, CERMIN_DB_PATH (default data/cermin.db), CERMIN_CLASSIFY_MODEL
+// (default claude-sonnet-5-5), CERMIN_EMBED_MODEL (default
+// @cf/qwen/qwen3-embedding-0.6b) and CERMIN_LITESTREAM_SOCKET from the
+// environment. With CERMIN_LITESTREAM_SOCKET set, it also watches the backups
+// through Litestream's IPC socket there.
 //
 //	cermin import <file>
 //
 // saves each message in the WhatsApp chat export file as a Thought, skipping
 // those already imported, and prints how many it imported and skipped. It
-// reads only CERMIN_DB_PATH. The catch-up of a running serve classifies them.
+// reads only CERMIN_DB_PATH. The catch-up of a running serve classifies and
+// embeds them.
 package main
 
 import (
@@ -41,6 +44,7 @@ import (
 	"github.com/arkoes07/cermin/internal/litestream"
 	"github.com/arkoes07/cermin/internal/sqlite"
 	"github.com/arkoes07/cermin/internal/telegram"
+	"github.com/arkoes07/cermin/internal/workersai"
 )
 
 const (
@@ -89,8 +93,17 @@ func serve(ctx context.Context) error {
 	if apiKey == "" {
 		return errors.New("missing ANTHROPIC_API_KEY")
 	}
+	cfAccountID := os.Getenv("CLOUDFLARE_ACCOUNT_ID")
+	if cfAccountID == "" {
+		return errors.New("missing CLOUDFLARE_ACCOUNT_ID")
+	}
+	cfToken := os.Getenv("CLOUDFLARE_API_TOKEN")
+	if cfToken == "" {
+		return errors.New("missing CLOUDFLARE_API_TOKEN")
+	}
 	dbPath := cmp.Or(os.Getenv("CERMIN_DB_PATH"), defaultDBPath)
 	model := cmp.Or(os.Getenv("CERMIN_CLASSIFY_MODEL"), claude.DefaultModel)
+	embedModel := cmp.Or(os.Getenv("CERMIN_EMBED_MODEL"), workersai.DefaultModel)
 	litestreamSocket := os.Getenv("CERMIN_LITESTREAM_SOCKET")
 
 	db, err := sqlite.Open(ctx, dbPath)
@@ -98,8 +111,9 @@ func serve(ctx context.Context) error {
 		return err
 	}
 	classifier := claude.New(apiKey, model)
+	embedder := workersai.New(workersai.APIURL, cfAccountID, cfToken, embedModel)
 	tg := telegram.New(telegram.APIURL, token)
-	bot := capture.New(db, tg, ownerID, classifier.Classify)
+	bot := capture.New(db, tg, ownerID, classifier.Classify, embedder.Embed, embedder.Model())
 
 	health := http.NewServeMux()
 	health.HandleFunc("GET /healthz", bot.ServeHealth)
@@ -119,7 +133,7 @@ func serve(ctx context.Context) error {
 		slog.InfoContext(ctx, "watching backups", "litestream_socket", litestreamSocket)
 		go backup.New(litestream.New(litestreamSocket, dbPath), tg, ownerID).Run(ctx)
 	}
-	slog.InfoContext(ctx, "capturing Thoughts", "db", dbPath, "classify_model", model)
+	slog.InfoContext(ctx, "capturing Thoughts", "db", dbPath, "classify_model", model, "embed_model", embedModel)
 	bot.Run(ctx)
 	slog.Info("stopped")
 	return errors.Join(healthSrv.Close(), metricsSrv.Close(), db.Close())

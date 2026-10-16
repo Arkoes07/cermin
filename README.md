@@ -2,7 +2,7 @@
 
 Cermin (Indonesian for "mirror") turns the Thoughts I send to a Telegram bot into a Corpus that mirrors how I think. It classifies each Thought, resurfaces related past ones, points out Loops, and builds a Portrait of my thinking.
 
-**Status:** week 1 of 4 (12–18 Oct). Capture and classification are live in Telegram, deployed to Fly.io and backed up to Cloudflare R2. The restore drill (#4) proved the backup restores, metrics (#23) are graphed on fly-metrics.net, and the backup watch (#24) says in Telegram when changes wait an hour to reach R2. Next: week 2, starting with the WhatsApp import (#25).
+**Status:** week 1 of 4 (12–18 Oct). Capture and classification are live in Telegram, deployed to Fly.io and backed up to Cloudflare R2. The restore drill (#4) proved the backup restores, metrics (#23) are graphed on fly-metrics.net, and the backup watch (#24) says in Telegram when changes wait an hour to reach R2. Week 2 has begun: the WhatsApp import (#25) brought the earlier Thoughts into the Corpus, and every Thought gets a qwen3-embedding-0.6b vector from Cloudflare Workers AI (#26). Next: calibrating the Resurfacing cut-off (#27).
 
 - Product: [docs/product/PRD.md](docs/product/PRD.md)
 - Vocabulary: [CONTEXT.md](CONTEXT.md)
@@ -15,11 +15,11 @@ Cermin (Indonesian for "mirror") turns the Thoughts I send to a Telegram bot int
 With Go 1.26 and a dev bot (two pollers can't share one bot token):
 
 ```sh
-set -a; . ./.env; set +a   # TELEGRAM_BOT_TOKEN, TELEGRAM_OWNER_ID, ANTHROPIC_API_KEY
+set -a; . ./.env; set +a   # TELEGRAM_BOT_TOKEN, TELEGRAM_OWNER_ID, ANTHROPIC_API_KEY, CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN
 go run ./cmd/cermin serve  # database at data/cermin.db unless CERMIN_DB_PATH is set
 ```
 
-Thoughts are classified by `claude-sonnet-5-5` unless `CERMIN_CLASSIFY_MODEL` names another model. `go test -tags integration ./internal/claude/` checks the classifier against the real API. `curl -i localhost:8080/healthz` answers 200 while the last poll of Telegram finished under 2 minutes ago, 503 otherwise.
+Thoughts are classified by `claude-sonnet-5-5` unless `CERMIN_CLASSIFY_MODEL` names another model, and embedded by `@cf/qwen/qwen3-embedding-0.6b` unless `CERMIN_EMBED_MODEL` does. `go test -tags integration ./internal/claude/` checks the classifier against the real API. `curl -i localhost:8080/healthz` answers 200 while the last poll of Telegram finished under 2 minutes ago, 503 otherwise.
 
 ## Deploy
 

@@ -15,10 +15,10 @@ const (
 	// Thought's Classification. No Acknowledgement waits on it, so a slow
 	// classifier gets time to finish.
 	catchUpClassifyTimeout = 60 * time.Second
-	// catchUpLimit is the most Thoughts one catch-up classifies, to cap cost,
-	// and the most Acknowledgements it brings up to date, and edits to show a
-	// deletion, to stay under Telegram's rate limits. The rest wait for the
-	// next catch-up.
+	// catchUpLimit is the most Thoughts one catch-up classifies, and embeds,
+	// to cap cost, and the most Acknowledgements it brings up to date, and
+	// edits to show a deletion, to stay under Telegram's rate limits. The rest
+	// wait for the next catch-up.
 	catchUpLimit = 20
 	// classifyMaxBackoff is the longest the catch-up waits to try again to
 	// classify a Thought it failed on.
@@ -52,7 +52,8 @@ func (b *Bot) catchUpEveryInterval(ctx context.Context) {
 // catchUpLimit Thoughts that have no Classification and are due, oldest
 // first, and edits their Acknowledgements to show it. A Thought it fails to
 // classify is logged and postponed, ever longer, so that one the classifier
-// always fails on costs few paid calls.
+// always fails on costs few paid calls. Last, it embeds up to catchUpLimit
+// Thoughts that have no vector from the embedding model, oldest first.
 func (b *Bot) CatchUp(ctx context.Context) error {
 	now := b.timeNow()
 	if err := b.syncOutOfDateAcks(ctx); err != nil {
@@ -61,7 +62,10 @@ func (b *Bot) CatchUp(ctx context.Context) error {
 	if err := b.showDeletions(ctx); err != nil {
 		return err
 	}
-	return b.classifyDueThoughts(ctx, now)
+	if err := b.classifyDueThoughts(ctx, now); err != nil {
+		return err
+	}
+	return b.embedLateThoughts(ctx)
 }
 
 // syncOutOfDateAcks brings up to catchUpLimit out-of-date Acknowledgements up
@@ -159,4 +163,38 @@ func (b *Bot) showLateClassification(ctx context.Context, thoughtID int64) {
 	if err := b.syncAck(context.WithoutCancel(ctx), thoughtID); err != nil {
 		slog.WarnContext(ctx, "updating acknowledgement", "thought_id", thoughtID, "err", err)
 	}
+}
+
+// embedLateThoughts embeds up to catchUpLimit Thoughts that have no vector
+// from the embedding model, oldest first, in one call: those captured before
+// embedding shipped, imported ones, and those a Capture failed to embed. A
+// failure is logged, and the next catch-up tries again.
+//
+// ponytail: no backoff and no skipping, so a failing embedder costs one call
+// a minute, and one text the API refuses holds up every Thought after it; back
+// off per Thought, as classification does, if one text ever fails the whole
+// batch.
+func (b *Bot) embedLateThoughts(ctx context.Context) error {
+	// Under the lock no Capture is under way, so none of these Thoughts is
+	// being embedded by one.
+	b.mu.Lock()
+	thoughts, err := b.db.GetThoughtsWithoutEmbeddingByModel(ctx, b.embedModel, catchUpLimit)
+	b.mu.Unlock()
+	if err != nil || len(thoughts) == 0 {
+		return err
+	}
+
+	ids := make([]int64, 0, len(thoughts))
+	for _, t := range thoughts {
+		ids = append(ids, t.ID)
+	}
+	// Unlocked, so that a slow embedder never holds up a Capture.
+	if err := b.embedThoughts(ctx, thoughts); err != nil {
+		if ctx.Err() == nil { // a shutdown is no fault of the embedder's
+			slog.WarnContext(ctx, "embedding thoughts late", "thought_ids", ids, "err", err)
+		}
+		return nil
+	}
+	slog.InfoContext(ctx, "thoughts embedded late", "thought_ids", ids)
+	return nil
 }

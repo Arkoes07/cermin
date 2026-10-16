@@ -597,6 +597,36 @@ func TestBot_ProcessInbox_RetryKeepsClassification(t *testing.T) {
 	}
 }
 
+// Embedding waits for the Acknowledgement, so it never delays it.
+func TestBot_ProcessInbox_EmbedsThoughtAfterAcknowledgement(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	embedder := &fakeEmbedder{}
+	var api *fakeBotAPI // set by newBotWith below, before anything is embedded
+	var sentBeforeEmbed []sentMessage
+	embed := func(ctx context.Context, texts []string) ([][]float32, error) {
+		sentBeforeEmbed = api.sentMessages()
+		return embedder.embed(ctx, texts)
+	}
+	bot, db, api := newBotWith(t, classifier.classify, embed, filepath.Join(t.TempDir(), "cermin.db"))
+	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
+
+	thought := captureQueued(t, bot, db)
+
+	wantSent := []sentMessage{{ChatID: ownerID, Text: "💡 idea · running", ReplyToID: messageID}}
+	if !slices.Equal(sentBeforeEmbed, wantSent) {
+		t.Errorf("sent before embedding %+v, want %+v", sentBeforeEmbed, wantSent)
+	}
+	if want := [][]string{{thought.Text}}; !reflect.DeepEqual(embedder.calls, want) {
+		t.Errorf("embedded %q, want %q", embedder.calls, want)
+	}
+	unembedded, err := db.GetThoughtsWithoutEmbeddingByModel(ctx, embedModel, 20)
+	if err != nil || len(unembedded) != 0 {
+		t.Errorf("GetThoughtsWithoutEmbeddingByModel = %+v, %v; want none", unembedded, err)
+	}
+}
+
 func TestBot_ProcessInbox_IgnoresOtherChats(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

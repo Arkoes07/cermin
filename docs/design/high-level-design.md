@@ -15,9 +15,9 @@ This document describes the whole v1 solution, weeks 1 to 4. The choices that ar
 | LLM calls | 10 to 30/day: one Classification per Thought, plus Ask, weekly Digest and occasional Portrait | |
 | Tokens | under 1M/month in total | |
 | MCP calls | tens/day at most | |
-| Storage per Thought | ~20 KB: text 0.5 KB, raw update 2 KB, Classifications 3 KB, embedding ~12 KB (3,072 float32) | |
-| Database size | ~10 MB by 8 Nov, ~40 MB after a year | |
-| Similarity search | brute force: 2,000 × 3,072 ≈ 6M multiply-adds per query, about a millisecond; all vectors in RAM ≈ 25 MB | no vector index needed below ~100k Thoughts |
+| Storage per Thought | ~10 KB: text 0.5 KB, raw update 2 KB, Classifications 3 KB, embedding 4 KB (1,024 float32) | |
+| Database size | ~5 MB by 8 Nov, ~20 MB after a year | |
+| Similarity search | brute force: 2,000 × 1,024 ≈ 2M multiply-adds per query, under a millisecond; all vectors in RAM ≈ 8 MB | no vector index needed below ~100k Thoughts |
 | Concurrency | one writer; a few concurrent readers (MCP) | |
 
 ### Monthly cost
@@ -32,11 +32,11 @@ This document describes the whole v1 solution, weeks 1 to 4. The choices that ar
 | Ask on Claude Sonnet 5.5: ~60 × 5k in, 500 out | ~$0.90 |
 | Digest on Sonnet 5.5: 4 runs | ~$0.20 |
 | Portrait on Claude Opus 5.5 ($4 / $20): ~4 runs × 30k in, ~15k out incl. thinking | ~$1.70 |
-| Embeddings, gemini-embedding-2 ($0.20 per MTok) | < $0.01 |
+| Embeddings, Qwen3-Embedding-0.6B on Workers AI ($0.012 per MTok, inside the free 10,000 Neurons a day) | $0 |
 | Week-3 evaluation reruns (Haiku, Sonnet, Opus on the labelled set, via the Batch API at half price) | ~$2, once |
 | **Total** | **≈ $8 in the month with evaluation, ≈ $6 otherwise; under the $10 cap** |
 
-The models for Ask, Digest and Portrait are upper bounds; each picks its own in its week. Both AI provider accounts have spend caps.
+The models for Ask, Digest and Portrait are upper bounds; each picks its own in its week. The Anthropic account has a spend cap. Workers AI has none, so the Cloudflare account stays on the Workers Free plan, where calls past the daily free allocation fail instead of being billed.
 
 ## 2. Non-functional requirements
 
@@ -47,7 +47,7 @@ The models for Ask, Digest and Portrait are upper bounds; each picks its own in 
 | Latency | Acknowledgement ≤ 8 s (typically a few seconds). Resurfacing ≤ 10 s after Capture. `/ask` ≤ 30 s. MCP search ≤ 2 s. | One process, local SQLite, brute-force search in memory. |
 | Availability | Best effort on one machine. An outage of up to 24 h loses nothing. A deploy means a few seconds of downtime. | Telegram buffers updates; MCP clients retry; Fly restarts the process when it exits. A failing `/healthz` takes the machine out of routing but doesn't restart it ([5.4](#54-monitoring)). |
 | Recovery | Under 1 h to rebuild from backup. | `litestream restore` onto a fresh volume; restore drill in week 1. |
-| Privacy | The Corpus is never public. | Owner-only bot, by Telegram user ID. MCP behind a bearer token over TLS. Paid AI tiers only, which don't train on inputs. Thought text is never written to logs. `/delete` scrubs the database; backups age out after 7 days. |
+| Privacy | The Corpus is never public. | Owner-only bot, by Telegram user ID. MCP behind a bearer token over TLS. Only AI APIs whose terms rule out training on inputs: Anthropic's paid API and Workers AI. Thought text is never written to logs. `/delete` scrubs the database; backups age out after 7 days. |
 | Security | No secrets or real Thoughts in the repo or its issues. | Fly and GitHub secrets; test fixtures use made-up Thoughts. |
 | Cost | ≤ $10/month for everything. | [Section 1](#monthly-cost). |
 | Portability | Someone else can run their own Cermin on other hosting or models. | Nothing in the code is host-specific: one binary, a SQLite file and environment variables, needing only a disk and outbound internet. Long polling needs no inbound URL. Each AI provider sits behind one function (`classify`, `embed`) with the model name in config, so another provider is one new implementation ([ADR-0006](../adr/0006-claude-classification-gemini-embeddings.md)). |
@@ -64,7 +64,7 @@ flowchart LR
     cermin <--> db[("SQLite<br/>on a Fly volume")]
     db -.->|Litestream, continuous| r2[("Cloudflare R2<br/>backups")]
     cermin -->|classify, answer, summarise| claude["Claude API"]
-    cermin -->|embed, from week 2| gemini["Gemini embeddings API"]
+    cermin -->|embed, from week 2| workersai["Cloudflare Workers AI"]
     client(["Claude Code / Claude Desktop<br/>on the laptop"]) -->|MCP over HTTPS, bearer token, from week 3| cermin
 ```
 
@@ -121,7 +121,7 @@ flowchart TB
 | Process shape and storage | [ADR-0003](../adr/0003-one-process-embedded-sqlite.md) | One binary, one process: bot, workers, MCP endpoint and scheduler. SQLite in WAL mode with a pure-Go driver, replicated by Litestream. Subcommands handle one-off jobs: `serve`, `import` (wk 2), `pairs` (wk 2), `eval` (wk 3). |
 | MCP transport | [ADR-0004](../adr/0004-remote-mcp-bearer-token.md) | Streamable HTTP inside the same process, bearer token, no OAuth in v1. |
 | Hosting | [ADR-0005](../adr/0005-fly-single-machine-r2-backups.md) | Fly.io, one always-on machine in `iad`; Litestream backups on Cloudflare R2. |
-| AI provider | [ADR-0006](../adr/0006-claude-classification-gemini-embeddings.md) | Claude Sonnet 5.5 classifies from day 1; gemini-embedding-2 from week 2; paid tiers only. |
+| AI provider | [ADR-0006](../adr/0006-claude-classification-gemini-embeddings.md) | Claude Sonnet 5.5 classifies from day 1; Qwen3-Embedding-0.6B on Workers AI embeds from week 2; no provider trains on Thoughts. |
 | Capture pipeline | [ADR-0007](../adr/0007-capture-durable-inbox-long-polling.md) | Long polling into a database inbox; the Thought is saved before any AI call. |
 | Data model | [ADR-0008](../adr/0008-append-only-classifications.md) | Append-only Classifications; every candidate Topic stored; Kinds in a table changed only by migrations. |
 | Code layout | [ADR-0009](../adr/0009-domain-package-and-inward-imports.md) | Clean architecture's dependency rule without its layer directories: the domain in `internal/cermin`, use cases and adapters as sibling packages, wiring in `cmd/cermin`. See [5.2](#52-code-layout). |
@@ -150,6 +150,7 @@ Module `github.com/arkoes07/cermin`. Imports point inward, toward `internal/cerm
 | `internal/capture/` | use case | the inbox handler, commands, the catch-up loop, the poller's `/healthz` |
 | `internal/sqlite/` | adapter | SQLite access; migrations embedded and tracked with `PRAGMA user_version`; `PRAGMA foreign_keys = ON`; `PRAGMA secure_delete = ON`, so a deleted row leaves the file and, once retention passes, the backups |
 | `internal/claude/` | adapter | Claude API calls; today the classification call, with its prompt and output schema |
+| `internal/workersai/` | adapter | Cloudflare Workers AI client over `net/http`: the embedding model's run call |
 | `internal/telegram/` | adapter | Bot API client over `net/http`: `getUpdates`, `sendMessage`, `editMessageText`, `sendChatAction` |
 | `internal/litestream/` | adapter | client for Litestream's IPC socket over `net/http`: `POST /sync`, which returns the local and the replicated position |
 | `internal/chatexport/` | adapter | parser for the hand-pruned iOS WhatsApp export (`_chat.txt`) in its one format: each header line starts a message, with its Thought time read in WIB, and other lines continue it |
@@ -159,7 +160,7 @@ Module `github.com/arkoes07/cermin`. Imports point inward, toward `internal/cerm
 Later weeks add packages when they need them. New code goes in the first place that fits:
 
 1. **A glossary term, or a rule about one that needs no I/O**: `internal/cermin`.
-2. **Code that calls out of the process** (an API, the database, a file format): an adapter, named after what it talks to (`telegram`, `claude`, `sqlite`, `gemini`, `chatexport`), so the glossary's words stay free for the domain and the use cases. `embed` is taken by the standard library, hence `gemini`. A WhatsApp chat export is a file format, hence `chatexport`, which leaves `whatsapp` for a WhatsApp bot. An adapter may import `internal/cermin` and nothing else in this module.
+2. **Code that calls out of the process** (an API, the database, a file format): an adapter, named after what it talks to (`telegram`, `claude`, `sqlite`, `workersai`, `chatexport`), so the glossary's words stay free for the domain and the use cases. `embed` is taken by the standard library, hence `workersai`. A WhatsApp chat export is a file format, hence `chatexport`, which leaves `whatsapp` for a WhatsApp bot. An adapter may import `internal/cermin` and nothing else in this module.
 3. **Code that drives the adapters**: something you do or receive (Capture, Correction, Resurfacing, Ask, Digest), an endpoint that receives requests (MCP), or logic several of them share (Retrieval). It goes in a use-case package named after its job, such as `resurface`, `ask`, `digest`, `mcp` or `retrieval`. A use case may import `internal/cermin`, adapters and other use cases, and calls adapters directly. It declares a function type or interface for an adapter only when a second implementation arrives or a test needs a fake that a real instance can't provide, as `capture.ClassifyFunc` does for the Claude call.
 4. **Reading the environment, choosing implementations, building each part and starting it**: `cmd/cermin`. A part may still run goroutines of its own.
 
@@ -184,8 +185,8 @@ Libraries:
 | `R2_ENDPOINT`, `R2_BUCKET`, `LITESTREAM_ACCESS_KEY_ID`, `LITESTREAM_SECRET_ACCESS_KEY` | 1 | Fly secrets | Litestream replica on R2 |
 | `FLY_API_TOKEN` | 1 | GitHub Actions secret | Deploy on push to `main` |
 | `CERMIN_LITESTREAM_SOCKET` | 1 | `fly.toml`; unset locally | Litestream's IPC socket, read by the backup watch; unset turns the watch off |
-| `GEMINI_API_KEY` | 2 | Fly secret; `.env` | Embeddings |
-| `CERMIN_EMBED_MODEL` | 2 | optional; default `gemini-embedding-2` | Embedding model |
+| `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` | 2 | Fly secrets; `.env` | Embeddings on Workers AI; the token is scoped to Workers AI only |
+| `CERMIN_EMBED_MODEL` | 2 | optional; default `@cf/qwen/qwen3-embedding-0.6b` | Embedding model |
 | `CERMIN_MCP_TOKEN` | 3 | Fly secret; MCP client config | MCP bearer token |
 
 Values that only change with a deploy are constants in code: the WIB timezone (a fixed UTC+7 zone, so the image needs no tzdata), the 8 s Acknowledgement wait, the 0.5 placeholder keep threshold, the HTTP port (8080), the metrics port (9091), the backup watch's 1 h threshold, and the Resurfacing cut-off ([ADR-0010](../adr/0010-resurfacing-raw-text-calibrated-cutoff.md)) and 24 h window.
@@ -525,7 +526,7 @@ Confidence is never shown.
   - `topics` lists 3 to 5 candidates, reusing existing names where one fits.
   - Every candidate comes back unkept. Cermin then keeps those at or above 0.5, at most 3, or the single best if none pass (`cermin.KeepTopics`). Week 3 replaces the 0.5 placeholder (⏳).
   - `kind_suggestion` is empty unless no Kind fits well.
-- **`embed(texts) → vectors`** (week 2): gemini-embedding-2 at 3072 dimensions, on the raw text, with no task instruction ([ADR-0010](../adr/0010-resurfacing-raw-text-calibrated-cutoff.md)).
+- **`embed(texts) → vectors`** (week 2): Qwen3-Embedding-0.6B on Workers AI at 1024 dimensions, on the raw text sent as documents, so with no task instruction ([ADR-0010](../adr/0010-resurfacing-raw-text-calibrated-cutoff.md)).
 - **`answer(question, thoughts) → {text, cited_ids}`** (week 3).
 
 ## 9. Decisions log
@@ -537,13 +538,13 @@ Confidence is never shown.
 | Process and storage | One Go process, embedded SQLite, Litestream backups. | [ADR-0003](../adr/0003-one-process-embedded-sqlite.md) |
 | MCP clients and transport | Claude Code and Claude Desktop over Streamable HTTP with a bearer token; no OAuth in v1. | [ADR-0004](../adr/0004-remote-mcp-bearer-token.md) |
 | Hosting | Fly.io, one machine in `iad`, backups on R2. | [ADR-0005](../adr/0005-fly-single-machine-r2-backups.md) |
-| AI provider | Claude Sonnet 5.5 for classification, gemini-embedding-2 for embeddings, paid tiers only. | [ADR-0006](../adr/0006-claude-classification-gemini-embeddings.md) |
+| AI provider | Claude Sonnet 5.5 for classification, Qwen3-Embedding-0.6B on Workers AI for embeddings; no provider trains on Thoughts. | [ADR-0006](../adr/0006-claude-classification-gemini-embeddings.md) |
 | Capture pipeline | Long polling into a durable inbox; save before classifying; reply after classification or 8 s. | [ADR-0007](../adr/0007-capture-durable-inbox-long-polling.md), PRD |
 | Data model | Append-only Classifications, every candidate Topic stored, Kinds table changed only by migration, hard delete with inbox scrubbing. | [ADR-0008](../adr/0008-append-only-classifications.md) |
 | Code layout | Domain types and rules in `internal/cermin`; imports point inward; no layer directories, and no interface until a second implementation or a test needs one. | [ADR-0009](../adr/0009-domain-package-and-inward-imports.md) |
 | Day-1 confidence | The model's stated confidence per Assignment (`verbalized-v1`); Topics kept at ≥ 0.5 as a placeholder. | ADR-0006 |
 | Language | Cermin writes only English and quotes Thoughts as written. Kind and Topic names are English, except Declared Topics. | PRD, CONTEXT.md |
-| Resurfacing | Raw-text embeddings at 3072 dimensions. Strong means a cosine similarity at or above a cut-off calibrated on your labelled pairs. Up to 2 Thoughts, never from the last 24 h and never the one replied to. Sent once, during Capture, after the Acknowledgement. | [ADR-0010](../adr/0010-resurfacing-raw-text-calibrated-cutoff.md), [#28](https://github.com/Arkoes07/cermin/issues/28) |
+| Resurfacing | Raw-text embeddings at 1024 dimensions. Strong means a cosine similarity at or above a cut-off calibrated on your labelled pairs. Up to 2 Thoughts, never from the last 24 h and never the one replied to. Sent once, during Capture, after the Acknowledgement. | [ADR-0010](../adr/0010-resurfacing-raw-text-calibrated-cutoff.md), [#28](https://github.com/Arkoes07/cermin/issues/28) |
 | Reactions | 👍/👎 buttons under each Insight; every tap is stored and the latest counts. | [#28](https://github.com/Arkoes07/cermin/issues/28) |
 | WhatsApp import | The hand-pruned iOS export goes over `fly ssh sftp`, then `cermin import`. `chatexport` parses it, and `source` stays `whatsapp`, the channel it was captured in. Imported Thoughts get no Acknowledgement and trigger no Resurfacing. | [#25](https://github.com/Arkoes07/cermin/issues/25) |
 | Corrections | Reply commands; `/topics` replaces the set; Cermin's Classifications are kept. | CONTEXT.md |

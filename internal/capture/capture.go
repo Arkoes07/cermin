@@ -1,8 +1,9 @@
 // Package capture turns the owner's Telegram messages into Thoughts,
-// classifies them, and applies the owner's Corrections and deletes. Every
-// update is stored in the inbox before anything else happens and processed
-// from there, so a crash or a failed reply never loses one. A catch-up loop
-// later finishes what a crash, the classifier or Telegram left undone.
+// classifies and embeds them, and applies the owner's Corrections and deletes.
+// Every update is stored in the inbox before anything else happens and
+// processed from there, so a crash or a failed reply never loses one. A
+// catch-up loop later finishes what a crash, the classifier, the embedder or
+// Telegram left undone.
 package capture
 
 import (
@@ -69,19 +70,25 @@ type ClassifyFunc func(
 	topics []string,
 ) (cermin.Classification, error)
 
+// EmbedFunc gives each of texts its vector, in the same order, all from one
+// embedding model. (*workersai.Client).Embed is one.
+type EmbedFunc func(ctx context.Context, texts []string) ([][]float32, error)
+
 // Bot moves Telegram updates into the inbox, captures the owner's Thoughts
 // and runs their Corrections and deletes from it, and catches up on the
 // Captures left unfinished. One goroutine at a time may call Poll, and one may
 // call ProcessInbox or Process; Run does both. CatchUp and ServeHealth are safe
 // for concurrent use.
 type Bot struct {
-	db       *sqlite.DB
-	tg       *telegram.Client
-	ownerID  int64
-	classify ClassifyFunc
-	offset   int64            // the next update_id to ask Telegram for; only Poll uses it
-	timeNow  func() time.Time // time.Now, unless a test sets another clock
-	polledAt atomic.Int64     // when the last successful getUpdates finished, in Unix nanoseconds; 0 before the first
+	db         *sqlite.DB
+	tg         *telegram.Client
+	ownerID    int64
+	classify   ClassifyFunc
+	embed      EmbedFunc
+	embedModel string           // the model embed uses, under which its vectors are stored
+	offset     int64            // the next update_id to ask Telegram for; only Poll uses it
+	timeNow    func() time.Time // time.Now, unless a test sets another clock
+	polledAt   atomic.Int64     // when the last successful getUpdates finished, in Unix nanoseconds; 0 before the first
 
 	// repliedAlbumID is the media_group_id of the last album that got a
 	// reply. Only Process uses it, so it is lost on a restart.
@@ -98,14 +105,24 @@ type Bot struct {
 }
 
 // New returns a Bot that captures the Thoughts of the Telegram user ownerID,
-// ignoring everyone else, and classifies them with classify.
-func New(db *sqlite.DB, tg *telegram.Client, ownerID int64, classify ClassifyFunc) *Bot {
+// ignoring everyone else, classifies them with classify, and embeds them with
+// embed, which uses the model embedModel.
+func New(
+	db *sqlite.DB,
+	tg *telegram.Client,
+	ownerID int64,
+	classify ClassifyFunc,
+	embed EmbedFunc,
+	embedModel string,
+) *Bot {
 	return &Bot{
-		db:       db,
-		tg:       tg,
-		ownerID:  ownerID,
-		classify: classify,
-		timeNow:  time.Now,
+		db:         db,
+		tg:         tg,
+		ownerID:    ownerID,
+		classify:   classify,
+		embed:      embed,
+		embedModel: embedModel,
+		timeNow:    time.Now,
 	}
 }
 
@@ -294,7 +311,7 @@ func (b *Bot) findOwnerMessage(u telegram.Update) *telegram.Message {
 
 // captureThought captures the owner's text message m, sent in update
 // updateID: it saves m as a Thought, classifies it and gives it an
-// Acknowledgement, then marks the update processed.
+// Acknowledgement, marks the update processed, then embeds the Thought.
 func (b *Bot) captureThought(ctx context.Context, updateID int64, m *telegram.Message) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -312,8 +329,9 @@ func (b *Bot) captureThought(ctx context.Context, updateID int64, m *telegram.Me
 
 	// The Thought may already have its Acknowledgement if this update was
 	// processed before a crash, or the catch-up sent it since; the catch-up
-	// then classifies it if it isn't yet.
-	if thought.AckMessageID == 0 {
+	// then classifies and embeds it if it isn't yet.
+	isNew := thought.AckMessageID == 0
+	if isNew {
 		if err := b.tg.SendChatAction(ctx, m.Chat.ID, "typing"); err != nil {
 			slog.WarnContext(ctx, "showing typing", "thought_id", thought.ID, "err", err)
 		}
@@ -329,7 +347,35 @@ func (b *Bot) captureThought(ctx context.Context, updateID int64, m *telegram.Me
 		thoughtsCaptured.Inc()
 		slog.InfoContext(ctx, "thought captured", "thought_id", thought.ID, "update_id", updateID)
 	}
-	return b.syncAckAndMarkProcessed(ctx, thought.ID, updateID)
+	if err := b.syncAckAndMarkProcessed(ctx, thought.ID, updateID); err != nil {
+		return err
+	}
+	if isNew {
+		// A failure never fails a Capture: the catch-up embeds the Thought.
+		if err := b.embedThoughts(ctx, []cermin.Thought{thought}); err != nil {
+			slog.WarnContext(ctx, "embedding thought", "thought_id", thought.ID, "err", err)
+		}
+	}
+	return nil
+}
+
+// embedThoughts gives each of thoughts its vector from the embedding model, in
+// one call.
+func (b *Bot) embedThoughts(ctx context.Context, thoughts []cermin.Thought) error {
+	texts := make([]string, 0, len(thoughts))
+	for _, t := range thoughts {
+		texts = append(texts, t.Text)
+	}
+	vectors, err := b.embed(ctx, texts)
+	if err != nil {
+		return err
+	}
+	for i, t := range thoughts {
+		if err := b.db.SaveEmbedding(ctx, t.ID, b.embedModel, vectors[i]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // reply sends text in reply to the owner's message m, from update updateID. A

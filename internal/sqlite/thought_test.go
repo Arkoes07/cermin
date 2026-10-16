@@ -78,6 +78,26 @@ func TestDB_DeleteThought_KeepsIDsUnused(t *testing.T) {
 	}
 }
 
+// A vector is made from the Thought's text, so it goes with it.
+func TestDB_DeleteThought_DeletesEmbedding(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	db := openDB(t)
+	thought := saveThought(t, db)
+	if err := db.SaveEmbedding(ctx, thought.ID, "model-test", []float32{1, 2}); err != nil {
+		t.Fatalf("SaveEmbedding: %v", err)
+	}
+
+	if err := db.DeleteThought(ctx, thought.ID, 0); err != nil {
+		t.Fatalf("DeleteThought: %v", err)
+	}
+
+	var n int
+	if err := db.pool.QueryRowContext(ctx, `SELECT COUNT(*) FROM embeddings`).Scan(&n); err != nil || n != 0 {
+		t.Errorf("embeddings left: %d, %v; want 0", n, err)
+	}
+}
+
 // Litestream copies the file's pages to R2, and retention ages out only the
 // copies made before a delete, so the deleted text must leave the file's
 // pages too, not just the table.

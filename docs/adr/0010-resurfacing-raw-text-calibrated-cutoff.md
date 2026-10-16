@@ -2,7 +2,7 @@
 
 A Resurfacing should appear only when a past Thought is strongly related: about the same specific subject, in any language, not merely sharing a Topic ([CONTEXT.md](../../CONTEXT.md)). A weak match shown every time would train you to ignore all of them. Two choices decide what counts as strongly related:
 
-- **Only the Thought's raw text is embedded.** It uses gemini-embedding-2 at its full 3072 dimensions, with no task instruction. Kind and Topics stay out:
+- **Only the Thought's raw text is embedded.** It uses Qwen3-Embedding-0.6B on Workers AI at its 1024 dimensions, sent as a document, so with no task instruction. Kind and Topics stay out:
   - Topics are broad on purpose. Adding "coding" to "Go generics feel clunky" and to "Rust's borrow checker taught me ownership" pulls together exactly the pair that shouldn't come back. The specific words should decide.
   - Kind pushes the best pairs apart. A question and the observation that answers it have different Kinds.
   - The vector would have to wait for the classifier, which may be slow or down. Every Correction and every Declared Topic backfill would also mean embedding the Thought again.

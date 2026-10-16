@@ -3,6 +3,8 @@ package capture_test
 import (
 	"context"
 	"errors"
+	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"testing"
@@ -644,8 +646,43 @@ func TestBot_CatchUp_DropsClassificationOfThoughtDeletedMeanwhile(t *testing.T) 
 	}
 }
 
+// A failed embedding fails neither the Capture nor the catch-up, and the next
+// catch-up tries again.
+func TestBot_CatchUp_EmbedsOnceEmbedderRecovers(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "running", Confidence: 0.9}}}
+	embedder := &fakeEmbedder{err: errors.New("embedder down")}
+	bot, db, api := newBotWith(t, classifier.classify, embedder.embed, filepath.Join(t.TempDir(), "cermin.db"))
+	api.queue(textUpdate(t, ownerID, "Start running on Saturdays.", 0))
+	thought := captureQueued(t, bot, db)
+	if updates, err := db.GetUnprocessedUpdates(ctx); err != nil || len(updates) != 0 {
+		t.Errorf("unprocessed updates = %+v, %v; want none", updates, err)
+	}
+
+	if err := bot.CatchUp(ctx); err != nil {
+		t.Fatalf("CatchUp: %v", err)
+	}
+	embedder.err = nil
+	if err := bot.CatchUp(ctx); err != nil {
+		t.Fatalf("CatchUp again: %v", err)
+	}
+
+	if want := slices.Repeat([][]string{{thought.Text}}, 3); !reflect.DeepEqual(embedder.calls, want) {
+		t.Errorf("embedded %q, want %q", embedder.calls, want)
+	}
+	unembedded, err := db.GetThoughtsWithoutEmbeddingByModel(ctx, embedModel, 20)
+	if err != nil || len(unembedded) != 0 {
+		t.Errorf("GetThoughtsWithoutEmbeddingByModel = %+v, %v; want none", unembedded, err)
+	}
+	wantSent := []sentMessage{{ChatID: ownerID, Text: "💡 idea · running", ReplyToID: messageID}}
+	if sent := api.sentMessages(); !slices.Equal(sent, wantSent) {
+		t.Errorf("sent %+v, want %+v", sent, wantSent)
+	}
+}
+
 // An imported Thought has no Telegram message for an Acknowledgement to reply
-// to, so the catch-up only classifies it.
+// to, so the catch-up only classifies and embeds it.
 func TestBot_CatchUp_ClassifiesImportedThoughtWithoutAcknowledgement(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()

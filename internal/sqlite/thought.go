@@ -126,10 +126,11 @@ func (db *DB) GetThoughtByMessageID(ctx context.Context, messageID int64) (cermi
 	return t, true, nil
 }
 
-// DeleteThought deletes the Thought id, with its Classifications, the inbox
-// updates that carry its message, which are the message and its edits, and
-// update updateID, which asked for the delete, all in one transaction. So a
-// crash can't leave that update to be processed again with its Thought gone.
+// DeleteThought deletes the Thought id, with its Classifications and vectors,
+// the inbox updates that carry its message, which are the message and its
+// edits, and update updateID, which asked for the delete, all in one
+// transaction. So a crash can't leave that update to be processed again with
+// its Thought gone.
 // Other updates keep no copy of the Thought's text: telegram.Update.Raw cuts
 // replies' copies down to the message ID. The Thought's Acknowledgement, if it
 // has one, is added to those GetDeletedAckIDs returns.
@@ -164,7 +165,7 @@ func (db *DB) deleteThought(ctx context.Context, id, updateID int64) error {
 	if err != nil {
 		return err
 	}
-	// Its Classifications and their candidate Topics cascade.
+	// Its Classifications, their candidate Topics and its vectors cascade.
 	if _, err := tx.ExecContext(ctx, `DELETE FROM thoughts WHERE id = ?`, id); err != nil {
 		return err
 	}

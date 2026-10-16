@@ -30,6 +30,8 @@ const (
 	messageID = 7    // the Telegram message carrying the Thought
 	ackID     = 1001 // its Acknowledgement, the first message the fake Bot API sends
 	commandID = 20   // the Telegram message carrying a command
+
+	embedModel = "model-test" // the embedding model of every test Bot
 )
 
 // thoughtTime is when the test Thoughts were sent: 08:30 WIB.
@@ -42,6 +44,17 @@ func newBot(t *testing.T, classify capture.ClassifyFunc) (*capture.Bot, *sqlite.
 
 // newBotAt is newBot with its database at path.
 func newBotAt(t *testing.T, classify capture.ClassifyFunc, path string) (*capture.Bot, *sqlite.DB, *fakeBotAPI) {
+	t.Helper()
+	return newBotWith(t, classify, (&fakeEmbedder{}).embed, path)
+}
+
+// newBotWith is newBotAt embedding with embed.
+func newBotWith(
+	t *testing.T,
+	classify capture.ClassifyFunc,
+	embed capture.EmbedFunc,
+	path string,
+) (*capture.Bot, *sqlite.DB, *fakeBotAPI) {
 	t.Helper()
 	api := &fakeBotAPI{}
 	srv := httptest.NewServer(api.handler(t))
@@ -57,7 +70,7 @@ func newBotAt(t *testing.T, classify capture.ClassifyFunc, path string) (*captur
 		}
 	})
 
-	bot := capture.New(db, telegram.New(srv.URL, botToken), ownerID, classify)
+	bot := capture.New(db, telegram.New(srv.URL, botToken), ownerID, classify, embed, embedModel)
 	return bot, db, api
 }
 
@@ -242,6 +255,25 @@ func (f *fakeClassifier) classify(
 		Language:         "en",
 	}
 	return c, nil
+}
+
+// fakeEmbedder gives every text the same vector, or fails with err if set. It
+// records the texts of each call.
+type fakeEmbedder struct {
+	err   error
+	calls [][]string
+}
+
+func (f *fakeEmbedder) embed(_ context.Context, texts []string) ([][]float32, error) {
+	f.calls = append(f.calls, texts)
+	if f.err != nil {
+		return nil, f.err
+	}
+	vectors := make([][]float32, 0, len(texts))
+	for range texts {
+		vectors = append(vectors, []float32{0.5, -0.25, 1})
+	}
+	return vectors, nil
 }
 
 // textUpdate is an update carrying a text message. A non-zero replyToID
