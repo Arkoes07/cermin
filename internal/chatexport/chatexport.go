@@ -12,6 +12,8 @@ import (
 	"io"
 	"regexp"
 	"time"
+
+	"github.com/arkoes07/cermin/internal/cermin"
 )
 
 // header is a line that starts a message: its time, in timeLayout, its
@@ -20,10 +22,6 @@ var header = regexp.MustCompile(`^\[(\d\d/\d\d/\d\d, \d\d\.\d\d\.\d\d)\] [^:]+: 
 
 // timeLayout is how a header writes a message's time.
 const timeLayout = "02/01/06, 15.04.05"
-
-// wib is Western Indonesia Time, the timezone of the export's times. It has
-// no daylight saving time, so a fixed zone matches it and needs no tzdata.
-var wib = time.FixedZone("WIB", 7*60*60)
 
 // Message is one message in a chat export.
 type Message struct {
@@ -47,7 +45,7 @@ func Parse(r io.Reader) ([]Message, error) {
 			messages[len(messages)-1].Text += "\n" + line
 			continue
 		}
-		at, err := time.ParseInLocation(timeLayout, m[1], wib)
+		at, err := time.ParseInLocation(timeLayout, m[1], cermin.WIB)
 		if err != nil {
 			return nil, fmt.Errorf("line %d: %w", n, err)
 		}

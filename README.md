@@ -2,7 +2,7 @@
 
 Cermin (Indonesian for "mirror") turns the Thoughts I send to a Telegram bot into a Corpus that mirrors how I think. It classifies each Thought, resurfaces related past ones, points out Loops, and builds a Portrait of my thinking.
 
-**Status:** week 1 of 4 (12–18 Oct). Capture and classification are live in Telegram, deployed to Fly.io and backed up to Cloudflare R2. The restore drill (#4) proved the backup restores, metrics (#23) are graphed on fly-metrics.net, and the backup watch (#24) says in Telegram when changes wait an hour to reach R2. Week 2 has begun: the WhatsApp import (#25) brought the earlier Thoughts into the Corpus, and every Thought gets a qwen3-embedding-0.6b vector from Cloudflare Workers AI (#26). Next: calibrating the Resurfacing cut-off (#27).
+**Status:** week 1 of 4 (12–18 Oct). Capture and classification are live in Telegram, deployed to Fly.io and backed up to Cloudflare R2. The restore drill (#4) proved the backup restores, metrics (#23) are graphed on fly-metrics.net, and the backup watch (#24) says in Telegram when changes wait an hour to reach R2. Week 2 has begun: the WhatsApp import (#25) brought the earlier Thoughts into the Corpus, every Thought gets a qwen3-embedding-0.6b vector from Cloudflare Workers AI (#26), and `cermin pairs` lists the pairs for calibrating the Resurfacing cut-off (#27). Next: labelling them to set the cut-off, then Resurfacing (#28).
 
 - Product: [docs/product/PRD.md](docs/product/PRD.md)
 - Vocabulary: [CONTEXT.md](CONTEXT.md)
