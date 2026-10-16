@@ -643,3 +643,42 @@ func TestBot_CatchUp_DropsClassificationOfThoughtDeletedMeanwhile(t *testing.T) 
 		t.Errorf("edited %+v, want %+v", edits, wantEdits)
 	}
 }
+
+// An imported Thought has no Telegram message for an Acknowledgement to reply
+// to, so the catch-up only classifies it.
+func TestBot_CatchUp_ClassifiesImportedThoughtWithoutAcknowledgement(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	classifier := &fakeClassifier{candidates: []cermin.TopicCandidate{{Name: "walking", Confidence: 0.9}}}
+	bot, db, api := newBot(t, classifier.classify)
+	_, err := db.SaveImportedThought(ctx, cermin.Thought{
+		Text:       "Maybe the morning walk is when ideas come, not the desk.",
+		Source:     "whatsapp",
+		ThoughtAt:  thoughtTime,
+		ReceivedAt: thoughtTime,
+	})
+	if err != nil {
+		t.Fatalf("SaveImportedThought: %v", err)
+	}
+
+	for range 2 {
+		if err := bot.CatchUp(ctx); err != nil {
+			t.Fatalf("CatchUp: %v", err)
+		}
+	}
+
+	thoughts, err := db.GetThoughts(ctx)
+	if err != nil {
+		t.Fatalf("GetThoughts: %v", err)
+	}
+	classifications := classificationsOf(t, db, thoughts)
+	if len(classifications) != 1 || len(classifications[0]) != 1 {
+		t.Errorf("Classifications = %+v, want 1 of the one Thought", classifications)
+	}
+	if sent := api.sentMessages(); len(sent) != 0 {
+		t.Errorf("sent %+v, want nothing", sent)
+	}
+	if edits := api.editedMessages(); len(edits) != 0 {
+		t.Errorf("edited %+v, want nothing", edits)
+	}
+}

@@ -9,7 +9,7 @@ This document describes the whole v1 solution, weeks 1 to 4. The choices that ar
 | Quantity | Estimate | Basis |
 |---|---|---|
 | Thoughts | 5/day on average; plan for 30/day peaks | PRD |
-| Corpus size | ~75 imported from WhatsApp, then ~150/month: ~400 by 8 Nov, ~2,000 after a year | 3 Oct to go-live at 5/day |
+| Corpus size | 21 imported from WhatsApp, then ~150/month: ~400 by 8 Nov, ~2,000 after a year | the export, then 5/day |
 | Thought length | ~200 characters (~60 tokens) on average; 4,096 max | Telegram message limit |
 | Telegram updates | 10 to 40/day: Thoughts, commands, Reactions | |
 | LLM calls | 10 to 30/day: one Classification per Thought, plus Ask, weekly Digest and occasional Portrait | |
@@ -152,13 +152,14 @@ Module `github.com/arkoes07/cermin`. Imports point inward, toward `internal/cerm
 | `internal/claude/` | adapter | Claude API calls; today the classification call, with its prompt and output schema |
 | `internal/telegram/` | adapter | Bot API client over `net/http`: `getUpdates`, `sendMessage`, `editMessageText`, `sendChatAction` |
 | `internal/litestream/` | adapter | client for Litestream's IPC socket over `net/http`: `POST /sync`, which returns the local and the replicated position |
+| `internal/chatexport/` | adapter | parser for the hand-pruned iOS WhatsApp export (`_chat.txt`) in its one format: each header line starts a message, with its Thought time read in WIB, and other lines continue it |
 | `internal/backup/` | use case | the backup watch ([5.4](#54-monitoring)) |
 | `cmd/cermin/` | wiring | `main` with subcommands: `serve` (wk 1), `import` (wk 2), `pairs` (wk 2), `eval` (wk 3); reads the environment and builds every part with its constructor, without a dependency-injection library |
 
 Later weeks add packages when they need them. New code goes in the first place that fits:
 
 1. **A glossary term, or a rule about one that needs no I/O**: `internal/cermin`.
-2. **Code that calls out of the process** (an API, the database, a file format): an adapter, named after what it talks to (`telegram`, `claude`, `sqlite`, `gemini`, `whatsapp`), so the glossary's words stay free for the domain and the use cases. `embed` is taken by the standard library and `import` is a Go keyword, hence `gemini` and `whatsapp`. An adapter may import `internal/cermin` and nothing else in this module.
+2. **Code that calls out of the process** (an API, the database, a file format): an adapter, named after what it talks to (`telegram`, `claude`, `sqlite`, `gemini`, `chatexport`), so the glossary's words stay free for the domain and the use cases. `embed` is taken by the standard library, hence `gemini`. A WhatsApp chat export is a file format, hence `chatexport`, which leaves `whatsapp` for a WhatsApp bot. An adapter may import `internal/cermin` and nothing else in this module.
 3. **Code that drives the adapters**: something you do or receive (Capture, Correction, Resurfacing, Ask, Digest), an endpoint that receives requests (MCP), or logic several of them share (Retrieval). It goes in a use-case package named after its job, such as `resurface`, `ask`, `digest`, `mcp` or `retrieval`. A use case may import `internal/cermin`, adapters and other use cases, and calls adapters directly. It declares a function type or interface for an adapter only when a second implementation arrives or a test needs a fake that a real instance can't provide, as `capture.ClassifyFunc` does for the Claude call.
 4. **Reading the environment, choosing implementations, building each part and starting it**: `cmd/cermin`. A part may still run goroutines of its own.
 
@@ -187,7 +188,7 @@ Libraries:
 | `CERMIN_EMBED_MODEL` | 2 | optional; default `gemini-embedding-2` | Embedding model |
 | `CERMIN_MCP_TOKEN` | 3 | Fly secret; MCP client config | MCP bearer token |
 
-Values that only change with a deploy are constants in code: the WIB timezone (`Asia/Jakarta`), the 8 s Acknowledgement wait, the 0.5 placeholder keep threshold, the HTTP port (8080), the metrics port (9091), the backup watch's 1 h threshold, and the Resurfacing cut-off ([ADR-0010](../adr/0010-resurfacing-raw-text-calibrated-cutoff.md)) and 24 h window.
+Values that only change with a deploy are constants in code: the WIB timezone (a fixed UTC+7 zone, so the image needs no tzdata), the 8 s Acknowledgement wait, the 0.5 placeholder keep threshold, the HTTP port (8080), the metrics port (9091), the backup watch's 1 h threshold, and the Resurfacing cut-off ([ADR-0010](../adr/0010-resurfacing-raw-text-calibrated-cutoff.md)) and 24 h window.
 
 ### 5.4 Monitoring
 
@@ -544,7 +545,7 @@ Confidence is never shown.
 | Language | Cermin writes only English and quotes Thoughts as written. Kind and Topic names are English, except Declared Topics. | PRD, CONTEXT.md |
 | Resurfacing | Raw-text embeddings at 3072 dimensions. Strong means a cosine similarity at or above a cut-off calibrated on your labelled pairs. Up to 2 Thoughts, never from the last 24 h and never the one replied to. Sent once, during Capture, after the Acknowledgement. | [ADR-0010](../adr/0010-resurfacing-raw-text-calibrated-cutoff.md), [#28](https://github.com/Arkoes07/cermin/issues/28) |
 | Reactions | 👍/👎 buttons under each Insight; every tap is stored and the latest counts. | [#28](https://github.com/Arkoes07/cermin/issues/28) |
-| WhatsApp import | The hand-pruned iOS export goes over `fly ssh sftp`, then `cermin import`. Imported Thoughts get no Acknowledgement and trigger no Resurfacing. | [#25](https://github.com/Arkoes07/cermin/issues/25) |
+| WhatsApp import | The hand-pruned iOS export goes over `fly ssh sftp`, then `cermin import`. `chatexport` parses it, and `source` stays `whatsapp`, the channel it was captured in. Imported Thoughts get no Acknowledgement and trigger no Resurfacing. | [#25](https://github.com/Arkoes07/cermin/issues/25) |
 | Corrections | Reply commands; `/topics` replaces the set; Cermin's Classifications are kept. | CONTEXT.md |
 | Kinds | Starting five, defined in the PRD; changed only by your decision. | PRD, ADR-0008 |
 | Time | UTC stored, read in WIB; no per-Thought timezone in v1. | |

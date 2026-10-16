@@ -39,6 +39,32 @@ func (db *DB) SaveThought(ctx context.Context, t cermin.Thought) (cermin.Thought
 	return stored, nil
 }
 
+// SaveImportedThought stores a Thought imported from a chat export, which has
+// no Telegram message, and reports whether it is new. If a Thought with the
+// same source, Thought time and text is already stored, it saves nothing, so
+// importing the same message twice keeps one Thought.
+func (db *DB) SaveImportedThought(ctx context.Context, t cermin.Thought) (bool, error) {
+	res, err := db.pool.ExecContext(ctx, `
+		INSERT INTO thoughts (text, source, thought_at, received_at)
+		SELECT :text, :source, :thought_at, :received_at
+		WHERE NOT EXISTS (
+			SELECT 1 FROM thoughts WHERE source = :source AND thought_at = :thought_at AND text = :text
+		)`,
+		sql.Named("text", t.Text),
+		sql.Named("source", t.Source),
+		sql.Named("thought_at", formatTime(t.ThoughtAt)),
+		sql.Named("received_at", formatTime(t.ReceivedAt)),
+	)
+	if err != nil {
+		return false, fmt.Errorf("saving imported thought: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("saving imported thought: %w", err)
+	}
+	return n == 1, nil
+}
+
 // SetAck records that message ackMessageID is a Thought's Acknowledgement and
 // shows Classification classificationID, or none if it is 0.
 func (db *DB) SetAck(ctx context.Context, thoughtID, ackMessageID, classificationID int64) error {

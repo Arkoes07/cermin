@@ -9,6 +9,12 @@
 // CERMIN_CLASSIFY_MODEL (default claude-sonnet-5-5) and
 // CERMIN_LITESTREAM_SOCKET from the environment. With CERMIN_LITESTREAM_SOCKET
 // set, it also watches the backups through Litestream's IPC socket there.
+//
+//	cermin import <file>
+//
+// saves each message in the WhatsApp chat export file as a Thought, skipping
+// those already imported, and prints how many it imported and skipped. It
+// reads only CERMIN_DB_PATH. The catch-up of a running serve classifies them.
 package main
 
 import (
@@ -29,6 +35,8 @@ import (
 
 	"github.com/arkoes07/cermin/internal/backup"
 	"github.com/arkoes07/cermin/internal/capture"
+	"github.com/arkoes07/cermin/internal/cermin"
+	"github.com/arkoes07/cermin/internal/chatexport"
 	"github.com/arkoes07/cermin/internal/claude"
 	"github.com/arkoes07/cermin/internal/litestream"
 	"github.com/arkoes07/cermin/internal/sqlite"
@@ -42,6 +50,8 @@ const (
 	// [metrics] port matches it, and no service exposes it, so it is never
 	// public.
 	metricsAddr = ":9091"
+	// defaultDBPath is the database file when CERMIN_DB_PATH is unset.
+	defaultDBPath = "data/cermin.db"
 )
 
 func main() {
@@ -52,9 +62,21 @@ func main() {
 }
 
 func run(args []string) error {
-	if len(args) != 1 || args[0] != "serve" {
-		return errors.New("usage: cermin serve")
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	switch {
+	case len(args) == 1 && args[0] == "serve":
+		return serve(ctx)
+	case len(args) == 2 && args[0] == "import":
+		return importChat(ctx, args[1])
+	default:
+		return errors.New("usage: cermin serve | cermin import <file>")
 	}
+}
+
+// serve runs the bot until ctx is cancelled.
+func serve(ctx context.Context) error {
 	token := os.Getenv("TELEGRAM_BOT_TOKEN")
 	if token == "" {
 		return errors.New("missing TELEGRAM_BOT_TOKEN")
@@ -67,12 +89,9 @@ func run(args []string) error {
 	if apiKey == "" {
 		return errors.New("missing ANTHROPIC_API_KEY")
 	}
-	dbPath := cmp.Or(os.Getenv("CERMIN_DB_PATH"), "data/cermin.db")
+	dbPath := cmp.Or(os.Getenv("CERMIN_DB_PATH"), defaultDBPath)
 	model := cmp.Or(os.Getenv("CERMIN_CLASSIFY_MODEL"), claude.DefaultModel)
 	litestreamSocket := os.Getenv("CERMIN_LITESTREAM_SOCKET")
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	db, err := sqlite.Open(ctx, dbPath)
 	if err != nil {
@@ -104,6 +123,45 @@ func run(args []string) error {
 	bot.Run(ctx)
 	slog.Info("stopped")
 	return errors.Join(healthSrv.Close(), metricsSrv.Close(), db.Close())
+}
+
+// importChat saves each message in the WhatsApp chat export at path as a
+// Thought, with WhatsApp as its source, the channel it was captured in. It
+// skips those already imported, so it can be run again, and prints how many it
+// imported and skipped.
+func importChat(ctx context.Context, path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	messages, err := chatexport.Parse(f)
+	if err != nil {
+		return fmt.Errorf("parsing %s: %w", path, err)
+	}
+
+	db, err := sqlite.Open(ctx, cmp.Or(os.Getenv("CERMIN_DB_PATH"), defaultDBPath))
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	imported := 0
+	for _, m := range messages {
+		isNew, err := db.SaveImportedThought(ctx, cermin.Thought{
+			Text:       m.Text,
+			Source:     "whatsapp",
+			ThoughtAt:  m.ThoughtAt,
+			ReceivedAt: now,
+		})
+		if err != nil {
+			return errors.Join(err, db.Close())
+		}
+		if isNew {
+			imported++
+		}
+	}
+	fmt.Printf("imported %d Thoughts, skipped %d already imported\n", imported, len(messages)-imported)
+	return db.Close()
 }
 
 // startHTTP serves h on addr until the server it returns is closed.

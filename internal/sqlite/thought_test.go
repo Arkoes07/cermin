@@ -5,9 +5,40 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/arkoes07/cermin/internal/cermin"
 )
+
+// A second import of the same export, or of one that stopped halfway, must
+// add nothing.
+func TestDB_SaveImportedThought_KeepsOne(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	db := openDB(t)
+	imported := cermin.Thought{
+		Text:       "Maybe the morning walk is when ideas come, not the desk.",
+		Source:     "whatsapp",
+		ThoughtAt:  time.Date(2026, 10, 3, 12, 10, 30, 0, time.UTC),
+		ReceivedAt: time.Now(),
+	}
+
+	for i, wantNew := range []bool{true, false} {
+		isNew, err := db.SaveImportedThought(ctx, imported)
+		if err != nil || isNew != wantNew {
+			t.Fatalf("SaveImportedThought #%d = %t, %v; want %t", i+1, isNew, err, wantNew)
+		}
+	}
+	thoughts, err := db.GetThoughts(ctx)
+	if err != nil || len(thoughts) != 1 {
+		t.Fatalf("GetThoughts = %+v, %v; want 1", thoughts, err)
+	}
+	want := imported
+	want.ID, want.ReceivedAt = thoughts[0].ID, thoughts[0].ReceivedAt
+	if thoughts[0] != want {
+		t.Errorf("stored %+v, want %+v", thoughts[0], want)
+	}
+}
 
 // Logs name a Thought or a Classification by its ID alone, so a deleted one's
 // ID must never go to a new one. The Thought deleted is usually the newest,
