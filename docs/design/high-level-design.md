@@ -151,6 +151,8 @@ Module `github.com/arkoes07/cermin`. Imports point inward, toward `internal/cerm
 | `internal/sqlite/` | adapter | SQLite access; migrations embedded and tracked with `PRAGMA user_version`; `PRAGMA foreign_keys = ON`; `PRAGMA secure_delete = ON`, so a deleted row leaves the file and, once retention passes, the backups |
 | `internal/claude/` | adapter | Claude API calls; today the classification call, with its prompt and output schema |
 | `internal/telegram/` | adapter | Bot API client over `net/http`: `getUpdates`, `sendMessage`, `editMessageText`, `sendChatAction` |
+| `internal/litestream/` | adapter | client for Litestream's IPC socket over `net/http`: `POST /sync`, which returns the local and the replicated position |
+| `internal/backup/` | use case | the backup watch ([5.4](#54-monitoring)) |
 | `cmd/cermin/` | wiring | `main` with subcommands: `serve` (wk 1), `import` (wk 2), `pairs` (wk 2), `eval` (wk 3); reads the environment and builds every part with its constructor, without a dependency-injection library |
 
 Later weeks add packages when they need them. New code goes in the first place that fits:

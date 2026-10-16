@@ -7,6 +7,12 @@ snapshot:
   # leaves R2 within retention + interval: 6 days.
   retention: 120h
 
+# The IPC socket, through which Cermin's backup watch asks how far
+# replication has got. fly.toml's CERMIN_LITESTREAM_SOCKET matches the path.
+socket:
+  enabled: true
+  path: /var/run/litestream.sock
+
 dbs:
   - path: ${CERMIN_DB_PATH} # /data/cermin.db, set in fly.toml
     replica:

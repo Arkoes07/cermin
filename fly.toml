@@ -5,6 +5,8 @@ primary_region = "iad"
 
 [env]
   CERMIN_DB_PATH = "/data/cermin.db"
+  # litestream.yml's socket path; it turns the backup watch on.
+  CERMIN_LITESTREAM_SOCKET = "/var/run/litestream.sock"
 
 [mounts]
   source = "cermin_data"

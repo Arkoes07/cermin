@@ -5,8 +5,10 @@
 // captures and classifies Thoughts sent to the Telegram bot until it is
 // interrupted, answers /healthz on port 8080 and serves Prometheus metrics at
 // /metrics on port 9091. It reads TELEGRAM_BOT_TOKEN, TELEGRAM_OWNER_ID,
-// ANTHROPIC_API_KEY and, optionally, CERMIN_DB_PATH (default data/cermin.db)
-// and CERMIN_CLASSIFY_MODEL (default claude-sonnet-5-5) from the environment.
+// ANTHROPIC_API_KEY and, optionally, CERMIN_DB_PATH (default data/cermin.db),
+// CERMIN_CLASSIFY_MODEL (default claude-sonnet-5-5) and
+// CERMIN_LITESTREAM_SOCKET from the environment. With CERMIN_LITESTREAM_SOCKET
+// set, it also watches the backups through Litestream's IPC socket there.
 package main
 
 import (
@@ -25,8 +27,10 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/arkoes07/cermin/internal/backup"
 	"github.com/arkoes07/cermin/internal/capture"
 	"github.com/arkoes07/cermin/internal/claude"
+	"github.com/arkoes07/cermin/internal/litestream"
 	"github.com/arkoes07/cermin/internal/sqlite"
 	"github.com/arkoes07/cermin/internal/telegram"
 )
@@ -65,6 +69,7 @@ func run(args []string) error {
 	}
 	dbPath := cmp.Or(os.Getenv("CERMIN_DB_PATH"), "data/cermin.db")
 	model := cmp.Or(os.Getenv("CERMIN_CLASSIFY_MODEL"), claude.DefaultModel)
+	litestreamSocket := os.Getenv("CERMIN_LITESTREAM_SOCKET")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -74,7 +79,8 @@ func run(args []string) error {
 		return err
 	}
 	classifier := claude.New(apiKey, model)
-	bot := capture.New(db, telegram.New(telegram.APIURL, token), ownerID, classifier.Classify)
+	tg := telegram.New(telegram.APIURL, token)
+	bot := capture.New(db, tg, ownerID, classifier.Classify)
 
 	health := http.NewServeMux()
 	health.HandleFunc("GET /healthz", bot.ServeHealth)
@@ -90,6 +96,10 @@ func run(args []string) error {
 		return errors.Join(err, healthSrv.Close(), db.Close())
 	}
 
+	if litestreamSocket != "" {
+		slog.InfoContext(ctx, "watching backups", "litestream_socket", litestreamSocket)
+		go backup.New(litestream.New(litestreamSocket, dbPath), tg, ownerID).Run(ctx)
+	}
 	slog.InfoContext(ctx, "capturing Thoughts", "db", dbPath, "classify_model", model)
 	bot.Run(ctx)
 	slog.Info("stopped")
