@@ -12,7 +12,7 @@ This document describes the whole v1 solution, weeks 1 to 4. The choices that ar
 | Corpus size | 21 imported from WhatsApp, then ~150/month: ~400 by 8 Nov, ~2,000 after a year | the export, then 5/day |
 | Thought length | ~200 characters (~60 tokens) on average; 4,096 max | Telegram message limit |
 | Telegram updates | 10 to 40/day: Thoughts, commands, Reactions | |
-| LLM calls | 10 to 30/day: one Classification per Thought, plus Ask, weekly Digest and occasional Portrait | |
+| LLM calls | 10 to 30/day: one Classification per Thought, a Resurfacing Judge call for about half of them, plus Ask, weekly Digest and occasional Portrait | |
 | Tokens | under 1M/month in total | |
 | MCP calls | tens/day at most | |
 | Storage per Thought | ~10 KB: text 0.5 KB, raw update 2 KB, Classifications 3 KB, embedding 4 KB (1,024 float32) | |
@@ -29,12 +29,13 @@ This document describes the whole v1 solution, weeks 1 to 4. The choices that ar
 | Backups on Cloudflare R2 (free tier: 10 GB, free egress) | $0 |
 | Metrics on Fly's managed Prometheus and Grafana (no charge today; Fly gives notice before that changes) | $0 |
 | Classification on Claude Sonnet 5.5 ($2 / $10 per MTok), low effort: 150 × ~1.5k in, ~350 out | ~$1 to $1.50 |
+| Resurfacing Judge on Claude Sonnet 5.5, low effort: ~75 × ~850 in, ~300 out | ~$0.35 |
 | Ask on Claude Sonnet 5.5: ~60 × 5k in, 500 out | ~$0.90 |
 | Digest on Sonnet 5.5: 4 runs | ~$0.20 |
 | Portrait on Claude Opus 5.5 ($4 / $20): ~4 runs × 30k in, ~15k out incl. thinking | ~$1.70 |
 | Embeddings, Qwen3-Embedding-0.6B on Workers AI ($0.012 per MTok, inside the free 10,000 Neurons a day) | $0 |
 | Week-3 evaluation reruns (Haiku, Sonnet, Opus on the labelled set, via the Batch API at half price) | ~$2, once |
-| **Total** | **≈ $8 in the month with evaluation, ≈ $6 otherwise; under the $10 cap** |
+| **Total** | **≈ $9 in the month with evaluation, ≈ $7 otherwise; under the $10 cap** |
 
 The models for Ask, Digest and Portrait are upper bounds; each picks its own in its week. The Anthropic account has a spend cap. Workers AI has none, so the Cloudflare account stays on the Workers Free plan, where calls past the daily free allocation fail instead of being billed.
 
@@ -125,7 +126,7 @@ flowchart TB
 | Capture pipeline | [ADR-0007](../adr/0007-capture-durable-inbox-long-polling.md) | Long polling into a database inbox; the Thought is saved before any AI call. |
 | Data model | [ADR-0008](../adr/0008-append-only-classifications.md) | Append-only Classifications; every candidate Topic stored; Kinds in a table changed only by migrations. |
 | Code layout | [ADR-0009](../adr/0009-domain-package-and-inward-imports.md) | Clean architecture's dependency rule without its layer directories: the domain in `internal/cermin`, use cases and adapters as sibling packages, wiring in `cmd/cermin`. See [5.2](#52-code-layout). |
-| Resurfacing | [ADR-0010](../adr/0010-resurfacing-raw-text-calibrated-cutoff.md) | Only the raw text is embedded. A strong relation is a cosine similarity at or above a cut-off calibrated on your labelled pairs. |
+| Resurfacing | [ADR-0010](../adr/0010-resurfacing-raw-text-calibrated-cutoff.md) | Only the raw text is embedded. Cosine similarity shortlists the candidates, and a Claude Judge decides which are strongly related. |
 | Deploy | | GitHub Actions runs `go vet` and `go test` on every push, then `fly deploy` on `main` once they pass. The inbox makes this safe: a handler bug leaves updates unprocessed, not lost. |
 | Monitoring | | Metrics about running Cermin on Fly's managed Prometheus; numbers about your use from SQL; one alert, for backups. See [5.4](#54-monitoring). |
 
@@ -149,13 +150,13 @@ Module `github.com/arkoes07/cermin`. Imports point inward, toward `internal/cerm
 | `internal/cermin/` | domain | the glossary types (Thought, Kind, Classification, candidate Topics) and the rules about them that need no I/O, such as the keep rule (`KeepTopics`) |
 | `internal/capture/` | use case | the inbox handler, commands, the catch-up loop, the poller's `/healthz` |
 | `internal/sqlite/` | adapter | SQLite access; migrations embedded and tracked with `PRAGMA user_version`; `PRAGMA foreign_keys = ON`; `PRAGMA secure_delete = ON`, so a deleted row leaves the file and, once retention passes, the backups |
-| `internal/claude/` | adapter | Claude API calls; today the classification call, with its prompt and output schema |
+| `internal/claude/` | adapter | Claude API calls, each with its prompt and output schema: the classification call and the Resurfacing Judge's |
 | `internal/workersai/` | adapter | Cloudflare Workers AI client over `net/http`: the embedding model's run call |
 | `internal/telegram/` | adapter | Bot API client over `net/http`: `getUpdates`, `sendMessage`, `editMessageText`, `sendChatAction` |
 | `internal/litestream/` | adapter | client for Litestream's IPC socket over `net/http`: `POST /sync`, which returns the local and the replicated position |
 | `internal/chatexport/` | adapter | parser for the hand-pruned iOS WhatsApp export (`_chat.txt`) in its one format: each header line starts a message, with its Thought time read in WIB, and other lines continue it |
 | `internal/backup/` | use case | the backup watch ([5.4](#54-monitoring)) |
-| `cmd/cermin/` | wiring | `main` with subcommands: `serve` (wk 1), `import` (wk 2), `pairs` (wk 2), `eval` (wk 3); reads the environment and builds every part with its constructor, without a dependency-injection library |
+| `cmd/cermin/` | wiring | `main` with subcommands: `serve` (wk 1), `import` (wk 2), `pairs` (wk 2), `eval resurfacing` (wk 2), `eval classification` (wk 3); reads the environment and builds every part with its constructor, without a dependency-injection library |
 
 Later weeks add packages when they need them. New code goes in the first place that fits:
 
@@ -187,9 +188,10 @@ Libraries:
 | `CERMIN_LITESTREAM_SOCKET` | 1 | `fly.toml`; unset locally | Litestream's IPC socket, read by the backup watch; unset turns the watch off |
 | `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` | 2 | Fly secrets; `.env` | Embeddings on Workers AI; the token is scoped to Workers AI only |
 | `CERMIN_EMBED_MODEL` | 2 | optional; default `@cf/qwen/qwen3-embedding-0.6b` | Embedding model |
+| `CERMIN_JUDGE_MODEL` | 2 | optional; default `claude-sonnet-5-5` | Resurfacing Judge model |
 | `CERMIN_MCP_TOKEN` | 3 | Fly secret; MCP client config | MCP bearer token |
 
-Values that only change with a deploy are constants in code: the WIB timezone (a fixed UTC+7 zone, so the image needs no tzdata), the 8 s Acknowledgement wait, the 0.5 placeholder keep threshold, the HTTP port (8080), the metrics port (9091), the backup watch's 1 h threshold, and the Resurfacing cut-off ([ADR-0010](../adr/0010-resurfacing-raw-text-calibrated-cutoff.md)) and 24 h window.
+Values that only change with a deploy are constants in code: the WIB timezone (a fixed UTC+7 zone, so the image needs no tzdata), the 8 s Acknowledgement wait, the 0.5 placeholder keep threshold, the HTTP port (8080), the metrics port (9091), the backup watch's 1 h threshold, and for Resurfacing the shortlist's 0.45 floor and cap of 3, the Judge's 0.6 keep confidence ([ADR-0010](../adr/0010-resurfacing-raw-text-calibrated-cutoff.md)) and the 24 h window.
 
 ### 5.4 Monitoring
 
@@ -527,6 +529,11 @@ Confidence is never shown.
   - Every candidate comes back unkept. Cermin then keeps those at or above 0.5, at most 3, or the single best if none pass (`cermin.KeepTopics`). Week 3 replaces the 0.5 placeholder (⏳).
   - `kind_suggestion` is empty unless no Kind fits well.
 - **`embed(texts) → vectors`** (week 2): Qwen3-Embedding-0.6B on Workers AI at 1024 dimensions, on the raw text sent as documents, so with no task instruction ([ADR-0010](../adr/0010-resurfacing-raw-text-calibrated-cutoff.md)).
+- **`judge(text, shortlist) → confidences`** (week 2): one call per Thought for its whole Resurfacing shortlist, on Claude Sonnet 5.5 unless `CERMIN_JUDGE_MODEL` says otherwise ([ADR-0010](../adr/0010-resurfacing-raw-text-calibrated-cutoff.md)).
+  - Structured output, at low effort.
+  - One confidence from 0 to 1 per shortlisted Thought, in order: the model's own stated value (method `verbalized-v1`). A wrong count, or a stop reason other than `end_turn`, is an error.
+  - The prompt (`judge-v1`) holds the Thoughts' texts only, with no Kinds, Topics or dates. No reasons come back, since a reason would paraphrase a Thought and outlive its `/delete`.
+  - A shortlisted Thought is kept at 0.6 or above.
 - **`answer(question, thoughts) → {text, cited_ids}`** (week 3).
 
 ## 9. Decisions log
@@ -544,7 +551,7 @@ Confidence is never shown.
 | Code layout | Domain types and rules in `internal/cermin`; imports point inward; no layer directories, and no interface until a second implementation or a test needs one. | [ADR-0009](../adr/0009-domain-package-and-inward-imports.md) |
 | Day-1 confidence | The model's stated confidence per Assignment (`verbalized-v1`); Topics kept at ≥ 0.5 as a placeholder. | ADR-0006 |
 | Language | Cermin writes only English and quotes Thoughts as written. Kind and Topic names are English, except Declared Topics. | PRD, CONTEXT.md |
-| Resurfacing | Raw-text embeddings at 1024 dimensions. Strong means a cosine similarity at or above a cut-off calibrated on your labelled pairs. Up to 2 Thoughts, never from the last 24 h and never the one replied to. Sent once, during Capture, after the Acknowledgement. | [ADR-0010](../adr/0010-resurfacing-raw-text-calibrated-cutoff.md), [#28](https://github.com/Arkoes07/cermin/issues/28) |
+| Resurfacing | Raw-text embeddings at 1024 dimensions shortlist up to 3 eligible past Thoughts that score at least 0.45. Strong means Claude Sonnet 5.5 is at least 0.6 confident that the two are strongly related: precision 0.88 and 0.83 in two runs on your labelled shortlists, with recall left out of the bar for now. Up to 2 Thoughts, never from the last 24 h and never the one replied to. Sent once, during Capture, after the Acknowledgement. | [ADR-0010](../adr/0010-resurfacing-raw-text-calibrated-cutoff.md), [#29](https://github.com/Arkoes07/cermin/issues/29), [#28](https://github.com/Arkoes07/cermin/issues/28) |
 | Reactions | 👍/👎 buttons under each Insight; every tap is stored and the latest counts. | [#28](https://github.com/Arkoes07/cermin/issues/28) |
 | WhatsApp import | The hand-pruned iOS export goes over `fly ssh sftp`, then `cermin import`. `chatexport` parses it, and `source` stays `whatsapp`, the channel it was captured in. Imported Thoughts get no Acknowledgement and trigger no Resurfacing. | [#25](https://github.com/Arkoes07/cermin/issues/25) |
 | Corrections | Reply commands; `/topics` replaces the set; Cermin's Classifications are kept. | CONTEXT.md |
@@ -557,5 +564,5 @@ Confidence is never shown.
 
 | Week | Open question |
 |---|---|
-| 3 | Classifier comparison: Claude Haiku 5.5, Sonnet 5.5, Opus 5.5 and Jev on the labelled set, for accuracy and calibration. The outcome is the cheapest model that holds accuracy, or a cascade ([#10](https://github.com/Arkoes07/cermin/issues/10)). Confidence method beyond the day-1 one; The strong-Topic threshold; Whether `kind_suggestion` evidence justifies a new Kind; How the evaluation set is built, since Corrections alone contain only errors; Declared Topic matching; Merging two Topics that mean the same, such as `money` into `personal finance`, given that Classifications are append-only ([ADR-0008](../adr/0008-append-only-classifications.md)); Ask retrieval size and model; The final MCP tool list. |
+| 3 | Classifier comparison (`cermin eval classification`): Claude Haiku 5.5, Sonnet 5.5, Opus 5.5 and Jev on the labelled set, for accuracy and calibration. The outcome is the cheapest model that holds accuracy, or a cascade ([#10](https://github.com/Arkoes07/cermin/issues/10)). Resurfacing comparison (`cermin eval resurfacing`): other ways on the labelled shortlists, to raise recall from about 0.3 to 0.4 without dropping precision below 0.8 ([#30](https://github.com/Arkoes07/cermin/issues/30)); Confidence method beyond the day-1 one; The strong-Topic threshold; Whether `kind_suggestion` evidence justifies a new Kind; How the evaluation set is built, since Corrections alone contain only errors; Declared Topic matching; Merging two Topics that mean the same, such as `money` into `personal finance`, given that Classifications are append-only ([ADR-0008](../adr/0008-append-only-classifications.md)); Ask retrieval size and model; The final MCP tool list. |
 | 4 | Loop detection; Digest content and model; Portrait method, trigger and model. |
