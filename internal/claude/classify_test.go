@@ -48,7 +48,7 @@ func TestClassifier_Classify_RecordsCall(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			srv := httptest.NewServer(fakeMessagesAPI(t, tt.status, tt.output))
+			srv := httptest.NewServer(fakeMessagesAPI(t, tt.status, "end_turn", tt.output))
 			t.Cleanup(srv.Close)
 			t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
 			kinds := []cermin.Kind{{Name: "idea", Definition: "something I might do or make"}}
@@ -99,9 +99,9 @@ func callMetricsOf(t *testing.T, model, outcome string) callMetrics {
 }
 
 // fakeMessagesAPI answers every request with status: an error, or, for 200, a
-// message whose text is output and whose usage is 120 input and 30 output
-// tokens.
-func fakeMessagesAPI(t *testing.T, status int, output string) http.Handler {
+// message that stopped with stopReason, whose text is output and whose usage
+// is 120 input and 30 output tokens.
+func fakeMessagesAPI(t *testing.T, status int, stopReason, output string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		body := map[string]any{
 			"type":  "error",
@@ -113,7 +113,7 @@ func fakeMessagesAPI(t *testing.T, status int, output string) http.Handler {
 				"type":        "message",
 				"role":        "assistant",
 				"model":       "claude-test",
-				"stop_reason": "end_turn",
+				"stop_reason": stopReason,
 				"content":     []map[string]any{{"type": "text", "text": output}},
 				"usage":       map[string]any{"input_tokens": 120, "output_tokens": 30},
 			}

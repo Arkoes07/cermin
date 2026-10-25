@@ -1,6 +1,8 @@
 // Package claude calls the Claude API for Cermin. A Classifier gives a Thought
 // its Classification: one call that names its Kind and candidate Topics, each
-// with Claude's stated confidence.
+// with Claude's stated confidence. A Judge states, in one call, how likely each
+// past Thought shortlisted for a Resurfacing is to be strongly related to the
+// new one.
 package claude
 
 import (
@@ -102,7 +104,7 @@ func (c *Classifier) Classify(
 	elapsed := time.Since(start)
 	// Recorded as Classify returns, so that output that fails to parse counts
 	// as an error.
-	defer func() { c.recordCall(purposeClassify, elapsed, resp, err) }()
+	defer func() { recordCall(purposeClassify, c.model, elapsed, resp, err) }()
 	if err != nil {
 		return cermin.Classification{}, fmt.Errorf("classify: %w", err)
 	}
@@ -111,14 +113,7 @@ func (c *Classifier) Classify(
 		return cermin.Classification{}, fmt.Errorf("classify: model stopped with %s", resp.StopReason)
 	}
 
-	var raw string
-	for _, block := range resp.Content {
-		if tb, ok := block.AsAny().(anthropic.TextBlock); ok {
-			raw = tb.Text
-			break
-		}
-	}
-
+	raw := readOutput(resp)
 	var out output
 	if err := json.Unmarshal([]byte(raw), &out); err != nil {
 		return cermin.Classification{}, fmt.Errorf("classify: decoding output: %w", err)
@@ -142,19 +137,30 @@ func (c *Classifier) Classify(
 	return classification, nil
 }
 
-// recordCall records a call made for purpose that took elapsed and ended in
-// err: its outcome, its duration and, if resp arrived, the tokens billed for
-// it.
-func (c *Classifier) recordCall(purpose string, elapsed time.Duration, resp *anthropic.Message, err error) {
+// readOutput returns the text of resp's first text block: the output, in the
+// shape the call's schema gives it.
+func readOutput(resp *anthropic.Message) string {
+	for _, block := range resp.Content {
+		if tb, ok := block.AsAny().(anthropic.TextBlock); ok {
+			return tb.Text
+		}
+	}
+	return ""
+}
+
+// recordCall records a call to model made for purpose that took elapsed and
+// ended in err: its outcome, its duration and, if resp arrived, the tokens
+// billed for it.
+func recordCall(purpose, model string, elapsed time.Duration, resp *anthropic.Message, err error) {
 	outcome := "ok"
 	if err != nil {
 		outcome = "error"
 	}
-	requestsTotal.WithLabelValues(purpose, c.model, outcome).Inc()
-	requestDuration.WithLabelValues(purpose, c.model).Observe(elapsed.Seconds())
+	requestsTotal.WithLabelValues(purpose, model, outcome).Inc()
+	requestDuration.WithLabelValues(purpose, model).Observe(elapsed.Seconds())
 	if resp != nil {
-		tokensTotal.WithLabelValues(purpose, c.model, "input").Add(float64(resp.Usage.InputTokens))
-		tokensTotal.WithLabelValues(purpose, c.model, "output").Add(float64(resp.Usage.OutputTokens))
+		tokensTotal.WithLabelValues(purpose, model, "input").Add(float64(resp.Usage.InputTokens))
+		tokensTotal.WithLabelValues(purpose, model, "output").Add(float64(resp.Usage.OutputTokens))
 	}
 }
 

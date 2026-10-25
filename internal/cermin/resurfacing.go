@@ -7,9 +7,17 @@ import (
 	"time"
 )
 
-// rememberWindow is how long you still remember a Thought, so that it can't
-// come back in a Resurfacing.
-const rememberWindow = 24 * time.Hour
+const (
+	// rememberWindow is how long you still remember a Thought, so that it
+	// can't come back in a Resurfacing.
+	rememberWindow = 24 * time.Hour
+	// shortlistFloor is the score a past Thought needs to be shortlisted: low
+	// enough to keep every pair you wanted in #27, high enough that most
+	// Thoughts shortlist none.
+	shortlistFloor = 0.45
+	// shortlistCap is the most Thoughts a shortlist holds.
+	shortlistCap = 3
+)
 
 // ScoredThought is a past Thought with its score against a new one: the
 // cosine similarity of their vectors.
@@ -35,6 +43,18 @@ func RankEligible(t EmbeddedThought, corpus []EmbeddedThought) []ScoredThought {
 		return cmp.Compare(b.Score, a.Score)
 	})
 	return ranked
+}
+
+// Shortlist returns the Thoughts in corpus that RankEligible ranks for t and
+// that score at least shortlistFloor, at most shortlistCap of them, best
+// first: the candidates for a Resurfacing of t.
+func Shortlist(t EmbeddedThought, corpus []EmbeddedThought) []ScoredThought {
+	ranked := RankEligible(t, corpus)
+	n := 0
+	for n < min(len(ranked), shortlistCap) && ranked[n].Score >= shortlistFloor {
+		n++
+	}
+	return ranked[:n]
 }
 
 // repliesTo reports whether t replies to past, through its message or its

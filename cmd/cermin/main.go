@@ -19,12 +19,23 @@
 // reads only CERMIN_DB_PATH. The catch-up of a running serve classifies and
 // embeds them.
 //
-//	cermin pairs
+//	cermin pairs [<old.csv>]
 //
-// writes a CSV to stdout, for calibrating the Resurfacing cut-off (ADR-0010):
-// each Thought that has an eligible earlier Thought, paired with its best one,
-// best score first, with an empty wanted column to label. It reads only
-// CERMIN_DB_PATH and CERMIN_EMBED_MODEL, and makes no network call.
+// writes a CSV to stdout, for measuring Resurfacing (#29): every pair each
+// Thought shortlists for a Resurfacing, grouped by Thought, then by rank, with
+// a wanted column to label. A pair labelled in old.csv, an earlier CSV from
+// cermin pairs, keeps its label and has held_out n; any other has held_out y.
+// It reads only CERMIN_DB_PATH and CERMIN_EMBED_MODEL, and makes no network
+// call.
+//
+//	cermin eval resurfacing <labelled.csv>
+//
+// prints how each way of deciding which shortlisted Thoughts come back in a
+// Resurfacing does against your labels in labelled.csv, a CSV from cermin pairs
+// with every row labelled: numbers only, no Thought text. It reads the current
+// Classifications from CERMIN_DB_PATH, and judges each shortlist with Claude,
+// so it reads ANTHROPIC_API_KEY and, optionally, CERMIN_JUDGE_MODEL (default
+// claude-sonnet-5-5).
 package main
 
 import (
@@ -56,8 +67,13 @@ func run(args []string) error {
 	case len(args) == 2 && args[0] == "import":
 		return importChat(ctx, args[1])
 	case len(args) == 1 && args[0] == "pairs":
-		return writePairs(ctx)
+		return writePairs(ctx, "")
+	case len(args) == 2 && args[0] == "pairs":
+		return writePairs(ctx, args[1])
+	case len(args) == 3 && args[0] == "eval" && args[1] == "resurfacing":
+		return evalResurfacing(ctx, args[2])
 	default:
-		return errors.New("usage: cermin serve | cermin import <file> | cermin pairs")
+		return errors.New("usage: cermin serve | cermin import <file> | cermin pairs [<old.csv>]" +
+			" | cermin eval resurfacing <labelled.csv>")
 	}
 }

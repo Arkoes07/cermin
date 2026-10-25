@@ -2,6 +2,7 @@ package cermin_test
 
 import (
 	"math"
+	"slices"
 	"testing"
 	"time"
 
@@ -102,6 +103,55 @@ func TestRankEligible_SkipsRemembered(t *testing.T) {
 			t.Parallel()
 			if got := cermin.RankEligible(thought, []cermin.EmbeddedThought{tt.past}); len(got) != 0 {
 				t.Errorf("RankEligible = %+v, want none", got)
+			}
+		})
+	}
+}
+
+// A shortlist keeps the eligible Thoughts that score at least 0.45, at most 3
+// of them, best first. The new Thought's vector is 5-dimensional, so that one
+// past Thought can score exactly 0.45: 9 over a length of 20.
+func TestShortlist(t *testing.T) {
+	t.Parallel()
+	thought := newThought(0)
+	thought.Vector = []float32{1, 0, 0, 0, 0}
+	eligibleThought := func(id int64, vector ...float32) cermin.EmbeddedThought {
+		return pastThought(id, 48*time.Hour, vector...)
+	}
+	tests := []struct {
+		name   string
+		corpus []cermin.EmbeddedThought
+		want   []int64
+	}{
+		{
+			name: "at most 3, best first",
+			corpus: []cermin.EmbeddedThought{
+				eligibleThought(1, 3, 4, 0, 0, 0),  // 0.6
+				eligibleThought(2, 9, 17, 5, 2, 1), // 0.45
+				eligibleThought(3, 4, 3, 0, 0, 0),  // 0.8
+				eligibleThought(4, 1, 1, 0, 0, 0),  // 0.71
+				pastThought(5, 23*time.Hour, 1, 0, 0, 0, 0),
+			},
+			want: []int64{3, 4, 1},
+		},
+		{
+			name: "at or above 0.45",
+			corpus: []cermin.EmbeddedThought{
+				eligibleThought(1, 1, 2, 0, 0, 0),  // 0.447
+				eligibleThought(2, 9, 17, 5, 2, 1), // 0.45
+			},
+			want: []int64{2},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := []int64{}
+			for _, s := range cermin.Shortlist(thought, tt.corpus) {
+				got = append(got, s.ID)
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("Shortlist = Thoughts %v, want %v", got, tt.want)
 			}
 		})
 	}
